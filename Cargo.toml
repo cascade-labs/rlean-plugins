@@ -12,11 +12,11 @@ license = "Apache-2.0"
 # Core rlean crates — fetched from GitHub at install time.
 # For local development, create a .cargo/config.toml (gitignored) with
 # [patch."https://github.com/cascade-labs/rlean"] path overrides.
-lean-core           = { git = "https://github.com/cascade-labs/rlean", package = "lean-core" }
-lean-data           = { git = "https://github.com/cascade-labs/rlean", package = "lean-data" }
-lean-storage        = { git = "https://github.com/cascade-labs/rlean", package = "lean-storage" }
-lean-data-providers = { git = "https://github.com/cascade-labs/rlean", package = "lean-data-providers" }
-lean-plugin         = { git = "https://github.com/cascade-labs/rlean", package = "lean-plugin" }
+lean-core           = { git = "ssh://git@github.com/cascade-labs/rlean", package = "lean-core" }
+lean-data           = { git = "ssh://git@github.com/cascade-labs/rlean", package = "lean-data" }
+lean-storage        = { git = "ssh://git@github.com/cascade-labs/rlean", package = "lean-storage" }
+lean-data-providers = { git = "ssh://git@github.com/cascade-labs/rlean", package = "lean-data-providers" }
+lean-plugin         = { git = "ssh://git@github.com/cascade-labs/rlean", package = "lean-plugin" }
 
 # Common deps
 tokio       = { version = "1", features = ["full"] }
