@@ -1,0 +1,5 @@
+# Use the system git binary so SSH keys and credential helpers work.
+# Required when cascade-labs/rlean is a private repo (cargo's built-in
+# git client doesn't support SSH agent auth).
+[net]
+git-fetch-with-cli = true

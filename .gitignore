@@ -1,5 +1,5 @@
 /target/
 **/*.rs.bk
 Cargo.lock
-# Local dev path-patch config — do not commit; breaks remote builds
-/.cargo/
+# Local dev path-patch overrides — do not commit; only rlean-specific patches go in .cargo/config.toml
+/.cargo/config.local.toml
