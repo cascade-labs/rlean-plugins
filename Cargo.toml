@@ -9,12 +9,14 @@ authors = ["Cascade Labs"]
 license = "Apache-2.0"
 
 [workspace.dependencies]
-# Core rlean crates — use local paths during development; switch to git deps after rlean is published
-lean-core           = { path = "../rlean/crates/lean-core" }
-lean-data           = { path = "../rlean/crates/lean-data" }
-lean-storage        = { path = "../rlean/crates/lean-storage" }
-lean-data-providers = { path = "../rlean/crates/lean-data-providers" }
-lean-plugin         = { path = "../rlean/crates/lean-plugin" }
+# Core rlean crates — fetched from GitHub at install time.
+# For local development, create a .cargo/config.toml (gitignored) with
+# [patch."https://github.com/cascade-labs/rlean"] path overrides.
+lean-core           = { git = "https://github.com/cascade-labs/rlean", package = "lean-core" }
+lean-data           = { git = "https://github.com/cascade-labs/rlean", package = "lean-data" }
+lean-storage        = { git = "https://github.com/cascade-labs/rlean", package = "lean-storage" }
+lean-data-providers = { git = "https://github.com/cascade-labs/rlean", package = "lean-data-providers" }
+lean-plugin         = { git = "https://github.com/cascade-labs/rlean", package = "lean-plugin" }
 
 # Common deps
 tokio       = { version = "1", features = ["full"] }

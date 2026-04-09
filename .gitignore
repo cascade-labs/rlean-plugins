@@ -1,3 +1,5 @@
 /target/
 **/*.rs.bk
 Cargo.lock
+# Local dev path-patch config — do not commit; breaks remote builds
+/.cargo/
