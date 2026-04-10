@@ -130,13 +130,15 @@ impl MassiveHistoryProvider {
         } else {
             let start_date = bars[0].time.date_utc();
             let dp = self.resolver.trade_bar(symbol, resolution, start_date);
-            self.writer.write_trade_bars_at(bars, &dp)
-                .map_err(|e| LeanError::DataError(e.to_string()))?;
-            info!(
-                "Massive: cached {} bars → {}",
-                bars.len(),
-                dp.to_path().display()
-            );
+            if !dp.to_path().exists() {
+                self.writer.write_trade_bars_at(bars, &dp)
+                    .map_err(|e| LeanError::DataError(e.to_string()))?;
+                info!(
+                    "Massive: cached {} bars → {}",
+                    bars.len(),
+                    dp.to_path().display()
+                );
+            }
         }
         Ok(())
     }
