@@ -130,15 +130,13 @@ impl MassiveHistoryProvider {
         } else {
             let start_date = bars[0].time.date_utc();
             let dp = self.resolver.trade_bar(symbol, resolution, start_date);
-            if !dp.to_path().exists() {
-                self.writer.write_trade_bars_at(bars, &dp)
-                    .map_err(|e| LeanError::DataError(e.to_string()))?;
-                info!(
-                    "Massive: cached {} bars → {}",
-                    bars.len(),
-                    dp.to_path().display()
-                );
-            }
+            self.writer.write_trade_bars_at(bars, &dp)
+                .map_err(|e| LeanError::DataError(e.to_string()))?;
+            info!(
+                "Massive: cached {} bars → {}",
+                bars.len(),
+                dp.to_path().display()
+            );
         }
         Ok(())
     }
@@ -168,17 +166,51 @@ impl lean_data_providers::IHistoryProvider for MassiveHistoryProvider {
         &self,
         request: &lean_data_providers::HistoryRequest,
     ) -> anyhow::Result<Vec<TradeBar>> {
+        use lean_data_providers::DataType;
+
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| anyhow::anyhow!("failed to build massive runtime: {e}"))?;
 
-        rt.block_on(self.fetch_and_cache(
-            request.symbol.clone(),
-            request.resolution,
-            request.start,
-            request.end,
-        ))
-        .map_err(|e| anyhow::anyhow!("{e}"))
+        match request.data_type {
+            DataType::FactorFile => {
+                // Fetch daily bars only for reference prices (needed to compute
+                // dividend adjustment factors); do NOT write bars to disk.
+                rt.block_on(async {
+                    let bars = self.client
+                        .get_aggregates(
+                            &request.symbol,
+                            lean_core::Resolution::Daily,
+                            request.start,
+                            request.end,
+                            false,
+                        )
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+                    if !bars.is_empty() {
+                        self.fetch_and_write_factor_file(
+                            &request.symbol,
+                            request.start,
+                            request.end,
+                            &bars,
+                        )
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    }
+
+                    Ok(vec![])
+                })
+            }
+            _ => rt
+                .block_on(self.fetch_and_cache(
+                    request.symbol.clone(),
+                    request.resolution,
+                    request.start,
+                    request.end,
+                ))
+                .map_err(|e| anyhow::anyhow!("{e}")),
+        }
     }
 }
