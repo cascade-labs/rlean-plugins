@@ -234,20 +234,19 @@ impl IHistoricalDataProvider for ThetaDataHistoryProvider {
 }
 
 // ─── lean_data_providers::IHistoryProvider ────────────────────────────────────
+//
+// IHistoryProvider::get_history is synchronous: this cdylib has its own copy
+// of tokio and cannot share thread-locals with the host binary's runtime.
+// We create a lightweight current-thread runtime per call; the host bridges
+// to async via spawn_blocking so no tokio worker thread is blocked.
 
-#[async_trait::async_trait]
 impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
-    async fn get_history(
+    fn get_history(
         &self,
         request: &lean_data_providers::HistoryRequest,
     ) -> anyhow::Result<Vec<TradeBar>> {
         use lean_data_providers::DataType;
 
-        // ThetaData only provides TradeBar data. For every other type
-        // (QuoteBar, Tick, OpenInterest) return NotImplemented so the
-        // StackedHistoryProvider falls through to the next provider in the
-        // chain — e.g. `--data-provider-historical thetadata,massive` will
-        // use Massive for corporate-action factor files and quote data.
         if request.data_type != DataType::TradeBar {
             return Err(anyhow::anyhow!(
                 "NotImplemented: ThetaData does not provide {:?} data \
@@ -256,13 +255,17 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
             ));
         }
 
-        self.fetch_and_cache(
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| anyhow::anyhow!("failed to build thetadata runtime: {e}"))?;
+
+        rt.block_on(self.fetch_and_cache(
             request.symbol.clone(),
             request.resolution,
             request.start,
             request.end,
-        )
-        .await
+        ))
         .map_err(|e| anyhow::anyhow!("{e}"))
     }
 }

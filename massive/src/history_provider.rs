@@ -155,20 +155,28 @@ impl IHistoricalDataProvider for MassiveHistoryProvider {
 }
 
 // ─── lean_data_providers::IHistoryProvider ────────────────────────────────────
+//
+// IHistoryProvider::get_history is synchronous: this cdylib has its own copy
+// of tokio and cannot share thread-locals with the host binary's runtime.
+// We create a lightweight current-thread runtime per call; the host bridges
+// to async via spawn_blocking so no tokio worker thread is blocked.
 
-#[async_trait::async_trait]
 impl lean_data_providers::IHistoryProvider for MassiveHistoryProvider {
-    async fn get_history(
+    fn get_history(
         &self,
         request: &lean_data_providers::HistoryRequest,
     ) -> anyhow::Result<Vec<TradeBar>> {
-        self.fetch_and_cache(
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| anyhow::anyhow!("failed to build massive runtime: {e}"))?;
+
+        rt.block_on(self.fetch_and_cache(
             request.symbol.clone(),
             request.resolution,
             request.start,
             request.end,
-        )
-        .await
+        ))
         .map_err(|e| anyhow::anyhow!("{e}"))
     }
 }
