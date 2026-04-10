@@ -1821,6 +1821,7 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 [[package]]
 name = "lean-core"
 version = "0.1.0"
+source = "git+ssh://git@github.com/cascade-labs/rlean#94f8fdfb9720328facc8f5c0cfcf37622eb1a080"
 dependencies = [
  "anyhow",
  "bitflags 2.11.0",
@@ -1845,6 +1846,7 @@ dependencies = [
 [[package]]
 name = "lean-data"
 version = "0.1.0"
+source = "git+ssh://git@github.com/cascade-labs/rlean#94f8fdfb9720328facc8f5c0cfcf37622eb1a080"
 dependencies = [
  "anyhow",
  "bitflags 2.11.0",
@@ -1866,6 +1868,7 @@ dependencies = [
 [[package]]
 name = "lean-data-providers"
 version = "0.1.0"
+source = "git+ssh://git@github.com/cascade-labs/rlean#94f8fdfb9720328facc8f5c0cfcf37622eb1a080"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1884,6 +1887,7 @@ dependencies = [
 [[package]]
 name = "lean-plugin"
 version = "0.1.0"
+source = "git+ssh://git@github.com/cascade-labs/rlean#94f8fdfb9720328facc8f5c0cfcf37622eb1a080"
 dependencies = [
  "serde",
  "serde_json",
@@ -1892,6 +1896,7 @@ dependencies = [
 [[package]]
 name = "lean-storage"
 version = "0.1.0"
+source = "git+ssh://git@github.com/cascade-labs/rlean#94f8fdfb9720328facc8f5c0cfcf37622eb1a080"
 dependencies = [
  "anyhow",
  "arrow",
