@@ -1,5 +1,5 @@
 [workspace]
-members = ["massive", "thetadata"]
+members = ["massive", "thetadata", "brokerages"]
 resolver = "2"
 
 [workspace.package]
@@ -17,6 +17,8 @@ lean-data           = { git = "ssh://git@github.com/cascade-labs/rlean", package
 lean-storage        = { git = "ssh://git@github.com/cascade-labs/rlean", package = "lean-storage" }
 lean-data-providers = { git = "ssh://git@github.com/cascade-labs/rlean", package = "lean-data-providers" }
 lean-plugin         = { git = "ssh://git@github.com/cascade-labs/rlean", package = "lean-plugin" }
+lean-brokerages     = { git = "ssh://git@github.com/cascade-labs/rlean", package = "lean-brokerages" }
+lean-orders         = { git = "ssh://git@github.com/cascade-labs/rlean", package = "lean-orders" }
 
 # Common deps
 tokio       = { version = "1", features = ["full"] }
@@ -25,6 +27,7 @@ serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 reqwest     = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 chrono      = { version = "0.4", features = ["serde"] }
+chrono-tz   = "0.10"
 tracing     = "0.1"
 async-trait = "0.1"
 
