@@ -2972,11 +2972,17 @@ dependencies = [
 name = "rlean-plugin-brokerages"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "lean-brokerages",
  "lean-core",
  "lean-orders",
+ "reqwest",
  "rust_decimal",
  "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

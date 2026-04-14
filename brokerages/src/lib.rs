@@ -6,6 +6,7 @@ pub mod fxcm_brokerage;
 pub mod interactive_brokers;
 pub mod oanda_brokerage;
 pub mod robinhood;
+pub mod tradier;
 
 pub use alpaca::AlpacaBrokerageModel;
 pub use binance_brokerage::{BinanceBrokerageModel, BinanceMarket};
@@ -20,3 +21,4 @@ pub use interactive_brokers::{InteractiveBrokersBrokerageModel, IbAccountType};
 pub use oanda_brokerage::OandaBrokerageModel;
 pub use robinhood::{RobinhoodBrokerageModel, RobinhoodAccountTier, OptionsLevel,
                    RobinhoodEquityFeeModel, RobinhoodOptionsFeeModel};
+pub use tradier::{TradierBrokerage, TradierBrokerageModel, TradierClient};
