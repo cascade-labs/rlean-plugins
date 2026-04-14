@@ -2969,20 +2969,69 @@ dependencies = [
 ]
 
 [[package]]
-name = "rlean-plugin-brokerages"
+name = "rlean-plugin-alpaca"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "lean-brokerages",
  "lean-core",
  "lean-orders",
- "reqwest",
  "rust_decimal",
  "rust_decimal_macros",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
+]
+
+[[package]]
+name = "rlean-plugin-binance"
+version = "0.1.0"
+dependencies = [
+ "lean-brokerages",
+ "lean-core",
+ "lean-orders",
+ "rust_decimal",
+ "rust_decimal_macros",
+]
+
+[[package]]
+name = "rlean-plugin-coinbase"
+version = "0.1.0"
+dependencies = [
+ "lean-brokerages",
+ "lean-core",
+ "lean-orders",
+ "rust_decimal",
+ "rust_decimal_macros",
+]
+
+[[package]]
+name = "rlean-plugin-fidelity"
+version = "0.1.0"
+dependencies = [
+ "lean-brokerages",
+ "lean-core",
+ "lean-orders",
+ "rust_decimal",
+ "rust_decimal_macros",
+]
+
+[[package]]
+name = "rlean-plugin-fxcm"
+version = "0.1.0"
+dependencies = [
+ "lean-brokerages",
+ "lean-core",
+ "lean-orders",
+ "rust_decimal",
+ "rust_decimal_macros",
+]
+
+[[package]]
+name = "rlean-plugin-interactive-brokers"
+version = "0.1.0"
+dependencies = [
+ "lean-brokerages",
+ "lean-core",
+ "lean-orders",
+ "rust_decimal",
+ "rust_decimal_macros",
 ]
 
 [[package]]
@@ -3011,6 +3060,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "rlean-plugin-oanda"
+version = "0.1.0"
+dependencies = [
+ "lean-brokerages",
+ "lean-core",
+ "lean-orders",
+ "rust_decimal",
+ "rust_decimal_macros",
+]
+
+[[package]]
+name = "rlean-plugin-robinhood"
+version = "0.1.0"
+dependencies = [
+ "lean-brokerages",
+ "lean-core",
+ "lean-orders",
+ "rust_decimal",
+ "rust_decimal_macros",
+]
+
+[[package]]
 name = "rlean-plugin-thetadata"
 version = "0.1.0"
 dependencies = [
@@ -3028,6 +3099,23 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rlean-plugin-tradier"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "lean-brokerages",
+ "lean-core",
+ "lean-orders",
+ "reqwest",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]

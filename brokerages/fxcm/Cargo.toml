@@ -1,0 +1,17 @@
+[package]
+name = "rlean-plugin-fxcm"
+version.workspace = true
+edition.workspace = true
+description = "rlean plugin: FXCM brokerage model"
+
+[lib]
+name = "rlean_plugin_fxcm"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+lean-brokerages = { workspace = true }
+lean-orders     = { workspace = true }
+lean-core       = { workspace = true }
+rust_decimal        = { workspace = true }
+rust_decimal_macros = "1"
+

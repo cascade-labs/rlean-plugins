@@ -1,0 +1,34 @@
+[package]
+name = "rlean-plugin-massive"
+version.workspace = true
+edition.workspace = true
+description = "rlean plugin: Massive.com (formerly Polygon.io) historical data provider"
+
+[lib]
+name = "rlean_plugin_massive"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+lean-core           = { workspace = true }
+lean-data           = { workspace = true }
+lean-storage        = { workspace = true }
+lean-data-providers = { workspace = true }
+lean-plugin         = { workspace = true }
+
+tokio        = { workspace = true }
+anyhow       = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+reqwest      = { workspace = true }
+chrono       = { workspace = true }
+chrono-tz    = { workspace = true }
+tracing      = { workspace = true }
+async-trait  = { workspace = true }
+rust_decimal = { workspace = true }
+arrow-array  = { workspace = true }
+arrow-schema = { workspace = true }
+parquet      = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio    = { workspace = true }

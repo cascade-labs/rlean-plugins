@@ -1,5 +1,5 @@
 [workspace]
-members = ["massive", "thetadata", "brokerages"]
+members = ["data_providers/*", "brokerages/*"]
 resolver = "2"
 
 [workspace.package]

@@ -1,0 +1,17 @@
+[package]
+name = "rlean-plugin-oanda"
+version.workspace = true
+edition.workspace = true
+description = "rlean plugin: OANDA brokerage model"
+
+[lib]
+name = "rlean_plugin_oanda"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+lean-brokerages = { workspace = true }
+lean-orders     = { workspace = true }
+lean-core       = { workspace = true }
+rust_decimal        = { workspace = true }
+rust_decimal_macros = "1"
+

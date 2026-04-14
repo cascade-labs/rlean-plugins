@@ -1,0 +1,16 @@
+[package]
+name = "rlean-plugin-robinhood"
+version.workspace = true
+edition.workspace = true
+description = "rlean plugin: Robinhood brokerage model"
+
+[lib]
+name = "rlean_plugin_robinhood"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+lean-brokerages = { workspace = true }
+lean-orders     = { workspace = true }
+lean-core       = { workspace = true }
+rust_decimal        = { workspace = true }
+rust_decimal_macros = "1"

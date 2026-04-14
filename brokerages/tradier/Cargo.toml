@@ -1,0 +1,22 @@
+[package]
+name = "rlean-plugin-tradier"
+version.workspace = true
+edition.workspace = true
+description = "rlean plugin: Tradier brokerage (live order routing via REST API)"
+
+[lib]
+name = "rlean_plugin_tradier"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+lean-brokerages = { workspace = true }
+lean-orders     = { workspace = true }
+lean-core       = { workspace = true }
+rust_decimal        = { workspace = true }
+rust_decimal_macros = "1"
+reqwest    = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+tokio      = { workspace = true }
+anyhow     = { workspace = true }
+tracing    = { workspace = true }
