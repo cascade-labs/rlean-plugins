@@ -1,0 +1,17 @@
+# Use the system git binary so SSH keys and credential helpers work.
+# Required when cascade-labs/rlean is a private repo (cargo's built-in
+# git client doesn't support SSH agent auth).
+[net]
+git-fetch-with-cli = true
+
+# Local path overrides — point to the sibling rlean workspace so plugin
+# changes that depend on local trait additions (e.g. earliest_date) can
+# be tested before publishing the crates to GitHub.
+[patch."ssh://git@github.com/cascade-labs/rlean"]
+lean-core           = { path = "../rlean/crates/lean-core" }
+lean-data           = { path = "../rlean/crates/lean-data" }
+lean-data-providers = { path = "../rlean/crates/lean-data-providers" }
+lean-storage        = { path = "../rlean/crates/lean-storage" }
+lean-plugin         = { path = "../rlean/crates/lean-plugin" }
+lean-brokerages     = { path = "../rlean/crates/lean-brokerages" }
+lean-orders         = { path = "../rlean/crates/lean-orders" }

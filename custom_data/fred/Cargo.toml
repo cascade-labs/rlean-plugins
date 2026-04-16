@@ -1,0 +1,19 @@
+[package]
+name = "rlean-plugin-fred"
+version.workspace = true
+edition.workspace = true
+description = "rlean plugin: FRED macroeconomic data series (UNRATE, CPI, DGS10, FEDFUNDS, etc.)"
+
+[lib]
+name = "rlean_plugin_fred"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+lean-core           = { workspace = true }
+lean-data           = { workspace = true }
+lean-data-providers = { workspace = true }
+lean-plugin         = { workspace = true }
+rust_decimal        = { workspace = true }
+chrono              = { workspace = true }
+serde_json          = { workspace = true }
+anyhow              = { workspace = true }

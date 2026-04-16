@@ -1,0 +1,17 @@
+[package]
+name = "rlean-plugin-binance"
+version.workspace = true
+edition.workspace = true
+description = "rlean plugin: Binance brokerage model"
+
+[lib]
+name = "rlean_plugin_binance"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+lean-brokerages = { workspace = true }
+lean-orders     = { workspace = true }
+lean-core       = { workspace = true }
+rust_decimal        = { workspace = true }
+rust_decimal_macros = "1"
+

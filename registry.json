@@ -1,0 +1,93 @@
+{
+  "version": "1",
+  "plugins": [
+    {
+      "name": "massive",
+      "version": "0.1.0",
+      "kind": "data-provider",
+      "description": "Massive.com (formerly Polygon.io) historical data provider",
+      "git_url": "https://github.com/cascade-labs/rlean-plugins",
+      "subdir": "data_providers/massive"
+    },
+    {
+      "name": "thetadata",
+      "version": "0.1.0",
+      "kind": "data-provider",
+      "description": "ThetaData options and equity historical data provider",
+      "git_url": "https://github.com/cascade-labs/rlean-plugins",
+      "subdir": "data_providers/thetadata"
+    },
+    {
+      "name": "alpaca",
+      "version": "0.1.0",
+      "kind": "brokerage",
+      "description": "Alpaca brokerage model (commission-free US equities)",
+      "git_url": "https://github.com/cascade-labs/rlean-plugins",
+      "subdir": "brokerages/alpaca"
+    },
+    {
+      "name": "binance",
+      "version": "0.1.0",
+      "kind": "brokerage",
+      "description": "Binance brokerage model (spot + USDT futures)",
+      "git_url": "https://github.com/cascade-labs/rlean-plugins",
+      "subdir": "brokerages/binance"
+    },
+    {
+      "name": "coinbase",
+      "version": "0.1.0",
+      "kind": "brokerage",
+      "description": "Coinbase brokerage model (crypto spot)",
+      "git_url": "https://github.com/cascade-labs/rlean-plugins",
+      "subdir": "brokerages/coinbase"
+    },
+    {
+      "name": "fxcm",
+      "version": "0.1.0",
+      "kind": "brokerage",
+      "description": "FXCM brokerage model (forex CFDs)",
+      "git_url": "https://github.com/cascade-labs/rlean-plugins",
+      "subdir": "brokerages/fxcm"
+    },
+    {
+      "name": "interactive_brokers",
+      "version": "0.1.0",
+      "kind": "brokerage",
+      "description": "Interactive Brokers brokerage model",
+      "git_url": "https://github.com/cascade-labs/rlean-plugins",
+      "subdir": "brokerages/interactive_brokers"
+    },
+    {
+      "name": "oanda",
+      "version": "0.1.0",
+      "kind": "brokerage",
+      "description": "OANDA brokerage model (forex spread-only)",
+      "git_url": "https://github.com/cascade-labs/rlean-plugins",
+      "subdir": "brokerages/oanda"
+    },
+    {
+      "name": "tradier",
+      "version": "0.1.0",
+      "kind": "brokerage",
+      "description": "Tradier brokerage model (commission-free equities, 2x leverage)",
+      "git_url": "https://github.com/cascade-labs/rlean-plugins",
+      "subdir": "brokerages/tradier"
+    },
+    {
+      "name": "fred",
+      "version": "0.1.0",
+      "kind": "custom-data",
+      "description": "FRED macroeconomic data series (UNRATE, CPI, DGS10, FEDFUNDS, etc.)",
+      "git_url": "https://github.com/cascade-labs/rlean-plugins",
+      "subdir": "custom_data/fred"
+    },
+    {
+      "name": "cboe_vix",
+      "version": "0.1.0",
+      "kind": "custom-data",
+      "description": "CBOE VIX daily OHLC (fear index)",
+      "git_url": "https://github.com/cascade-labs/rlean-plugins",
+      "subdir": "custom_data/cboe_vix"
+    }
+  ]
+}
