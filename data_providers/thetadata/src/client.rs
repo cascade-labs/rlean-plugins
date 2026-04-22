@@ -245,6 +245,147 @@ impl ThetaDataClient {
 
     // ─── Option endpoints ─────────────────────────────────────────────────────
 
+    /// Contract universe for a root symbol on a single trading day.
+    pub async fn get_option_contracts_for_date(
+        &self,
+        root: &str,
+        date: NaiveDate,
+    ) -> Result<Vec<V3OptionContract>> {
+        let cache_key = format!("{root}-{}-contracts-quote", fmt_date(date));
+        self.get_or_fetch_chain(&cache_key, || {
+            let root = root.to_string();
+            Box::pin(async move {
+                let params = vec![
+                    ("symbol", root),
+                    ("date", fmt_date(date)),
+                ];
+                self.execute("option/list/contracts/quote", &params).await
+            })
+        })
+        .await
+    }
+
+    /// Full option OHLC chain for a root symbol on a single trading day.
+    pub async fn get_option_ohlc_chain_for_date(
+        &self,
+        root: &str,
+        date: NaiveDate,
+        interval: &str,
+    ) -> Result<Vec<V3OptionOhlc>> {
+        let cache_key = format!("{root}-{}-ohlc-{interval}", fmt_date(date));
+        self.get_or_fetch_chain(&cache_key, || {
+            let root = root.to_string();
+            let interval = interval.to_string();
+            Box::pin(async move {
+                let contracts = self.get_option_contracts_for_date(&root, date).await?;
+                let expirations: std::collections::BTreeSet<String> = contracts
+                    .into_iter()
+                    .map(|contract| normalize_expiration(&contract.expiration))
+                    .collect();
+
+                let mut rows = Vec::new();
+                for expiration in expirations {
+                    let params = vec![
+                        ("symbol", root.clone()),
+                        ("expiration", expiration),
+                        ("strike", "*".to_string()),
+                        ("start_date", fmt_date(date)),
+                        ("end_date", fmt_date(date)),
+                        ("interval", interval.clone()),
+                    ];
+                    match self.execute("option/history/ohlc", &params).await {
+                        Ok(batch) => rows.extend(batch),
+                        Err(e) => warn!(
+                            "ThetaData: option OHLC fetch failed for {} {}: {}",
+                            root, date, e
+                        ),
+                    }
+                }
+                Ok(rows)
+            })
+        })
+        .await
+    }
+
+    /// Full option quote chain for a root symbol on a single trading day.
+    pub async fn get_option_quote_chain_for_date(
+        &self,
+        root: &str,
+        date: NaiveDate,
+        interval: &str,
+    ) -> Result<Vec<V3OptionQuote>> {
+        let cache_key = format!("{root}-{}-quotes-{interval}", fmt_date(date));
+        self.get_or_fetch_chain(&cache_key, || {
+            let root = root.to_string();
+            let interval = interval.to_string();
+            Box::pin(async move {
+                let contracts = self.get_option_contracts_for_date(&root, date).await?;
+                let expirations: std::collections::BTreeSet<String> = contracts
+                    .into_iter()
+                    .map(|contract| normalize_expiration(&contract.expiration))
+                    .collect();
+
+                let mut rows = Vec::new();
+                for expiration in expirations {
+                    let params = vec![
+                        ("symbol", root.clone()),
+                        ("expiration", expiration),
+                        ("strike", "*".to_string()),
+                        ("date", fmt_date(date)),
+                        ("interval", interval.clone()),
+                    ];
+                    match self.execute("option/history/quote", &params).await {
+                        Ok(batch) => rows.extend(batch),
+                        Err(e) => warn!(
+                            "ThetaData: option quote fetch failed for {} {}: {}",
+                            root, date, e
+                        ),
+                    }
+                }
+                Ok(rows)
+            })
+        })
+        .await
+    }
+
+    /// Full option trade chain for a root symbol on a single trading day.
+    pub async fn get_option_trade_chain_for_date(
+        &self,
+        root: &str,
+        date: NaiveDate,
+    ) -> Result<Vec<V3OptionTrade>> {
+        let cache_key = format!("{root}-{}-trades-tick", fmt_date(date));
+        self.get_or_fetch_chain(&cache_key, || {
+            let root = root.to_string();
+            Box::pin(async move {
+                let contracts = self.get_option_contracts_for_date(&root, date).await?;
+                let expirations: std::collections::BTreeSet<String> = contracts
+                    .into_iter()
+                    .map(|contract| normalize_expiration(&contract.expiration))
+                    .collect();
+
+                let mut rows = Vec::new();
+                for expiration in expirations {
+                    let params = vec![
+                        ("symbol", root.clone()),
+                        ("expiration", expiration),
+                        ("strike", "*".to_string()),
+                        ("date", fmt_date(date)),
+                    ];
+                    match self.execute("option/history/trade", &params).await {
+                        Ok(batch) => rows.extend(batch),
+                        Err(e) => warn!(
+                            "ThetaData: option trade fetch failed for {} {}: {}",
+                            root, date, e
+                        ),
+                    }
+                }
+                Ok(rows)
+            })
+        })
+        .await
+    }
+
     /// Option quote history for a single contract (bulk chain per day, filtered to contract).
     pub async fn get_option_quotes(
         &self,
@@ -672,6 +813,7 @@ impl ThetaDataClient {
 
 // ─── Option EOD Parquet helpers ───────────────────────────────────────────────
 
+#[cfg(test)]
 /// Convert a `NaiveDate` to nanoseconds since Unix epoch (midnight UTC).
 fn date_to_ns(date: NaiveDate) -> i64 {
     date.and_hms_opt(0, 0, 0)
@@ -934,11 +1076,11 @@ fn urlencoded(s: &str) -> String {
 /// Cheap pseudo-jitter (0–499 ms) without pulling in `rand`.
 fn rand_jitter() -> u32 {
     use std::time::SystemTime;
-    (SystemTime::now()
+    SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .subsec_millis()
-        % 500)
+        % 500
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

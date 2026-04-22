@@ -14,11 +14,18 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::FromPrimitive;
 use tracing::info;
 
-use lean_core::{DateTime, LeanError, NanosecondTimestamp, Resolution, Result as LeanResult, Symbol, TimeSpan};
-use lean_data::{IHistoricalDataProvider, TradeBar};
-use lean_storage::{ParquetWriter, PathResolver, WriterConfig};
+use lean_core::{
+    DateTime, LeanError, Market, NanosecondTimestamp, OptionRight, OptionStyle, Resolution,
+    Result as LeanResult, Symbol, SymbolOptionsExt, TimeSpan,
+};
+use lean_data::{Bar as LeanBar, IHistoricalDataProvider, QuoteBar, Tick, TradeBar, TradeBarData};
+use lean_storage::{OptionUniverseRow, ParquetWriter, PathResolver, WriterConfig};
 
 use crate::client::ThetaDataClient;
+use crate::models::{
+    parse_date, QuoteBar as ThetaQuoteBar, TradeTick, V3OptionContract, V3OptionOhlc,
+    V3OptionQuote, V3OptionTrade,
+};
 
 pub struct ThetaDataHistoryProvider {
     client:              ThetaDataClient,
@@ -241,6 +248,127 @@ impl ThetaDataHistoryProvider {
         }
         Ok(())
     }
+
+    fn write_quote_bars_to_disk(
+        &self,
+        symbol: &Symbol,
+        resolution: Resolution,
+        bars: &[QuoteBar],
+    ) -> Result<()> {
+        use std::collections::HashMap;
+
+        if bars.is_empty() {
+            return Ok(());
+        }
+
+        if !resolution.is_high_resolution() {
+            let first_date = bars[0].time.to_naive_utc().date();
+            let path = self.resolver.quote_bar(symbol, resolution, first_date).to_path();
+            return self.writer.write_quote_bars(bars, &path).map_err(Into::into);
+        }
+
+        let mut by_date: HashMap<NaiveDate, Vec<&QuoteBar>> = HashMap::new();
+        for bar in bars {
+            by_date
+                .entry(bar.time.to_naive_utc().date())
+                .or_default()
+                .push(bar);
+        }
+
+        for (date, day_bars) in by_date {
+            let owned: Vec<QuoteBar> = day_bars.into_iter().cloned().collect();
+            let path = self.resolver.quote_bar(symbol, resolution, date).to_path();
+            self.writer.write_quote_bars(&owned, &path)?;
+        }
+        Ok(())
+    }
+
+    fn write_ticks_to_disk(&self, symbol: &Symbol, ticks: &[Tick]) -> Result<()> {
+        use std::collections::HashMap;
+
+        if ticks.is_empty() {
+            return Ok(());
+        }
+
+        let mut by_date: HashMap<NaiveDate, Vec<&Tick>> = HashMap::new();
+        for tick in ticks {
+            by_date
+                .entry(tick.time.to_naive_utc().date())
+                .or_default()
+                .push(tick);
+        }
+
+        for (date, day_ticks) in by_date {
+            let owned: Vec<Tick> = day_ticks.into_iter().cloned().collect();
+            let path = self.resolver.tick(symbol, date).to_path();
+            self.writer.write_ticks(&owned, &path)?;
+        }
+        Ok(())
+    }
+
+    fn write_option_universe_to_disk(
+        &self,
+        ticker: &str,
+        date: NaiveDate,
+        rows: &[OptionUniverseRow],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let underlying = Symbol::create_equity(ticker, &Market::usa());
+        let path = self.resolver.option_universe(&underlying, date).to_path();
+        self.writer.write_option_universe(rows, &path).map_err(Into::into)
+    }
+
+    fn write_option_trade_bars_to_disk(
+        &self,
+        ticker: &str,
+        resolution: Resolution,
+        date: NaiveDate,
+        bars: &[TradeBar],
+    ) -> Result<()> {
+        if bars.is_empty() {
+            return Ok(());
+        }
+        let underlying = Symbol::create_equity(ticker, &Market::usa());
+        let path = self
+            .resolver
+            .option_trade_bar(&underlying, resolution, date)
+            .to_path();
+        self.writer.write_trade_bars(bars, &path).map_err(Into::into)
+    }
+
+    fn write_option_quote_bars_to_disk(
+        &self,
+        ticker: &str,
+        resolution: Resolution,
+        date: NaiveDate,
+        bars: &[QuoteBar],
+    ) -> Result<()> {
+        if bars.is_empty() {
+            return Ok(());
+        }
+        let underlying = Symbol::create_equity(ticker, &Market::usa());
+        let path = self
+            .resolver
+            .option_quote_bar(&underlying, resolution, date)
+            .to_path();
+        self.writer.write_quote_bars(bars, &path).map_err(Into::into)
+    }
+
+    fn write_option_ticks_to_disk(
+        &self,
+        ticker: &str,
+        date: NaiveDate,
+        ticks: &[Tick],
+    ) -> Result<()> {
+        if ticks.is_empty() {
+            return Ok(());
+        }
+        let underlying = Symbol::create_equity(ticker, &Market::usa());
+        let path = self.resolver.option_tick(&underlying, date).to_path();
+        self.writer.write_ticks(ticks, &path).map_err(Into::into)
+    }
 }
 
 impl IHistoricalDataProvider for ThetaDataHistoryProvider {
@@ -295,6 +423,63 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
         .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
+    fn get_quote_bars(
+        &self,
+        request: &lean_data_providers::HistoryRequest,
+    ) -> anyhow::Result<Vec<QuoteBar>> {
+        let interval = resolution_to_interval(request.resolution)
+            .ok_or_else(|| anyhow::anyhow!("ThetaData quote bars require minute/second/hour resolution"))?;
+        let period = resolution_to_period(request.resolution)
+            .ok_or_else(|| anyhow::anyhow!("ThetaData quote bars require bar resolution"))?;
+        let ticker = request.symbol.permtick.to_uppercase();
+        let start_date = request.start.to_naive_utc().date().max(self.standard_start_date);
+        let end_date = request.end.to_naive_utc().date();
+
+        let rt = build_runtime()?;
+        let rows = rt.block_on(self.client.get_stock_quotes(
+            &ticker,
+            start_date,
+            end_date,
+            interval,
+            None,
+            None,
+        ))?;
+
+        let bars: Vec<QuoteBar> = rows
+            .into_iter()
+            .filter_map(|row| stock_quote_to_lean_quote_bar(request.symbol.clone(), row, period))
+            .collect();
+
+        self.write_quote_bars_to_disk(&request.symbol, request.resolution, &bars)?;
+        Ok(bars)
+    }
+
+    fn get_ticks(
+        &self,
+        request: &lean_data_providers::HistoryRequest,
+    ) -> anyhow::Result<Vec<Tick>> {
+        let ticker = request.symbol.permtick.to_uppercase();
+        let start_date = request.start.to_naive_utc().date().max(self.standard_start_date);
+        let end_date = request.end.to_naive_utc().date();
+
+        let rt = build_runtime()?;
+        let rows = rt.block_on(self.client.get_stock_trades(
+            &ticker,
+            start_date,
+            end_date,
+            None,
+            None,
+        ))?;
+
+        let ticks: Vec<Tick> = rows
+            .into_iter()
+            .filter_map(|row| stock_trade_to_tick(request.symbol.clone(), row))
+            .collect();
+
+        self.write_ticks_to_disk(&request.symbol, &ticks)?;
+        Ok(ticks)
+    }
+
     fn get_option_eod_bars(
         &self,
         ticker: &str,
@@ -307,6 +492,275 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
 
         rt.block_on(self.client.get_option_eod_bars_for_date(ticker, date))
     }
+
+    fn get_option_universe(
+        &self,
+        ticker: &str,
+        date: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<OptionUniverseRow>> {
+        let rt = build_runtime()?;
+        let contracts = rt.block_on(self.client.get_option_contracts_for_date(ticker, date))?;
+        let rows: Vec<OptionUniverseRow> = contracts
+            .iter()
+            .filter_map(|row| option_contract_to_universe_row(ticker, date, row))
+            .collect();
+        self.write_option_universe_to_disk(ticker, date, &rows)?;
+        Ok(rows)
+    }
+
+    fn get_option_trade_bars(
+        &self,
+        ticker: &str,
+        resolution: Resolution,
+        date: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<TradeBar>> {
+        let interval = resolution_to_interval(resolution)
+            .ok_or_else(|| anyhow::anyhow!("ThetaData option trade bars require minute/second/hour resolution"))?;
+        let period = resolution_to_period(resolution)
+            .ok_or_else(|| anyhow::anyhow!("ThetaData option trade bars require bar resolution"))?;
+        let underlying = Symbol::create_equity(ticker, &Market::usa());
+
+        let _ = self.get_option_universe(ticker, date)?;
+
+        let rt = build_runtime()?;
+        let rows = rt.block_on(self.client.get_option_ohlc_chain_for_date(ticker, date, interval))?;
+        let bars: Vec<TradeBar> = rows
+            .into_iter()
+            .filter_map(|row| option_ohlc_to_trade_bar(&underlying, row, period))
+            .collect();
+        self.write_option_trade_bars_to_disk(ticker, resolution, date, &bars)?;
+        Ok(bars)
+    }
+
+    fn get_option_quote_bars(
+        &self,
+        ticker: &str,
+        resolution: Resolution,
+        date: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<QuoteBar>> {
+        let interval = resolution_to_interval(resolution)
+            .ok_or_else(|| anyhow::anyhow!("ThetaData option quote bars require minute/second/hour resolution"))?;
+        let period = resolution_to_period(resolution)
+            .ok_or_else(|| anyhow::anyhow!("ThetaData option quote bars require bar resolution"))?;
+        let underlying = Symbol::create_equity(ticker, &Market::usa());
+
+        let _ = self.get_option_universe(ticker, date)?;
+
+        let rt = build_runtime()?;
+        let rows = rt.block_on(self.client.get_option_quote_chain_for_date(ticker, date, interval))?;
+        let bars: Vec<QuoteBar> = rows
+            .into_iter()
+            .filter_map(|row| option_quote_to_quote_bar(&underlying, row, period))
+            .collect();
+        self.write_option_quote_bars_to_disk(ticker, resolution, date, &bars)?;
+        Ok(bars)
+    }
+
+    fn get_option_ticks(
+        &self,
+        ticker: &str,
+        date: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<Tick>> {
+        let underlying = Symbol::create_equity(ticker, &Market::usa());
+
+        let _ = self.get_option_universe(ticker, date)?;
+
+        let rt = build_runtime()?;
+        let trade_rows = rt.block_on(self.client.get_option_trade_chain_for_date(ticker, date))?;
+        let quote_rows = rt.block_on(self.client.get_option_quote_chain_for_date(ticker, date, "tick"))?;
+
+        let mut ticks: Vec<Tick> = quote_rows
+            .into_iter()
+            .filter_map(|row| option_quote_to_tick(&underlying, row))
+            .collect();
+        ticks.extend(
+            trade_rows
+                .into_iter()
+                .filter_map(|row| option_trade_to_tick(&underlying, row)),
+        );
+        ticks.sort_by_key(|tick| (tick.time.0, tick.tick_type as u8));
+
+        self.write_option_ticks_to_disk(ticker, date, &ticks)?;
+        Ok(ticks)
+    }
+}
+
+fn build_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build thetadata runtime: {e}"))
+}
+
+fn resolution_to_interval(resolution: Resolution) -> Option<&'static str> {
+    match resolution {
+        Resolution::Second => Some("1s"),
+        Resolution::Minute => Some("1m"),
+        Resolution::Hour => Some("1h"),
+        _ => None,
+    }
+}
+
+fn resolution_to_period(resolution: Resolution) -> Option<TimeSpan> {
+    match resolution {
+        Resolution::Second => Some(TimeSpan::ONE_SECOND),
+        Resolution::Minute => Some(TimeSpan::ONE_MINUTE),
+        Resolution::Hour => Some(TimeSpan::ONE_HOUR),
+        Resolution::Daily => Some(TimeSpan::ONE_DAY),
+        Resolution::Tick => None,
+    }
+}
+
+fn parse_option_symbol(
+    underlying: &Symbol,
+    expiration: &str,
+    strike: f64,
+    right: &str,
+) -> Option<Symbol> {
+    let clean = expiration.replace('-', "");
+    let expiry = NaiveDate::parse_from_str(&clean, "%Y%m%d").ok()?;
+    let right = match right.to_ascii_uppercase().as_str() {
+        "C" | "CALL" => OptionRight::Call,
+        "P" | "PUT" => OptionRight::Put,
+        _ => return None,
+    };
+    Some(Symbol::create_option_osi(
+        underlying.clone(),
+        Decimal::from_f64(strike)?,
+        expiry,
+        right,
+        OptionStyle::American,
+        &Market::usa(),
+    ))
+}
+
+fn row_time(date: &str, timestamp: &str, ms_of_day: u32) -> Option<NanosecondTimestamp> {
+    let date = parse_date(date, timestamp)?;
+    if ms_of_day > 0 {
+        return Some(date_ms_to_lean_datetime(date, ms_of_day));
+    }
+    for fmt in &["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"] {
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(timestamp, fmt) {
+            return Some(DateTime::from(dt.and_utc()).into());
+        }
+    }
+    None
+}
+
+fn option_contract_to_universe_row(
+    ticker: &str,
+    date: NaiveDate,
+    row: &V3OptionContract,
+) -> Option<OptionUniverseRow> {
+    let clean = row.expiration.replace('-', "");
+    let expiration = NaiveDate::parse_from_str(&clean, "%Y%m%d").ok()?;
+    let right = match row.right.to_ascii_uppercase().as_str() {
+        "C" | "CALL" => "C",
+        "P" | "PUT" => "P",
+        _ => return None,
+    };
+    Some(OptionUniverseRow {
+        date,
+        symbol_value: row.symbol.clone(),
+        underlying: ticker.to_uppercase(),
+        expiration,
+        strike: Decimal::from_f64(row.strike)?,
+        right: right.to_string(),
+    })
+}
+
+fn stock_quote_to_lean_quote_bar(
+    symbol: Symbol,
+    row: ThetaQuoteBar,
+    period: TimeSpan,
+) -> Option<QuoteBar> {
+    let time = date_ms_to_lean_datetime(row.date, row.ms_of_day);
+    let bid = Decimal::from_f64(row.bid_price)?;
+    let ask = Decimal::from_f64(row.ask_price)?;
+    Some(QuoteBar::new(
+        symbol,
+        time,
+        period,
+        Some(LeanBar::from_price(bid)),
+        Some(LeanBar::from_price(ask)),
+        Decimal::from_f64(row.bid_size).unwrap_or_default(),
+        Decimal::from_f64(row.ask_size).unwrap_or_default(),
+    ))
+}
+
+fn stock_trade_to_tick(symbol: Symbol, row: TradeTick) -> Option<Tick> {
+    let time = date_ms_to_lean_datetime(row.date, row.ms_of_day);
+    Some(Tick::trade(
+        symbol,
+        time,
+        Decimal::from_f64(row.price)?,
+        Decimal::from_f64(row.size).unwrap_or_default(),
+    ))
+}
+
+fn option_ohlc_to_trade_bar(
+    underlying: &Symbol,
+    row: V3OptionOhlc,
+    period: TimeSpan,
+) -> Option<TradeBar> {
+    let symbol = parse_option_symbol(underlying, &row.expiration, row.strike, &row.right)?;
+    let time = row_time(&row.date, &row.timestamp, row.ms_of_day)?;
+    Some(TradeBar::new(
+        symbol,
+        time,
+        period,
+        TradeBarData::new(
+            Decimal::from_f64(row.open)?,
+            Decimal::from_f64(row.high)?,
+            Decimal::from_f64(row.low)?,
+            Decimal::from_f64(row.close)?,
+            Decimal::from_f64(row.volume).unwrap_or_default(),
+        ),
+    ))
+}
+
+fn option_quote_to_quote_bar(
+    underlying: &Symbol,
+    row: V3OptionQuote,
+    period: TimeSpan,
+) -> Option<QuoteBar> {
+    let symbol = parse_option_symbol(underlying, &row.expiration, row.strike, &row.right)?;
+    let time = row_time(&row.date, &row.timestamp, row.ms_of_day)?;
+    let bid = Decimal::from_f64(row.bid_price)?;
+    let ask = Decimal::from_f64(row.ask_price)?;
+    Some(QuoteBar::new(
+        symbol,
+        time,
+        period,
+        Some(LeanBar::from_price(bid)),
+        Some(LeanBar::from_price(ask)),
+        Decimal::from_f64(row.bid_size).unwrap_or_default(),
+        Decimal::from_f64(row.ask_size).unwrap_or_default(),
+    ))
+}
+
+fn option_quote_to_tick(underlying: &Symbol, row: V3OptionQuote) -> Option<Tick> {
+    let symbol = parse_option_symbol(underlying, &row.expiration, row.strike, &row.right)?;
+    let time = row_time(&row.date, &row.timestamp, row.ms_of_day)?;
+    Some(Tick::quote(
+        symbol,
+        time,
+        Decimal::from_f64(row.bid_price)?,
+        Decimal::from_f64(row.ask_price)?,
+        Decimal::from_f64(row.bid_size).unwrap_or_default(),
+        Decimal::from_f64(row.ask_size).unwrap_or_default(),
+    ))
+}
+
+fn option_trade_to_tick(underlying: &Symbol, row: V3OptionTrade) -> Option<Tick> {
+    let symbol = parse_option_symbol(underlying, &row.expiration, row.strike, &row.right)?;
+    let time = row_time(&row.date, &row.timestamp, row.ms_of_day)?;
+    Some(Tick::trade(
+        symbol,
+        time,
+        Decimal::from_f64(row.price)?,
+        Decimal::from_f64(row.size).unwrap_or_default(),
+    ))
 }
 
 // ─── Time helpers ─────────────────────────────────────────────────────────────

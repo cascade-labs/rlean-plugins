@@ -3,3 +3,4 @@
 Cargo.lock
 # Local dev path-patch overrides — do not commit; only rlean-specific patches go in .cargo/config.toml
 /.cargo/config.local.toml
+data/

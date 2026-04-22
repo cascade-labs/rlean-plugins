@@ -102,6 +102,19 @@ pub struct V3OptionOhlc {
     pub count: u32,
 }
 
+/// One row from `option/list/contracts/{trade|quote}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct V3OptionContract {
+    #[serde(default)]
+    pub symbol: String,
+    #[serde(default)]
+    pub expiration: String,
+    #[serde(default)]
+    pub strike: f64,
+    #[serde(default)]
+    pub right: String,
+}
+
 /// One row from `option/history/eod`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct V3OptionEod {
