@@ -13,7 +13,7 @@ use lean_core::{DateTime, NanosecondTimestamp, Resolution, Symbol, TimeSpan};
 use lean_data::TradeBar;
 use serde::de::DeserializeOwned;
 
-use crate::models::{AggregatesResponse, MassiveDividendItem, MassiveSplitItem, PaginatedResponse};
+use crate::models::{AggregatesResponse, MassiveDividendItem, MassiveSplitItem, PaginatedResponse, TickerDetails, TickerDetailsResponse};
 
 const BASE_URL: &str = "https://api.massive.com";
 const MAX_RETRIES: u32 = 5;
@@ -219,6 +219,38 @@ impl MassiveRestClient {
             }
         }
         Ok(())
+    }
+
+    /// Fetch ticker details (listing date, delisting date, active status).
+    pub async fn get_ticker_details(&self, ticker: &str) -> Result<Option<TickerDetails>> {
+        let url = format!(
+            "{BASE_URL}/v3/reference/tickers/{ticker}?apiKey={}",
+            self.api_key
+        );
+        self.limiter.wait().await;
+        for attempt in 0..MAX_RETRIES {
+            match self.http.get(&url).send().await {
+                Ok(r) if r.status() == 404 => return Ok(None),
+                Ok(r) if r.status() == 429 => {
+                    let wait = Duration::from_secs(10 * (attempt as u64 + 1));
+                    warn!("Massive: rate limited (429), waiting {:.0}s", wait.as_secs_f64());
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+                Ok(r) if r.status().is_success() => {
+                    let resp = r.json::<TickerDetailsResponse>().await?;
+                    return Ok(resp.results);
+                }
+                Ok(r) => bail!("Massive API error: HTTP {}", r.status()),
+                Err(e) if attempt + 1 < MAX_RETRIES => {
+                    warn!("Massive: request error (attempt {}): {}", attempt + 1, e);
+                    tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        bail!("Massive: max retries ({MAX_RETRIES}) exceeded");
     }
 
     async fn fetch_aggs_with_retry(&self, url: &str) -> Result<AggregatesResponse> {

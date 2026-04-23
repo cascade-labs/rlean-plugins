@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use tracing::{info, warn};
 
-use lean_storage::schema::FactorFileEntry;
+use lean_storage::schema::{FactorFileEntry, MapFileEntry};
 use lean_storage::{ParquetReader, ParquetWriter, WriterConfig};
 
 use crate::models::{MassiveDividendItem, MassiveSplitItem};
@@ -46,7 +46,12 @@ pub fn compute_factor_rows(
     for s in splits {
         if let Ok(d) = NaiveDate::parse_from_str(&s.execution_date, "%Y-%m-%d") {
             let f = s.split_factor();
-            if f != 0.0 { events.push(Event::Split { date: d, factor: f }); }
+            // rlean runner uses max(date < bar_date) to look up factors.  A split
+            // row placed at `execution_date` (the ex-date) would first apply to
+            // bars on execution_date+1, leaving the ex-date bar with the wrong
+            // (pre-split) factor.  Shift the row one calendar day back so it
+            // applies starting on the ex-date itself.
+            if f != 0.0 { events.push(Event::Split { date: d - chrono::Duration::days(1), factor: f }); }
         }
     }
     for div in dividends {
@@ -71,13 +76,21 @@ pub fn compute_factor_rows(
     for event in &events {
         match event {
             Event::Split { date, factor } => {
-                cum_split *= factor;
+                // Push the boundary row BEFORE updating cum_split.
+                //
+                // Rows are processed newest → oldest.  The boundary row at
+                // (ex_date - 1) marks the start of the post-split era for
+                // rlean's `max(date < bar_date)` look-up: bars from ex_date
+                // onwards use THIS row (current cum_split = post-split factor),
+                // while bars before ex_date use the NEXT (older) row that will
+                // be generated after we multiply cum_split by the split factor.
                 rows.push(FactorFileEntry {
                     date: *date,
                     price_factor: cum_price,
                     split_factor: cum_split,
                     reference_price: 0.0,
                 });
+                cum_split *= factor;
             }
             Event::Dividend { date, amount } => {
                 let prev_close = find_prev_close(*date, ref_prices);
@@ -98,6 +111,21 @@ pub fn compute_factor_rows(
                 }
             }
         }
+    }
+
+    // Push a base row at a far-past date carrying the final cumulative factors.
+    // This is the "bottom" of the factor file: rlean's backward-extension logic
+    // returns the oldest row for any bar_date that predates all explicit rows.
+    // Without this row, bars in the pre-split era fall back to the split boundary
+    // row (sf=1.0) instead of the correct pre-split factor (e.g. sf=0.5).
+    if (cum_price - 1.0).abs() > 1e-9 || (cum_split - 1.0).abs() > 1e-9 {
+        let base_date = NaiveDate::from_ymd_opt(1900, 1, 1).unwrap();
+        rows.push(FactorFileEntry {
+            date: base_date,
+            price_factor: cum_price,
+            split_factor: cum_split,
+            reference_price: 0.0,
+        });
     }
 
     rows
@@ -185,12 +213,153 @@ pub fn factor_for_date(rows: &[FactorFileEntry], bar_date: NaiveDate) -> (f64, f
     }
 }
 
+// ─── Map file ────────────────────────────────────────────────────────────────
+
+/// Build map file rows from ticker details.
+///
+/// LEAN convention (Parquet, sorted newest first):
+///   - Row 0 (newest): sentinel / delisting date with current ticker
+///   - Row 1 ... N: historical ticker mappings (if any renames)
+///
+/// For a simple active ticker with no renames:
+///   [{date: FAR_FUTURE, ticker: "XLK"}, {date: list_date, ticker: "XLK"}]
+///
+/// For a delisted ticker:
+///   [{date: delisting_date, ticker: "META"}, ..., {date: list_date, ticker: "FB"}]
+///
+/// DelistingDate = first (newest) row's date if ≤ today + 1 year; else active.
+pub fn compute_map_file_rows(
+    ticker: &str,
+    list_date: Option<NaiveDate>,
+    delisting_date: Option<NaiveDate>,
+    _today: NaiveDate,
+) -> Vec<MapFileEntry> {
+    let ticker_upper = ticker.to_uppercase();
+
+    // Sentinel / last-active date
+    let end_date = delisting_date.unwrap_or_else(|| {
+        // Active: use far-future sentinel (20501231 by LEAN convention)
+        NaiveDate::from_ymd_opt(2050, 12, 31).unwrap()
+    });
+
+    let start_date = list_date.unwrap_or_else(|| {
+        // Unknown listing date: use a safe fallback
+        NaiveDate::from_ymd_opt(1998, 1, 2).unwrap()
+    });
+
+    // Newest first (LEAN file ordering)
+    let mut rows = vec![MapFileEntry {
+        date: end_date,
+        ticker: ticker_upper.clone(),
+    }];
+    if start_date < end_date {
+        rows.push(MapFileEntry {
+            date: start_date,
+            ticker: ticker_upper,
+        });
+    }
+    rows
+}
+
+/// Fetch ticker details and write a map file for `ticker`.
+pub async fn fetch_and_write_map_file(
+    client: &crate::client::MassiveRestClient,
+    map_path: &Path,
+    ticker: &str,
+    today: NaiveDate,
+) -> Result<Vec<MapFileEntry>> {
+    info!("Massive: fetching ticker details for {}", ticker);
+
+    let details = client
+        .get_ticker_details(ticker)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let (list_date, delisting_date) = if let Some(d) = details {
+        let ld = d
+            .list_date
+            .as_deref()
+            .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
+        let dd = d.delisted_utc.as_deref().and_then(|s| {
+            // delisted_utc may be "YYYY-MM-DDTHH:MM:SSZ" or "YYYY-MM-DD"
+            let date_part = s.split('T').next().unwrap_or(s);
+            NaiveDate::parse_from_str(date_part, "%Y-%m-%d").ok()
+        });
+        (ld, dd)
+    } else {
+        (None, None)
+    };
+
+    let rows = compute_map_file_rows(ticker, list_date, delisting_date, today);
+    write_map_file(map_path, &rows)?;
+    Ok(rows)
+}
+
+/// Write map file rows (newest first) to a Parquet file.
+pub fn write_map_file(path: &Path, rows: &[MapFileEntry]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).context("create map_files dir")?;
+    }
+    let writer = ParquetWriter::new(WriterConfig::default());
+    writer
+        .write_map_file(rows, path)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    /// Split rows must be placed at execution_date - 1 so that rlean's
+    /// `max(date < bar_date)` look-up selects the correct factor on the
+    /// first post-split bar (execution_date itself).
+    ///
+    /// Also verifies that a base row (sf=0.5 for a 2-for-1 split) is present
+    /// at a far-past date so pre-split bars are correctly halved.
+    #[test]
+    fn split_row_is_placed_at_ex_date_minus_one() {
+        let ex_date = date(2025, 12, 5); // Friday — first post-split trading day
+        let expected_row_date = date(2025, 12, 4); // Thursday
+
+        let split = crate::models::MassiveSplitItem {
+            ticker: "XLK".to_string(),
+            execution_date: "2025-12-05".to_string(),
+            split_from: 1.0,
+            split_to: 2.0,
+        };
+        let today = date(2026, 1, 1);
+        let rows = compute_factor_rows(&[split], &[], &HashMap::new(), today);
+
+        // Find the boundary row at ex_date-1.
+        let split_row = rows.iter()
+            .find(|r| r.date == expected_row_date)
+            .expect("split boundary row at ex_date-1 must exist");
+
+        assert_eq!(
+            split_row.date, expected_row_date,
+            "split row date should be ex_date-1={} so rlean runner applies it starting on ex_date={}",
+            expected_row_date, ex_date
+        );
+        // The boundary row must carry sf=1.0 (post-split era, no adjustment).
+        assert!(
+            (split_row.split_factor - 1.0).abs() < 1e-9,
+            "split boundary row split_factor should be 1.0 (post-split era), got {}",
+            split_row.split_factor
+        );
+
+        // A base row must exist with sf=0.5 (pre-split era, halve raw prices).
+        let base_row = rows.iter()
+            .min_by_key(|r| r.date)
+            .expect("at least one row must exist");
+        assert!(
+            (base_row.split_factor - 0.5).abs() < 1e-9,
+            "base row split_factor should be 0.5 (pre-split era), got {}",
+            base_row.split_factor
+        );
     }
 
     #[test]

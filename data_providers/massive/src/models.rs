@@ -71,6 +71,32 @@ pub struct MassiveDividendItem {
     pub dividend_type: String,
 }
 
+/// Response from Massive's `/v3/reference/tickers/{ticker}` endpoint.
+#[derive(Debug, Deserialize)]
+pub struct TickerDetailsResponse {
+    pub results: Option<TickerDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TickerDetails {
+    pub ticker: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub primary_exchange: String,
+    /// ISO 8601 date string "YYYY-MM-DD" if delisted.
+    pub delisted_utc: Option<String>,
+    /// "YYYY-MM-DD" listing date.
+    pub list_date: Option<String>,
+    /// false if delisted/inactive.
+    #[serde(default = "default_true")]
+    pub active: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
