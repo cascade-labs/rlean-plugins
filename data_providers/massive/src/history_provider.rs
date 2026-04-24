@@ -11,7 +11,7 @@ use lean_data::{IHistoricalDataProvider, TradeBar};
 use lean_storage::{ParquetWriter, PathResolver, WriterConfig};
 
 use crate::client::MassiveRestClient;
-use crate::corporate_actions::fetch_and_write_factor_file;
+use crate::corporate_actions::{fetch_and_write_factor_file, fetch_and_write_map_file};
 
 /// Massive historical data provider.
 ///
@@ -51,6 +51,17 @@ impl MassiveHistoryProvider {
             .join(format!("{ticker}.parquet"))
     }
 
+    /// Path to the LEAN map file for a symbol.
+    fn map_file_path(&self, symbol: &Symbol) -> std::path::PathBuf {
+        let ticker = symbol.permtick.to_lowercase();
+        let market = symbol.market().as_str().to_lowercase();
+        self.resolver.data_root
+            .join("equity")
+            .join(&market)
+            .join("map_files")
+            .join(format!("{ticker}.parquet"))
+    }
+
     async fn fetch_and_cache(
         &self,
         symbol: Symbol,
@@ -71,12 +82,22 @@ impl MassiveHistoryProvider {
         // Write bars to disk.
         self.write_to_disk(&symbol, resolution, &bars)?;
 
-        // For equity daily bars, also fetch corporate actions and write factor file.
+        // For equity daily bars, also fetch corporate actions and write factor file,
+        // and fetch ticker details to write the map file.
         if resolution == Resolution::Daily {
             if let Err(e) = self.fetch_and_write_factor_file(&symbol, start, end, &bars).await {
                 // Non-fatal: log the error but continue.
                 tracing::warn!(
                     "Massive: could not generate factor file for {}: {}",
+                    symbol.value, e
+                );
+            }
+            let map_path = self.map_file_path(&symbol);
+            let ticker = symbol.permtick.to_uppercase();
+            let today = chrono::Utc::now().date_naive();
+            if let Err(e) = fetch_and_write_map_file(&self.client, &map_path, &ticker, today).await {
+                tracing::warn!(
+                    "Massive: could not generate map file for {}: {}",
                     symbol.value, e
                 );
             }
@@ -200,6 +221,17 @@ impl lean_data_providers::IHistoryProvider for MassiveHistoryProvider {
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
                     }
 
+                    Ok(vec![])
+                })
+            }
+            DataType::MapFile => {
+                rt.block_on(async {
+                    let map_path = self.map_file_path(&request.symbol);
+                    let ticker = request.symbol.permtick.to_uppercase();
+                    let today = chrono::Utc::now().date_naive();
+                    fetch_and_write_map_file(&self.client, &map_path, &ticker, today)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
                     Ok(vec![])
                 })
             }

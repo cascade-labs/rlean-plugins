@@ -8,6 +8,7 @@ pub use client::MassiveRestClient;
 pub use corporate_actions::{
     read_factor_file, write_factor_file, factor_for_date,
     fetch_and_write_factor_file,
+    compute_map_file_rows, write_map_file, fetch_and_write_map_file,
 };
 
 use lean_data_providers::IHistoryProvider;
