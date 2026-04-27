@@ -126,7 +126,7 @@ impl ICustomDataSource for FredDataSource {
             serde_json::Value::String(config.ticker.clone()),
         );
 
-        Some(CustomDataPoint { time: parsed_date, value, fields })
+        Some(CustomDataPoint { time: parsed_date, end_time: None, value, fields })
     }
 
     fn is_full_history_source(&self) -> bool { true }
@@ -162,7 +162,7 @@ impl ICustomDataSource for FredDataSource {
             serde_json::Value::String(config.ticker.clone()),
         );
 
-        Some(CustomDataPoint { time: date, value, fields })
+        Some(CustomDataPoint { time: date, end_time: None, value, fields })
     }
 }
 

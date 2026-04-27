@@ -104,7 +104,7 @@ impl ICustomDataSource for CboeVixDataSource {
         fields.insert("low".to_string(),   serde_json::json!(low.to_string()));
         fields.insert("close".to_string(), serde_json::json!(close.to_string()));
 
-        Some(CustomDataPoint { time: parsed_date, value: close, fields })
+        Some(CustomDataPoint { time: parsed_date, end_time: None, value: close, fields })
     }
 
     fn is_full_history_source(&self) -> bool { true }
