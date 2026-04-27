@@ -30,7 +30,9 @@ pub struct InteractiveBrokersBrokerageModel {
 
 impl Default for InteractiveBrokersBrokerageModel {
     fn default() -> Self {
-        Self { account_type: IbAccountType::RegT }
+        Self {
+            account_type: IbAccountType::RegT,
+        }
     }
 }
 
@@ -39,13 +41,21 @@ impl InteractiveBrokersBrokerageModel {
         Self { account_type }
     }
 
-    pub fn reg_t() -> Self { Self::new(IbAccountType::RegT) }
-    pub fn portfolio() -> Self { Self::new(IbAccountType::Portfolio) }
-    pub fn cash() -> Self { Self::new(IbAccountType::Cash) }
+    pub fn reg_t() -> Self {
+        Self::new(IbAccountType::RegT)
+    }
+    pub fn portfolio() -> Self {
+        Self::new(IbAccountType::Portfolio)
+    }
+    pub fn cash() -> Self {
+        Self::new(IbAccountType::Cash)
+    }
 }
 
 impl BrokerageModel for InteractiveBrokersBrokerageModel {
-    fn name(&self) -> &str { "InteractiveBrokers" }
+    fn name(&self) -> &str {
+        "InteractiveBrokers"
+    }
 
     fn transaction_model(&self) -> Box<dyn SecurityTransactionModel> {
         Box::new(InteractiveBrokersFeeModel)
@@ -68,13 +78,19 @@ impl BrokerageModel for InteractiveBrokersBrokerageModel {
     ///
     /// Accepted: Market, Limit, StopMarket, StopLimit, TrailingStop,
     /// MarketOnOpen, MarketOnClose, LimitIfTouched, OptionExercise.
-    fn can_submit_order(&self) -> bool { true }
+    fn can_submit_order(&self) -> bool {
+        true
+    }
 
     /// IB allows order updates (quantity, price) for most order types.
-    fn can_update_order(&self) -> bool { true }
+    fn can_update_order(&self) -> bool {
+        true
+    }
 
     /// IB can execute all non-Base security types.
-    fn can_execute_order(&self) -> bool { true }
+    fn can_execute_order(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -85,21 +101,38 @@ mod tests {
     use rust_decimal_macros::dec;
 
     #[test]
-    fn name() { assert_eq!(InteractiveBrokersBrokerageModel::default().name(), "InteractiveBrokers"); }
+    fn name() {
+        assert_eq!(
+            InteractiveBrokersBrokerageModel::default().name(),
+            "InteractiveBrokers"
+        );
+    }
 
     #[test]
-    fn cash_leverage_is_one() { assert_eq!(InteractiveBrokersBrokerageModel::cash().default_leverage(), 1.0); }
+    fn cash_leverage_is_one() {
+        assert_eq!(
+            InteractiveBrokersBrokerageModel::cash().default_leverage(),
+            1.0
+        );
+    }
 
     #[test]
     fn portfolio_leverage_higher_than_regt() {
-        assert!(InteractiveBrokersBrokerageModel::portfolio().default_leverage()
-              > InteractiveBrokersBrokerageModel::reg_t().default_leverage());
+        assert!(
+            InteractiveBrokersBrokerageModel::portfolio().default_leverage()
+                > InteractiveBrokersBrokerageModel::reg_t().default_leverage()
+        );
     }
 
     #[test]
     fn commission_is_positive() {
-        let fee = InteractiveBrokersBrokerageModel::default().transaction_model()
-            .get_order_fee(&OrderFeeParameters { security_price: dec!(100), order_quantity: dec!(100), order_direction: OrderDirection::Buy });
+        let fee = InteractiveBrokersBrokerageModel::default()
+            .transaction_model()
+            .get_order_fee(&OrderFeeParameters {
+                security_price: dec!(100),
+                order_quantity: dec!(100),
+                order_direction: OrderDirection::Buy,
+            });
         assert!(fee.value > dec!(0), "IB charges commission on equities");
     }
 }

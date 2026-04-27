@@ -2,7 +2,9 @@
 ///
 /// Tradier offers commission-free equity trading, so the fee model returns $0.
 /// Margin accounts get 2× leverage (consistent with Reg T / FINRA).
-use lean_orders::security_transaction_model::{OrderFee, OrderFeeParameters, SecurityTransactionModel};
+use lean_orders::security_transaction_model::{
+    OrderFee, OrderFeeParameters, SecurityTransactionModel,
+};
 
 use lean_brokerages::BrokerageModel;
 
@@ -22,18 +24,28 @@ impl SecurityTransactionModel for TradierFeeModel {
 pub struct TradierBrokerageModel;
 
 impl BrokerageModel for TradierBrokerageModel {
-    fn name(&self) -> &str { "Tradier" }
+    fn name(&self) -> &str {
+        "Tradier"
+    }
 
     fn transaction_model(&self) -> Box<dyn SecurityTransactionModel> {
         Box::new(TradierFeeModel)
     }
 
     /// 2× leverage matches Reg T margin (same as the C# default for US equity).
-    fn default_leverage(&self) -> f64 { 2.0 }
+    fn default_leverage(&self) -> f64 {
+        2.0
+    }
 
-    fn can_submit_order(&self) -> bool { true }
-    fn can_update_order(&self) -> bool { true }
-    fn can_execute_order(&self) -> bool { true }
+    fn can_submit_order(&self) -> bool {
+        true
+    }
+    fn can_update_order(&self) -> bool {
+        true
+    }
+    fn can_execute_order(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -43,7 +55,11 @@ mod tests {
     use rust_decimal_macros::dec;
 
     fn params(price: rust_decimal::Decimal, qty: rust_decimal::Decimal) -> OrderFeeParameters {
-        OrderFeeParameters { security_price: price, order_quantity: qty, order_direction: OrderDirection::Buy }
+        OrderFeeParameters {
+            security_price: price,
+            order_quantity: qty,
+            order_direction: OrderDirection::Buy,
+        }
     }
 
     #[test]
@@ -60,17 +76,24 @@ mod tests {
     }
 
     #[test]
-    fn brokerage_model_name() { assert_eq!(TradierBrokerageModel.name(), "Tradier"); }
+    fn brokerage_model_name() {
+        assert_eq!(TradierBrokerageModel.name(), "Tradier");
+    }
 
     #[test]
-    fn default_leverage_is_two() { assert_eq!(TradierBrokerageModel.default_leverage(), 2.0); }
+    fn default_leverage_is_two() {
+        assert_eq!(TradierBrokerageModel.default_leverage(), 2.0);
+    }
 
     #[test]
-    fn can_submit() { assert!(TradierBrokerageModel.can_submit_order()); }
+    fn can_submit() {
+        assert!(TradierBrokerageModel.can_submit_order());
+    }
 
     #[test]
     fn transaction_model_zero_fee() {
-        let fee = TradierBrokerageModel.transaction_model()
+        let fee = TradierBrokerageModel
+            .transaction_model()
             .get_order_fee(&params(dec!(100), dec!(100)));
         assert_eq!(fee.value, dec!(0));
     }

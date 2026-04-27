@@ -31,21 +31,37 @@ pub struct OandaBrokerageModel {
 
 impl Default for OandaBrokerageModel {
     /// US-regulation default: 50:1 on major forex pairs.
-    fn default() -> Self { Self { max_leverage: dec!(50) } }
+    fn default() -> Self {
+        Self {
+            max_leverage: dec!(50),
+        }
+    }
 }
 
 impl OandaBrokerageModel {
     /// US-regulation account (50:1 major pairs).
-    pub fn us() -> Self { Self { max_leverage: dec!(50) } }
+    pub fn us() -> Self {
+        Self {
+            max_leverage: dec!(50),
+        }
+    }
 
     /// EU/ESMA-regulated account (30:1 major pairs).
-    pub fn eu() -> Self { Self { max_leverage: dec!(30) } }
+    pub fn eu() -> Self {
+        Self {
+            max_leverage: dec!(30),
+        }
+    }
 
-    pub fn new(max_leverage: Decimal) -> Self { Self { max_leverage } }
+    pub fn new(max_leverage: Decimal) -> Self {
+        Self { max_leverage }
+    }
 }
 
 impl BrokerageModel for OandaBrokerageModel {
-    fn name(&self) -> &str { "Oanda" }
+    fn name(&self) -> &str {
+        "Oanda"
+    }
 
     /// OANDA is spread-based — no explicit per-trade commission.
     fn transaction_model(&self) -> Box<dyn SecurityTransactionModel> {
@@ -64,12 +80,18 @@ impl BrokerageModel for OandaBrokerageModel {
 
     /// OANDA only accepts Forex and CFD orders.
     /// Supported types: Market, Limit, StopMarket, StopLimit (GTC only).
-    fn can_submit_order(&self) -> bool { true }
+    fn can_submit_order(&self) -> bool {
+        true
+    }
 
     /// OANDA allows order modifications.
-    fn can_update_order(&self) -> bool { true }
+    fn can_update_order(&self) -> bool {
+        true
+    }
 
-    fn can_execute_order(&self) -> bool { true }
+    fn can_execute_order(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -80,18 +102,29 @@ mod tests {
     use rust_decimal_macros::dec;
 
     #[test]
-    fn name() { assert_eq!(OandaBrokerageModel::default().name(), "Oanda"); }
+    fn name() {
+        assert_eq!(OandaBrokerageModel::default().name(), "Oanda");
+    }
 
     #[test]
-    fn us_leverage_50() { assert_eq!(OandaBrokerageModel::us().default_leverage(), 50.0); }
+    fn us_leverage_50() {
+        assert_eq!(OandaBrokerageModel::us().default_leverage(), 50.0);
+    }
 
     #[test]
-    fn eu_leverage_30() { assert_eq!(OandaBrokerageModel::eu().default_leverage(), 30.0); }
+    fn eu_leverage_30() {
+        assert_eq!(OandaBrokerageModel::eu().default_leverage(), 30.0);
+    }
 
     #[test]
     fn spread_only_no_commission() {
-        let fee = OandaBrokerageModel::default().transaction_model()
-            .get_order_fee(&OrderFeeParameters { security_price: dec!(1), order_quantity: dec!(100000), order_direction: OrderDirection::Buy });
+        let fee = OandaBrokerageModel::default()
+            .transaction_model()
+            .get_order_fee(&OrderFeeParameters {
+                security_price: dec!(1),
+                order_quantity: dec!(100000),
+                order_direction: OrderDirection::Buy,
+            });
         assert_eq!(fee.value, dec!(0));
     }
 }

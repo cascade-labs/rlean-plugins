@@ -1,10 +1,10 @@
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
-use reqwest::Client;
-use rust_decimal::Decimal;
+use reqwest::blocking::Client;
 use rust_decimal::prelude::FromPrimitive;
-use tokio::sync::Mutex;
+use rust_decimal::Decimal;
 use tracing::{info, warn};
 
 use chrono::{NaiveDate, TimeZone, Utc};
@@ -13,7 +13,10 @@ use lean_core::{DateTime, NanosecondTimestamp, Resolution, Symbol, TimeSpan};
 use lean_data::TradeBar;
 use serde::de::DeserializeOwned;
 
-use crate::models::{AggregatesResponse, MassiveDividendItem, MassiveSplitItem, PaginatedResponse, TickerDetails, TickerDetailsResponse};
+use crate::models::{
+    AggregatesResponse, MassiveDividendItem, MassiveSplitItem, PaginatedResponse, TickerDetails,
+    TickerDetailsResponse,
+};
 
 const BASE_URL: &str = "https://api.massive.com";
 const MAX_RETRIES: u32 = 5;
@@ -55,10 +58,10 @@ impl RateLimiter {
     }
 
     async fn wait(&self) {
-        let mut last = self.last.lock().await;
+        let mut last = self.last.lock().expect("rate limiter mutex poisoned");
         let elapsed = last.elapsed();
         if elapsed < self.min_interval {
-            tokio::time::sleep(self.min_interval - elapsed).await;
+            std::thread::sleep(self.min_interval - elapsed);
         }
         *last = Instant::now();
     }
@@ -92,7 +95,9 @@ impl MassiveRestClient {
         }
     }
 
-    pub fn api_key(&self) -> &str { &self.api_key }
+    pub fn api_key(&self) -> &str {
+        &self.api_key
+    }
 
     /// Fetch aggregate (OHLCV) bars for a symbol over the given UTC range.
     ///
@@ -106,11 +111,11 @@ impl MassiveRestClient {
         end: DateTime,
         adjusted: bool,
     ) -> Result<Vec<TradeBar>> {
-        let ticker  = symbol.permtick.to_uppercase();
+        let ticker = symbol.permtick.to_uppercase();
         let timespan = resolution_to_timespan(resolution)?;
         let start_ms = start.0 / 1_000_000;
-        let end_ms   = end.0   / 1_000_000;
-        let adj_str  = if adjusted { "true" } else { "false" };
+        let end_ms = end.0 / 1_000_000;
+        let adj_str = if adjusted { "true" } else { "false" };
 
         info!(
             "Massive: downloading {} {} bars for {} ({} → {}, adjusted={})",
@@ -141,14 +146,14 @@ impl MassiveRestClient {
                     let time = NanosecondTimestamp::from_millis(corrected_ms);
                     let dec = |f: f64| Decimal::from_f64(f).unwrap_or_default();
                     all_bars.push(TradeBar {
-                        symbol:   symbol.clone(),
+                        symbol: symbol.clone(),
                         time,
                         end_time: NanosecondTimestamp(time.0 + period.nanos),
-                        open:     dec(bar.open),
-                        high:     dec(bar.high),
-                        low:      dec(bar.low),
-                        close:    dec(bar.close),
-                        volume:   dec(bar.volume),
+                        open: dec(bar.open),
+                        high: dec(bar.high),
+                        low: dec(bar.low),
+                        close: dec(bar.close),
+                        volume: dec(bar.volume),
                         period,
                     });
                 }
@@ -205,7 +210,11 @@ impl MassiveRestClient {
     }
 
     /// Generic paginated fetch for Massive's v3 reference endpoints.
-    async fn fetch_paged<T: DeserializeOwned>(&self, initial_url: String, out: &mut Vec<T>) -> Result<()> {
+    async fn fetch_paged<T: DeserializeOwned>(
+        &self,
+        initial_url: String,
+        out: &mut Vec<T>,
+    ) -> Result<()> {
         let mut url = initial_url;
         loop {
             self.limiter.wait().await;
@@ -229,22 +238,25 @@ impl MassiveRestClient {
         );
         self.limiter.wait().await;
         for attempt in 0..MAX_RETRIES {
-            match self.http.get(&url).send().await {
+            match self.http.get(&url).send() {
                 Ok(r) if r.status() == 404 => return Ok(None),
                 Ok(r) if r.status() == 429 => {
                     let wait = Duration::from_secs(10 * (attempt as u64 + 1));
-                    warn!("Massive: rate limited (429), waiting {:.0}s", wait.as_secs_f64());
-                    tokio::time::sleep(wait).await;
+                    warn!(
+                        "Massive: rate limited (429), waiting {:.0}s",
+                        wait.as_secs_f64()
+                    );
+                    std::thread::sleep(wait);
                     continue;
                 }
                 Ok(r) if r.status().is_success() => {
-                    let resp = r.json::<TickerDetailsResponse>().await?;
+                    let resp = r.json::<TickerDetailsResponse>()?;
                     return Ok(resp.results);
                 }
                 Ok(r) => bail!("Massive API error: HTTP {}", r.status()),
                 Err(e) if attempt + 1 < MAX_RETRIES => {
                     warn!("Massive: request error (attempt {}): {}", attempt + 1, e);
-                    tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
+                    std::thread::sleep(Duration::from_secs(2u64.pow(attempt)));
                     continue;
                 }
                 Err(e) => return Err(e.into()),
@@ -255,22 +267,25 @@ impl MassiveRestClient {
 
     async fn fetch_aggs_with_retry(&self, url: &str) -> Result<AggregatesResponse> {
         for attempt in 0..MAX_RETRIES {
-            match self.http.get(url).send().await {
+            match self.http.get(url).send() {
                 Ok(r) if r.status() == 429 => {
                     let wait = Duration::from_secs(10 * (attempt as u64 + 1));
-                    warn!("Massive: rate limited (429), waiting {:.0}s", wait.as_secs_f64());
-                    tokio::time::sleep(wait).await;
+                    warn!(
+                        "Massive: rate limited (429), waiting {:.0}s",
+                        wait.as_secs_f64()
+                    );
+                    std::thread::sleep(wait);
                     continue;
                 }
                 Ok(r) if r.status().is_success() => {
-                    return Ok(r.json::<AggregatesResponse>().await?);
+                    return Ok(r.json::<AggregatesResponse>()?);
                 }
                 Ok(r) => {
                     bail!("Massive API error: HTTP {}", r.status());
                 }
                 Err(e) if attempt + 1 < MAX_RETRIES => {
                     warn!("Massive: request error (attempt {}): {}", attempt + 1, e);
-                    tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
+                    std::thread::sleep(Duration::from_secs(2u64.pow(attempt)));
                     continue;
                 }
                 Err(e) => return Err(e.into()),
@@ -279,24 +294,30 @@ impl MassiveRestClient {
         bail!("Massive: max retries ({MAX_RETRIES}) exceeded");
     }
 
-    async fn fetch_paged_with_retry<T: DeserializeOwned>(&self, url: &str) -> Result<PaginatedResponse<T>> {
+    async fn fetch_paged_with_retry<T: DeserializeOwned>(
+        &self,
+        url: &str,
+    ) -> Result<PaginatedResponse<T>> {
         for attempt in 0..MAX_RETRIES {
-            match self.http.get(url).send().await {
+            match self.http.get(url).send() {
                 Ok(r) if r.status() == 429 => {
                     let wait = Duration::from_secs(10 * (attempt as u64 + 1));
-                    warn!("Massive: rate limited (429), waiting {:.0}s", wait.as_secs_f64());
-                    tokio::time::sleep(wait).await;
+                    warn!(
+                        "Massive: rate limited (429), waiting {:.0}s",
+                        wait.as_secs_f64()
+                    );
+                    std::thread::sleep(wait);
                     continue;
                 }
                 Ok(r) if r.status().is_success() => {
-                    return Ok(r.json::<PaginatedResponse<T>>().await?);
+                    return Ok(r.json::<PaginatedResponse<T>>()?);
                 }
                 Ok(r) => {
                     bail!("Massive API error: HTTP {}", r.status());
                 }
                 Err(e) if attempt + 1 < MAX_RETRIES => {
                     warn!("Massive: request error (attempt {}): {}", attempt + 1, e);
-                    tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
+                    std::thread::sleep(Duration::from_secs(2u64.pow(attempt)));
                     continue;
                 }
                 Err(e) => return Err(e.into()),
@@ -308,11 +329,11 @@ impl MassiveRestClient {
 
 fn resolution_to_timespan(res: Resolution) -> Result<&'static str> {
     match res {
-        Resolution::Tick   => bail!("Tick resolution not supported via the aggregates API"),
+        Resolution::Tick => bail!("Tick resolution not supported via the aggregates API"),
         Resolution::Second => Ok("second"),
         Resolution::Minute => Ok("minute"),
-        Resolution::Hour   => Ok("hour"),
-        Resolution::Daily  => Ok("day"),
+        Resolution::Hour => Ok("hour"),
+        Resolution::Daily => Ok("day"),
     }
 }
 
@@ -322,7 +343,10 @@ mod tests {
 
     #[test]
     fn resolution_second_maps_to_second() {
-        assert_eq!(resolution_to_timespan(Resolution::Second).unwrap(), "second");
+        assert_eq!(
+            resolution_to_timespan(Resolution::Second).unwrap(),
+            "second"
+        );
     }
 
     #[test]

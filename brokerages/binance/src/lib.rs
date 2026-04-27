@@ -13,9 +13,7 @@
 ///
 /// 24/7 trading on all markets.
 use lean_brokerages::BrokerageModel;
-use lean_orders::security_transaction_model::{
-    BinanceFeeModel, SecurityTransactionModel,
-};
+use lean_orders::security_transaction_model::{BinanceFeeModel, SecurityTransactionModel};
 use rust_decimal_macros::dec;
 
 /// Which Binance product line this model represents.
@@ -35,24 +33,38 @@ pub struct BinanceBrokerageModel {
 }
 
 impl Default for BinanceBrokerageModel {
-    fn default() -> Self { Self { market: BinanceMarket::Spot } }
+    fn default() -> Self {
+        Self {
+            market: BinanceMarket::Spot,
+        }
+    }
 }
 
 impl BinanceBrokerageModel {
-    pub fn new(market: BinanceMarket) -> Self { Self { market } }
-    pub fn spot() -> Self { Self::new(BinanceMarket::Spot) }
-    pub fn usdt_futures() -> Self { Self::new(BinanceMarket::UsdtFutures) }
-    pub fn coin_futures() -> Self { Self::new(BinanceMarket::CoinFutures) }
+    pub fn new(market: BinanceMarket) -> Self {
+        Self { market }
+    }
+    pub fn spot() -> Self {
+        Self::new(BinanceMarket::Spot)
+    }
+    pub fn usdt_futures() -> Self {
+        Self::new(BinanceMarket::UsdtFutures)
+    }
+    pub fn coin_futures() -> Self {
+        Self::new(BinanceMarket::CoinFutures)
+    }
 }
 
 impl BrokerageModel for BinanceBrokerageModel {
-    fn name(&self) -> &str { "Binance" }
+    fn name(&self) -> &str {
+        "Binance"
+    }
 
     fn transaction_model(&self) -> Box<dyn SecurityTransactionModel> {
         match self.market {
             BinanceMarket::Spot => Box::new(BinanceFeeModel {
-                taker_rate: dec!(0.001),  // 0.10%
-                maker_rate: dec!(0.001),  // 0.10%
+                taker_rate: dec!(0.001), // 0.10%
+                maker_rate: dec!(0.001), // 0.10%
             }),
             BinanceMarket::UsdtFutures | BinanceMarket::CoinFutures => {
                 Box::new(BinanceFeeModel {
@@ -76,13 +88,19 @@ impl BrokerageModel for BinanceBrokerageModel {
     }
 
     /// Binance accepts all standard crypto order types.
-    fn can_submit_order(&self) -> bool { true }
+    fn can_submit_order(&self) -> bool {
+        true
+    }
 
     /// Binance does **not** support in-place order updates.
     /// Cancel the old order and submit a new one.
-    fn can_update_order(&self) -> bool { false }
+    fn can_update_order(&self) -> bool {
+        false
+    }
 
-    fn can_execute_order(&self) -> bool { true }
+    fn can_execute_order(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -93,21 +111,32 @@ mod tests {
     use rust_decimal_macros::dec;
 
     #[test]
-    fn name() { assert_eq!(BinanceBrokerageModel::spot().name(), "Binance"); }
-
-    #[test]
-    fn futures_leverage_higher_than_spot() {
-        assert!(BinanceBrokerageModel::usdt_futures().default_leverage()
-              > BinanceBrokerageModel::spot().default_leverage());
+    fn name() {
+        assert_eq!(BinanceBrokerageModel::spot().name(), "Binance");
     }
 
     #[test]
-    fn cannot_update_order() { assert!(!BinanceBrokerageModel::default().can_update_order()); }
+    fn futures_leverage_higher_than_spot() {
+        assert!(
+            BinanceBrokerageModel::usdt_futures().default_leverage()
+                > BinanceBrokerageModel::spot().default_leverage()
+        );
+    }
+
+    #[test]
+    fn cannot_update_order() {
+        assert!(!BinanceBrokerageModel::default().can_update_order());
+    }
 
     #[test]
     fn spot_fee_positive() {
-        let fee = BinanceBrokerageModel::spot().transaction_model()
-            .get_order_fee(&OrderFeeParameters { security_price: dec!(100), order_quantity: dec!(1), order_direction: OrderDirection::Buy });
+        let fee = BinanceBrokerageModel::spot()
+            .transaction_model()
+            .get_order_fee(&OrderFeeParameters {
+                security_price: dec!(100),
+                order_quantity: dec!(1),
+                order_direction: OrderDirection::Buy,
+            });
         assert!(fee.value > dec!(0));
     }
 }

@@ -7,24 +7,20 @@
 ///   - Concurrent request limiting (default 4 — STANDARD plan cap)
 ///   - Retry on 429 with exponential back-off + jitter
 ///   - Treat HTTP 472 / 475 / 572 as "no data" (empty result, not an error)
-///   - Option EOD chain data is cached in structured Parquet files under
-///     `{data_root}/option/usa/daily/{underlying}/{underlying}_eod.parquet`
+///   - Option EOD chain data is cached in partitioned Parquet files under
+///     `{data_root}/option/usa/daily/trade/date=YYYY-MM-DD/data.parquet`
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use chrono::NaiveDate;
-use reqwest::Client;
+use reqwest::blocking::Client;
 use rust_decimal::Decimal;
 use serde::de::DeserializeOwned;
-use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, warn};
 
-use lean_storage::{
-    OptionEodBar,
-    ParquetReader, ParquetWriter, WriterConfig,
-};
+use lean_storage::{OptionEodBar, ParquetReader, ParquetWriter, WriterConfig};
 
 use crate::models::*;
 
@@ -51,10 +47,10 @@ impl RateLimiter {
     }
 
     async fn wait(&self) {
-        let mut last = self.last.lock().await;
+        let mut last = self.last.lock().expect("rate limiter mutex poisoned");
         let elapsed = last.elapsed();
         if elapsed < self.min_interval {
-            tokio::time::sleep(self.min_interval - elapsed).await;
+            std::thread::sleep(self.min_interval - elapsed);
         }
         *last = Instant::now();
     }
@@ -65,24 +61,21 @@ pub struct ThetaDataClient {
     access_token: Option<String>,
     base_url: String,
     limiter: RateLimiter,
-    semaphore: Arc<Semaphore>,
-    /// Root of the structured data store. Option EOD bars are written to
-    /// `{data_root}/option/usa/daily/{underlying}/{underlying}_eod.parquet`.
+    /// Root of the structured data store.
     data_root: PathBuf,
     parquet_writer: ParquetWriter,
     parquet_reader: ParquetReader,
 }
 
 impl ThetaDataClient {
-    /// Canonical path for a per-date option EOD Parquet cache file.
-    ///
-    /// Layout: `{data_root}/option/usa/daily/{ul}/{YYYYMMDD}_eod.parquet`
-    fn option_eod_path_for_date(&self, root: &str, date: NaiveDate) -> PathBuf {
-        let ul = root.to_lowercase();
+    fn option_eod_partition_path(&self, date: NaiveDate) -> PathBuf {
         self.data_root
-            .join("option").join("usa").join("daily")
-            .join(&ul)
-            .join(format!("{}_eod.parquet", date.format("%Y%m%d")))
+            .join("option")
+            .join("usa")
+            .join("daily")
+            .join("trade")
+            .join(format!("date={date}"))
+            .join("data.parquet")
     }
 
     /// Create a new client.
@@ -96,7 +89,7 @@ impl ThetaDataClient {
         access_token: Option<String>,
         base_url: Option<String>,
         requests_per_second: f64,
-        max_concurrent: usize,
+        _max_concurrent: usize,
         data_root: impl AsRef<Path>,
     ) -> Self {
         let http = Client::builder()
@@ -113,7 +106,6 @@ impl ThetaDataClient {
             access_token,
             base_url,
             limiter: RateLimiter::new(requests_per_second),
-            semaphore: Arc::new(Semaphore::new(max_concurrent)),
             data_root: data_root.as_ref().to_path_buf(),
             parquet_writer: ParquetWriter::new(WriterConfig::default()),
             parquet_reader: ParquetReader::new(),
@@ -138,8 +130,7 @@ impl ThetaDataClient {
                 ("start_date", fmt_date(chunk_start)),
                 ("end_date", fmt_date(chunk_end)),
             ];
-            let rows: Vec<serde_json::Value> =
-                self.execute("stock/history/eod", &params).await?;
+            let rows: Vec<serde_json::Value> = self.execute("stock/history/eod", &params).await?;
             for row in rows {
                 if let Some(bar) = parse_stock_eod_row(&row) {
                     all.push(bar);
@@ -168,10 +159,13 @@ impl ThetaDataClient {
                 ("end_date", fmt_date(chunk_end)),
                 ("interval", interval.to_string()),
             ];
-            if let Some(st) = start_time { params.push(("start_time", st.to_string())); }
-            if let Some(et) = end_time   { params.push(("end_time",   et.to_string())); }
-            let rows: Vec<serde_json::Value> =
-                self.execute("stock/history/ohlc", &params).await?;
+            if let Some(st) = start_time {
+                params.push(("start_time", st.to_string()));
+            }
+            if let Some(et) = end_time {
+                params.push(("end_time", et.to_string()));
+            }
+            let rows: Vec<serde_json::Value> = self.execute("stock/history/ohlc", &params).await?;
             for row in rows {
                 if let Some(bar) = parse_stock_ohlc_row(&row) {
                     all.push(bar);
@@ -199,10 +193,13 @@ impl ThetaDataClient {
                 ("date", fmt_date(d)),
                 ("interval", interval.to_string()),
             ];
-            if let Some(st) = start_time { params.push(("start_time", st.to_string())); }
-            if let Some(et) = end_time   { params.push(("end_time",   et.to_string())); }
-            let rows: Vec<serde_json::Value> =
-                self.execute("stock/history/quote", &params).await?;
+            if let Some(st) = start_time {
+                params.push(("start_time", st.to_string()));
+            }
+            if let Some(et) = end_time {
+                params.push(("end_time", et.to_string()));
+            }
+            let rows: Vec<serde_json::Value> = self.execute("stock/history/quote", &params).await?;
             for row in rows {
                 if let Some(q) = parse_stock_quote_row(&row) {
                     all.push(q);
@@ -225,14 +222,14 @@ impl ThetaDataClient {
         let mut all = Vec::new();
         let mut d = start;
         while d <= end {
-            let mut params = vec![
-                ("symbol", symbol.to_string()),
-                ("date", fmt_date(d)),
-            ];
-            if let Some(st) = start_time { params.push(("start_time", st.to_string())); }
-            if let Some(et) = end_time   { params.push(("end_time",   et.to_string())); }
-            let rows: Vec<serde_json::Value> =
-                self.execute("stock/history/trade", &params).await?;
+            let mut params = vec![("symbol", symbol.to_string()), ("date", fmt_date(d))];
+            if let Some(st) = start_time {
+                params.push(("start_time", st.to_string()));
+            }
+            if let Some(et) = end_time {
+                params.push(("end_time", et.to_string()));
+            }
+            let rows: Vec<serde_json::Value> = self.execute("stock/history/trade", &params).await?;
             for row in rows {
                 if let Some(t) = parse_stock_trade_row(&row) {
                     all.push(t);
@@ -255,10 +252,7 @@ impl ThetaDataClient {
         self.get_or_fetch_chain(&cache_key, || {
             let root = root.to_string();
             Box::pin(async move {
-                let params = vec![
-                    ("symbol", root),
-                    ("date", fmt_date(date)),
-                ];
+                let params = vec![("symbol", root), ("date", fmt_date(date))];
                 self.execute("option/list/contracts/quote", &params).await
             })
         })
@@ -398,7 +392,11 @@ impl ThetaDataClient {
         interval: &str,
     ) -> Result<Vec<QuoteBar>> {
         let contract_key = option_contract_key(expiration, strike, right);
-        let cache_key = format!("{root}-{}-{}-quote-{interval}", fmt_date(start), fmt_date(end));
+        let cache_key = format!(
+            "{root}-{}-{}-quote-{interval}",
+            fmt_date(start),
+            fmt_date(end)
+        );
         let all_rows: Vec<V3OptionQuote> = self
             .get_or_fetch_chain(&cache_key, || {
                 let root = root.to_string();
@@ -429,13 +427,22 @@ impl ThetaDataClient {
             .filter(|r| option_row_matches(&r.expiration, r.strike, &r.right, &contract_key))
             .filter_map(|r| {
                 let date = parse_date(&r.date, &r.timestamp)?;
-                let ms = if r.ms_of_day > 0 { r.ms_of_day } else { ms_of_day_from_timestamp(&r.timestamp) };
+                let ms = if r.ms_of_day > 0 {
+                    r.ms_of_day
+                } else {
+                    ms_of_day_from_timestamp(&r.timestamp)
+                };
                 Some(QuoteBar {
-                    date, ms_of_day: ms,
-                    bid_size: r.bid_size, bid_exchange: r.bid_exchange,
-                    bid_price: r.bid_price, bid_condition: r.bid_condition,
-                    ask_size: r.ask_size, ask_exchange: r.ask_exchange,
-                    ask_price: r.ask_price, ask_condition: r.ask_condition,
+                    date,
+                    ms_of_day: ms,
+                    bid_size: r.bid_size,
+                    bid_exchange: r.bid_exchange,
+                    bid_price: r.bid_price,
+                    bid_condition: r.bid_condition,
+                    ask_size: r.ask_size,
+                    ask_exchange: r.ask_exchange,
+                    ask_price: r.ask_price,
+                    ask_condition: r.ask_condition,
                 })
             })
             .collect())
@@ -481,8 +488,19 @@ impl ThetaDataClient {
             .filter(|r| option_row_matches(&r.expiration, r.strike, &r.right, &contract_key))
             .filter_map(|r| {
                 let date = parse_date(&r.date, &r.timestamp)?;
-                let ms = if r.ms_of_day > 0 { r.ms_of_day } else { ms_of_day_from_timestamp(&r.timestamp) };
-                Some(TradeTick { date, ms_of_day: ms, price: r.price, size: r.size, exchange: r.exchange, condition: r.condition })
+                let ms = if r.ms_of_day > 0 {
+                    r.ms_of_day
+                } else {
+                    ms_of_day_from_timestamp(&r.timestamp)
+                };
+                Some(TradeTick {
+                    date,
+                    ms_of_day: ms,
+                    price: r.price,
+                    size: r.size,
+                    exchange: r.exchange,
+                    condition: r.condition,
+                })
             })
             .collect())
     }
@@ -491,17 +509,13 @@ impl ThetaDataClient {
     ///
     /// Uses `expiration="*"` and `strike="*"` to retrieve the full chain for that date.
     ///
-    /// Date-partitioned layout: `{data_root}/option/usa/daily/{root_lower}/{YYYYMMDD}_eod.parquet`
-    ///
-    /// Cache check is a single `file.exists()` syscall — no Parquet reads needed.
-    /// On cache hit the file is opened and all rows returned directly (no predicate).
-    /// On cache miss the API is called and a new per-date file is written.
+    /// Date-partitioned layout: `{data_root}/option/usa/daily/trade/date=YYYY-MM-DD/data.parquet`
     pub async fn get_option_eod_for_date(
         &self,
         root: &str,
         date: NaiveDate,
     ) -> Result<Vec<V3OptionEod>> {
-        let parquet_path = self.option_eod_path_for_date(root, date);
+        let parquet_path = self.option_eod_partition_path(date);
 
         // ── Cache hit: one syscall, open file, read all rows ─────────────────
         if parquet_path.exists() {
@@ -509,7 +523,12 @@ impl ThetaDataClient {
                 "ThetaData: cache hit for {root} on {date} at {}",
                 parquet_path.display()
             );
-            let cached = self.parquet_reader.read_option_eod_bars(&[parquet_path])?;
+            let cached = self
+                .parquet_reader
+                .read_option_eod_bars(&[parquet_path])?
+                .into_iter()
+                .filter(|bar| bar.underlying.eq_ignore_ascii_case(root))
+                .collect();
             return Ok(option_eod_bars_to_v3(cached));
         }
 
@@ -526,9 +545,20 @@ impl ThetaDataClient {
         let api_rows: Vec<V3OptionEod> = self.execute("option/history/eod", &params).await?;
 
         if !api_rows.is_empty() {
-            // One file per date — convert and write directly, no merge needed.
             let new_bars: Vec<OptionEodBar> = v3_to_option_eod_bars(root, date, &api_rows);
-            if let Err(e) = self.parquet_writer.write_option_eod_bars(&new_bars, &parquet_path) {
+            let mut merged = if parquet_path.exists() {
+                self.parquet_reader
+                    .read_option_eod_bars(&[parquet_path.clone()])
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            merged.retain(|bar| !bar.underlying.eq_ignore_ascii_case(root));
+            merged.extend_from_slice(&new_bars);
+            if let Err(e) = self
+                .parquet_writer
+                .write_option_eod_bars(&merged, &parquet_path)
+            {
                 warn!("ThetaData: failed to write option EOD Parquet for {root} {date}: {e}");
             } else {
                 debug!(
@@ -553,14 +583,19 @@ impl ThetaDataClient {
         root: &str,
         date: NaiveDate,
     ) -> Result<Vec<OptionEodBar>> {
-        let parquet_path = self.option_eod_path_for_date(root, date);
+        let parquet_path = self.option_eod_partition_path(date);
 
         if parquet_path.exists() {
             debug!(
                 "ThetaData: cache hit for {root} on {date} at {}",
                 parquet_path.display()
             );
-            return Ok(self.parquet_reader.read_option_eod_bars(&[parquet_path])?);
+            return Ok(self
+                .parquet_reader
+                .read_option_eod_bars(&[parquet_path])?
+                .into_iter()
+                .filter(|bar| bar.underlying.eq_ignore_ascii_case(root))
+                .collect());
         }
 
         // Cache miss — fetch from API, write to disk, return as OptionEodBar.
@@ -576,7 +611,19 @@ impl ThetaDataClient {
 
         let bars = v3_to_option_eod_bars(root, date, &api_rows);
         if !bars.is_empty() {
-            if let Err(e) = self.parquet_writer.write_option_eod_bars(&bars, &parquet_path) {
+            let mut merged = if parquet_path.exists() {
+                self.parquet_reader
+                    .read_option_eod_bars(&[parquet_path.clone()])
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            merged.retain(|bar| !bar.underlying.eq_ignore_ascii_case(root));
+            merged.extend_from_slice(&bars);
+            if let Err(e) = self
+                .parquet_writer
+                .write_option_eod_bars(&merged, &parquet_path)
+            {
                 warn!("ThetaData: failed to write option EOD Parquet for {root} {date}: {e}");
             }
         }
@@ -618,10 +665,16 @@ impl ThetaDataClient {
                 let date = parse_date(&r.date, "")?;
                 Some(EodBar {
                     date,
-                    open: r.open, high: r.high, low: r.low, close: r.close,
-                    volume: r.volume, count: r.count,
-                    bid_price: r.bid_price, bid_size: r.bid_size,
-                    ask_price: r.ask_price, ask_size: r.ask_size,
+                    open: r.open,
+                    high: r.high,
+                    low: r.low,
+                    close: r.close,
+                    volume: r.volume,
+                    count: r.count,
+                    bid_price: r.bid_price,
+                    bid_size: r.bid_size,
+                    ask_price: r.ask_price,
+                    ask_size: r.ask_size,
                 })
             })
             .collect())
@@ -646,10 +699,13 @@ impl ThetaDataClient {
                 ("date", fmt_date(d)),
                 ("interval", interval.to_string()),
             ];
-            if let Some(st) = start_time { params.push(("start_time", st.to_string())); }
-            if let Some(et) = end_time   { params.push(("end_time",   et.to_string())); }
-            let rows: Vec<V3IndexPrice> =
-                self.execute("index/history/price", &params).await?;
+            if let Some(st) = start_time {
+                params.push(("start_time", st.to_string()));
+            }
+            if let Some(et) = end_time {
+                params.push(("end_time", et.to_string()));
+            }
+            let rows: Vec<V3IndexPrice> = self.execute("index/history/price", &params).await?;
             for r in rows {
                 if let Some(ip) = parse_index_price(&r) {
                     all.push(ip);
@@ -675,8 +731,7 @@ impl ThetaDataClient {
                 ("start_date", fmt_date(chunk_start)),
                 ("end_date", fmt_date(chunk_end)),
             ];
-            let rows: Vec<serde_json::Value> =
-                self.execute("index/history/eod", &params).await?;
+            let rows: Vec<serde_json::Value> = self.execute("index/history/eod", &params).await?;
             for row in rows {
                 if let Some(bar) = parse_index_eod_row(&row) {
                     all.push(bar);
@@ -698,7 +753,8 @@ impl ThetaDataClient {
         params: &[(&str, String)],
     ) -> Result<Vec<T>> {
         let mut query = format!(
-            "{}{API_VERSION}/{}?format=ndjson", self.base_url,
+            "{}{API_VERSION}/{}?format=ndjson",
+            self.base_url,
             endpoint.trim_start_matches('/')
         );
         for (k, v) in params {
@@ -714,18 +770,16 @@ impl ThetaDataClient {
 
         loop {
             self.limiter.wait().await;
-            let _permit = self.semaphore.acquire().await;
-
             let mut req = self.http.get(&query);
             if let Some(token) = &self.access_token {
                 req = req.bearer_auth(token);
             }
-            let resp = match req.send().await {
+            let resp = match req.send() {
                 Ok(r) => r,
                 Err(e) if gen_retries < MAX_RETRIES => {
                     gen_retries += 1;
                     warn!("ThetaData: request error (retry {gen_retries}): {e}");
-                    tokio::time::sleep(Duration::from_secs(gen_retries as u64)).await;
+                    std::thread::sleep(Duration::from_secs(gen_retries as u64));
                     continue;
                 }
                 Err(e) => bail!("ThetaData: {e}"),
@@ -747,26 +801,28 @@ impl ThetaDataClient {
                 rl_retries += 1;
                 let delay_ms = (2u64.pow(rl_retries)) * 1000 + (rand_jitter() as u64);
                 warn!("ThetaData: rate limited (429), waiting {delay_ms}ms");
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                std::thread::sleep(Duration::from_millis(delay_ms));
                 continue;
             }
 
             if !resp.status().is_success() {
-                let body = resp.text().await.unwrap_or_default();
+                let body = resp.text().unwrap_or_default();
                 if gen_retries < MAX_RETRIES {
                     gen_retries += 1;
                     warn!("ThetaData: HTTP {status} (retry {gen_retries}): {body}");
-                    tokio::time::sleep(Duration::from_secs(gen_retries as u64)).await;
+                    std::thread::sleep(Duration::from_secs(gen_retries as u64));
                     continue;
                 }
                 bail!("ThetaData: HTTP {status} for {endpoint}: {body}");
             }
 
-            let body = resp.text().await?;
+            let body = resp.text()?;
             let mut result = Vec::new();
             for line in body.lines() {
                 let trimmed = line.trim();
-                if trimmed.is_empty() { continue; }
+                if trimmed.is_empty() {
+                    continue;
+                }
                 match serde_json::from_str::<T>(trimmed) {
                     Ok(item) => result.push(item),
                     Err(e) => debug!("ThetaData: skipping malformed row: {e}"),
@@ -788,11 +844,14 @@ impl ThetaDataClient {
         Fut: std::future::Future<Output = Result<Vec<T>>>,
     {
         // JSON cache for intraday/quote/trade chains (not EOD — those use Parquet).
-        let file_path = self.data_root.join(".chain-cache").join(format!("{cache_key}.json"));
+        let file_path = self
+            .data_root
+            .join(".chain-cache")
+            .join(format!("{cache_key}.json"));
 
         if file_path.exists() {
             debug!("ThetaData: chain disk-cache hit for {cache_key}");
-            let json = tokio::fs::read_to_string(&file_path).await?;
+            let json = std::fs::read_to_string(&file_path)?;
             return Ok(serde_json::from_str(&json).unwrap_or_default());
         }
 
@@ -800,10 +859,10 @@ impl ThetaDataClient {
 
         if !data.is_empty() {
             if let Some(parent) = file_path.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
+                let _ = std::fs::create_dir_all(parent);
             }
             if let Ok(json) = serde_json::to_string(&data) {
-                let _ = tokio::fs::write(&file_path, json).await;
+                let _ = std::fs::write(&file_path, json);
             }
         }
 
@@ -905,27 +964,34 @@ fn option_eod_bars_to_v3(bars: Vec<OptionEodBar>) -> Vec<V3OptionEod> {
 
 fn parse_stock_eod_row(row: &serde_json::Value) -> Option<EodBar> {
     let date_str = row["date"].as_str().unwrap_or("");
-    let last_ts  = row["last_trade"].as_str()
+    let last_ts = row["last_trade"]
+        .as_str()
         .or_else(|| row["last_trade_timestamp"].as_str())
         .unwrap_or("");
-    let created_ts = row["created"].as_str()
+    let created_ts = row["created"]
+        .as_str()
         .or_else(|| row["created_timestamp"].as_str())
         .unwrap_or("");
-    let date = parse_date(date_str, last_ts)
-        .or_else(|| parse_date("", created_ts))?;
+    let date = parse_date(date_str, last_ts).or_else(|| parse_date("", created_ts))?;
 
     Some(EodBar {
         date,
-        open:   row["open"].as_f64().unwrap_or(0.0),
-        high:   row["high"].as_f64().unwrap_or(0.0),
-        low:    row["low"].as_f64().unwrap_or(0.0),
-        close:  row["close"].as_f64().unwrap_or(0.0),
+        open: row["open"].as_f64().unwrap_or(0.0),
+        high: row["high"].as_f64().unwrap_or(0.0),
+        low: row["low"].as_f64().unwrap_or(0.0),
+        close: row["close"].as_f64().unwrap_or(0.0),
         volume: row["volume"].as_f64().unwrap_or(0.0),
-        count:  row["count"].as_u64().unwrap_or(0) as u32,
-        bid_price: row["bid_price"].as_f64().or_else(|| row["bid"].as_f64()).unwrap_or(0.0),
-        bid_size:  row["bid_size"].as_f64().unwrap_or(0.0),
-        ask_price: row["ask_price"].as_f64().or_else(|| row["ask"].as_f64()).unwrap_or(0.0),
-        ask_size:  row["ask_size"].as_f64().unwrap_or(0.0),
+        count: row["count"].as_u64().unwrap_or(0) as u32,
+        bid_price: row["bid_price"]
+            .as_f64()
+            .or_else(|| row["bid"].as_f64())
+            .unwrap_or(0.0),
+        bid_size: row["bid_size"].as_f64().unwrap_or(0.0),
+        ask_price: row["ask_price"]
+            .as_f64()
+            .or_else(|| row["ask"].as_f64())
+            .unwrap_or(0.0),
+        ask_size: row["ask_size"].as_f64().unwrap_or(0.0),
     })
 }
 
@@ -933,15 +999,20 @@ fn parse_stock_ohlc_row(row: &serde_json::Value) -> Option<OhlcBar> {
     let ts = row["timestamp"].as_str().unwrap_or("");
     let date = parse_date("", ts)?;
     let ms = row["ms_of_day"].as_u64().unwrap_or(0) as u32;
-    let ms = if ms > 0 { ms } else { ms_of_day_from_timestamp(ts) };
+    let ms = if ms > 0 {
+        ms
+    } else {
+        ms_of_day_from_timestamp(ts)
+    };
     Some(OhlcBar {
-        date, ms_of_day: ms,
-        open:   row["open"].as_f64().unwrap_or(0.0),
-        high:   row["high"].as_f64().unwrap_or(0.0),
-        low:    row["low"].as_f64().unwrap_or(0.0),
-        close:  row["close"].as_f64().unwrap_or(0.0),
+        date,
+        ms_of_day: ms,
+        open: row["open"].as_f64().unwrap_or(0.0),
+        high: row["high"].as_f64().unwrap_or(0.0),
+        low: row["low"].as_f64().unwrap_or(0.0),
+        close: row["close"].as_f64().unwrap_or(0.0),
         volume: row["volume"].as_f64().unwrap_or(0.0),
-        count:  row["count"].as_u64().unwrap_or(0) as u32,
+        count: row["count"].as_u64().unwrap_or(0) as u32,
     })
 }
 
@@ -949,16 +1020,27 @@ fn parse_stock_quote_row(row: &serde_json::Value) -> Option<QuoteBar> {
     let ts = row["timestamp"].as_str().unwrap_or("");
     let date = parse_date("", ts)?;
     let ms = row["ms_of_day"].as_u64().unwrap_or(0) as u32;
-    let ms = if ms > 0 { ms } else { ms_of_day_from_timestamp(ts) };
+    let ms = if ms > 0 {
+        ms
+    } else {
+        ms_of_day_from_timestamp(ts)
+    };
     Some(QuoteBar {
-        date, ms_of_day: ms,
-        bid_size:      row["bid_size"].as_f64().unwrap_or(0.0),
-        bid_exchange:  row["bid_exchange"].as_u64().unwrap_or(0) as u8,
-        bid_price:     row["bid_price"].as_f64().or_else(|| row["bid"].as_f64()).unwrap_or(0.0),
+        date,
+        ms_of_day: ms,
+        bid_size: row["bid_size"].as_f64().unwrap_or(0.0),
+        bid_exchange: row["bid_exchange"].as_u64().unwrap_or(0) as u8,
+        bid_price: row["bid_price"]
+            .as_f64()
+            .or_else(|| row["bid"].as_f64())
+            .unwrap_or(0.0),
         bid_condition: row["bid_condition"].as_i64().unwrap_or(0) as i32,
-        ask_size:      row["ask_size"].as_f64().unwrap_or(0.0),
-        ask_exchange:  row["ask_exchange"].as_u64().unwrap_or(0) as u8,
-        ask_price:     row["ask_price"].as_f64().or_else(|| row["ask"].as_f64()).unwrap_or(0.0),
+        ask_size: row["ask_size"].as_f64().unwrap_or(0.0),
+        ask_exchange: row["ask_exchange"].as_u64().unwrap_or(0) as u8,
+        ask_price: row["ask_price"]
+            .as_f64()
+            .or_else(|| row["ask"].as_f64())
+            .unwrap_or(0.0),
         ask_condition: row["ask_condition"].as_i64().unwrap_or(0) as i32,
     })
 }
@@ -967,12 +1049,17 @@ fn parse_stock_trade_row(row: &serde_json::Value) -> Option<TradeTick> {
     let ts = row["timestamp"].as_str().unwrap_or("");
     let date = parse_date("", ts)?;
     let ms = row["ms_of_day"].as_u64().unwrap_or(0) as u32;
-    let ms = if ms > 0 { ms } else { ms_of_day_from_timestamp(ts) };
+    let ms = if ms > 0 {
+        ms
+    } else {
+        ms_of_day_from_timestamp(ts)
+    };
     Some(TradeTick {
-        date, ms_of_day: ms,
-        price:     row["price"].as_f64().unwrap_or(0.0),
-        size:      row["size"].as_f64().unwrap_or(0.0),
-        exchange:  row["exchange"].as_u64().unwrap_or(0) as u8,
+        date,
+        ms_of_day: ms,
+        price: row["price"].as_f64().unwrap_or(0.0),
+        size: row["size"].as_f64().unwrap_or(0.0),
+        exchange: row["exchange"].as_u64().unwrap_or(0) as u8,
         condition: row["condition"].as_i64().unwrap_or(0) as i32,
     })
 }
@@ -981,14 +1068,18 @@ fn parse_index_price(r: &V3IndexPrice) -> Option<IndexPrice> {
     use chrono::NaiveDateTime;
     for fmt in &["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"] {
         if let Ok(dt) = NaiveDateTime::parse_from_str(&r.timestamp, fmt) {
-            return Some(IndexPrice { timestamp: dt, price: r.price });
+            return Some(IndexPrice {
+                timestamp: dt,
+                price: r.price,
+            });
         }
     }
     None
 }
 
 fn parse_index_eod_row(row: &serde_json::Value) -> Option<EodBar> {
-    let ts = row["timestamp"].as_str()
+    let ts = row["timestamp"]
+        .as_str()
         .or_else(|| row["close_timestamp"].as_str())
         .or_else(|| row["last_trade_timestamp"].as_str())
         .unwrap_or("");
@@ -996,14 +1087,16 @@ fn parse_index_eod_row(row: &serde_json::Value) -> Option<EodBar> {
     let date = parse_date(date_str, ts)?;
     Some(EodBar {
         date,
-        open:   row["open"].as_f64().unwrap_or(0.0),
-        high:   row["high"].as_f64().unwrap_or(0.0),
-        low:    row["low"].as_f64().unwrap_or(0.0),
-        close:  row["close"].as_f64().unwrap_or(0.0),
+        open: row["open"].as_f64().unwrap_or(0.0),
+        high: row["high"].as_f64().unwrap_or(0.0),
+        low: row["low"].as_f64().unwrap_or(0.0),
+        close: row["close"].as_f64().unwrap_or(0.0),
         volume: row["volume"].as_f64().unwrap_or(0.0),
-        count:  0,
-        bid_price: 0.0, bid_size: 0.0,
-        ask_price: 0.0, ask_size: 0.0,
+        count: 0,
+        bid_price: 0.0,
+        bid_size: 0.0,
+        ask_price: 0.0,
+        ask_size: 0.0,
     })
 }
 
@@ -1056,9 +1149,7 @@ fn days_in_month(year: i32, month: u32) -> u32 {
     } else {
         chrono::NaiveDate::from_ymd_opt(year, month + 1, 1)
             .unwrap()
-            .signed_duration_since(
-                chrono::NaiveDate::from_ymd_opt(year, month, 1).unwrap()
-            )
+            .signed_duration_since(chrono::NaiveDate::from_ymd_opt(year, month, 1).unwrap())
             .num_days() as u32
     }
 }
@@ -1205,7 +1296,7 @@ mod tests {
     #[test]
     fn test_month_chunks_single_month() {
         let start = NaiveDate::from_ymd_opt(2024, 1, 10).unwrap();
-        let end   = NaiveDate::from_ymd_opt(2024, 1, 25).unwrap();
+        let end = NaiveDate::from_ymd_opt(2024, 1, 25).unwrap();
         let chunks = calendar_month_chunks(start, end);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].0, start);
@@ -1215,21 +1306,21 @@ mod tests {
     #[test]
     fn test_month_chunks_spans_two_months() {
         let start = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
-        let end   = NaiveDate::from_ymd_opt(2024, 2, 20).unwrap();
+        let end = NaiveDate::from_ymd_opt(2024, 2, 20).unwrap();
         let chunks = calendar_month_chunks(start, end);
         assert_eq!(chunks.len(), 2);
         // First chunk: Jan 15 → Jan 31
         assert_eq!(chunks[0].0, NaiveDate::from_ymd_opt(2024, 1, 15).unwrap());
         assert_eq!(chunks[0].1, NaiveDate::from_ymd_opt(2024, 1, 31).unwrap());
         // Second chunk: Feb 1 → Feb 20
-        assert_eq!(chunks[1].0, NaiveDate::from_ymd_opt(2024, 2,  1).unwrap());
+        assert_eq!(chunks[1].0, NaiveDate::from_ymd_opt(2024, 2, 1).unwrap());
         assert_eq!(chunks[1].1, NaiveDate::from_ymd_opt(2024, 2, 20).unwrap());
     }
 
     #[test]
     fn test_month_chunks_three_calendar_months() {
-        let start = NaiveDate::from_ymd_opt(2024, 3,  1).unwrap();
-        let end   = NaiveDate::from_ymd_opt(2024, 5, 31).unwrap();
+        let start = NaiveDate::from_ymd_opt(2024, 3, 1).unwrap();
+        let end = NaiveDate::from_ymd_opt(2024, 5, 31).unwrap();
         let chunks = calendar_month_chunks(start, end);
         assert_eq!(chunks.len(), 3);
         // All chunks must be non-empty and monotonically increasing.
@@ -1240,11 +1331,19 @@ mod tests {
 
     #[test]
     fn test_month_chunks_covers_entire_range() {
-        let start = NaiveDate::from_ymd_opt(2024, 6,  5).unwrap();
-        let end   = NaiveDate::from_ymd_opt(2024, 9, 30).unwrap();
+        let start = NaiveDate::from_ymd_opt(2024, 6, 5).unwrap();
+        let end = NaiveDate::from_ymd_opt(2024, 9, 30).unwrap();
         let chunks = calendar_month_chunks(start, end);
-        assert_eq!(chunks.first().unwrap().0, start, "first chunk must start at 'start'");
-        assert_eq!(chunks.last().unwrap().1,  end,   "last chunk must end at 'end'");
+        assert_eq!(
+            chunks.first().unwrap().0,
+            start,
+            "first chunk must start at 'start'"
+        );
+        assert_eq!(
+            chunks.last().unwrap().1,
+            end,
+            "last chunk must end at 'end'"
+        );
     }
 
     #[test]
@@ -1297,14 +1396,14 @@ mod tests {
     #[test]
     fn test_option_contract_key_hyphenated_expiration_normalized() {
         let k1 = option_contract_key("2024-01-19", 185_000.0, "C");
-        let k2 = option_contract_key("20240119",   185_000.0, "C");
+        let k2 = option_contract_key("20240119", 185_000.0, "C");
         assert_eq!(k1, k2, "hyphens in expiration should be stripped");
     }
 
     #[test]
     fn test_option_contract_key_call_put_differ() {
         let call = option_contract_key("20240119", 185_000.0, "C");
-        let put  = option_contract_key("20240119", 185_000.0, "P");
+        let put = option_contract_key("20240119", 185_000.0, "P");
         assert_ne!(call, put);
     }
 
@@ -1364,10 +1463,10 @@ mod tests {
 
         let bar = parse_stock_eod_row(&json).expect("should parse eod row");
         assert_eq!(bar.date, NaiveDate::from_ymd_opt(2024, 1, 15).unwrap());
-        assert!((bar.open   - 185.50).abs()       < 1e-9);
-        assert!((bar.high   - 188.00).abs()       < 1e-9);
-        assert!((bar.low    - 184.00).abs()        < 1e-9);
-        assert!((bar.close  - 187.25).abs()       < 1e-9);
+        assert!((bar.open - 185.50).abs() < 1e-9);
+        assert!((bar.high - 188.00).abs() < 1e-9);
+        assert!((bar.low - 184.00).abs() < 1e-9);
+        assert!((bar.close - 187.25).abs() < 1e-9);
         assert!((bar.volume - 75_000_000.0).abs() < 1e-9);
         assert_eq!(bar.count, 350_000);
         assert!((bar.bid_price - 187.20).abs() < 1e-9);
@@ -1425,7 +1524,7 @@ mod tests {
         let bar = parse_stock_ohlc_row(&json).expect("should parse ohlc row");
         assert_eq!(bar.date, NaiveDate::from_ymd_opt(2024, 1, 15).unwrap());
         assert_eq!(bar.ms_of_day, 37_800_000);
-        assert!((bar.open  - 185.0).abs() < 1e-9);
+        assert!((bar.open - 185.0).abs() < 1e-9);
         assert!((bar.close - 185.8).abs() < 1e-9);
         assert_eq!(bar.count, 1200);
     }
@@ -1503,7 +1602,7 @@ mod tests {
         assert_eq!(t.date, NaiveDate::from_ymd_opt(2024, 1, 15).unwrap());
         assert_eq!(t.ms_of_day, 50_400_000);
         assert!((t.price - 185.75).abs() < 1e-9);
-        assert!((t.size  - 300.0).abs()  < 1e-9);
+        assert!((t.size - 300.0).abs() < 1e-9);
         assert_eq!(t.exchange, 60);
         assert_eq!(t.condition, 1);
     }
@@ -1549,7 +1648,10 @@ mod tests {
 
     #[test]
     fn test_parse_index_price_iso_t_format() {
-        let r = V3IndexPrice { timestamp: "2024-01-15T14:00:00.000".to_string(), price: 4750.25 };
+        let r = V3IndexPrice {
+            timestamp: "2024-01-15T14:00:00.000".to_string(),
+            price: 4750.25,
+        };
         let ip = parse_index_price(&r).expect("should parse index price");
         assert!((ip.price - 4750.25).abs() < 1e-9);
         use chrono::Timelike;
@@ -1558,14 +1660,20 @@ mod tests {
 
     #[test]
     fn test_parse_index_price_space_format() {
-        let r = V3IndexPrice { timestamp: "2024-01-15 14:00:00.000".to_string(), price: 4800.0 };
+        let r = V3IndexPrice {
+            timestamp: "2024-01-15 14:00:00.000".to_string(),
+            price: 4800.0,
+        };
         let ip = parse_index_price(&r).expect("should parse space-separated timestamp");
         assert!((ip.price - 4800.0).abs() < 1e-9);
     }
 
     #[test]
     fn test_parse_index_price_invalid_returns_none() {
-        let r = V3IndexPrice { timestamp: "not-a-timestamp".to_string(), price: 0.0 };
+        let r = V3IndexPrice {
+            timestamp: "not-a-timestamp".to_string(),
+            price: 0.0,
+        };
         assert!(parse_index_price(&r).is_none());
     }
 
@@ -1575,8 +1683,8 @@ mod tests {
     fn test_eod_chunk_boundary_364_days_is_single_chunk() {
         // 364 days ≤ 364 → should fit in one chunk.
         let start = NaiveDate::from_ymd_opt(2023, 1, 1).unwrap();
-        let end   = NaiveDate::from_ymd_opt(2023, 12, 31).unwrap();
-        let days  = (end - start).num_days();
+        let end = NaiveDate::from_ymd_opt(2023, 12, 31).unwrap();
+        let days = (end - start).num_days();
         assert!(days <= 364, "single chunk fits within 364-day window");
     }
 
@@ -1584,7 +1692,7 @@ mod tests {
     fn test_eod_chunk_boundary_multi_year_requires_two_chunks() {
         // 2-year range requires 2 chunks (max 364 days each).
         let start = NaiveDate::from_ymd_opt(2022, 1, 1).unwrap();
-        let end   = NaiveDate::from_ymd_opt(2023, 12, 31).unwrap();
+        let end = NaiveDate::from_ymd_opt(2023, 12, 31).unwrap();
         let total_days = (end - start).num_days();
         let expected_chunks = (total_days / 365) + 1;
         assert!(expected_chunks >= 2);
@@ -1680,18 +1788,21 @@ mod tests {
         assert_eq!(r.date, "20210419");
     }
 
-    /// Test helper: construct the per-date option EOD path (mirrors ThetaDataClient::option_eod_path_for_date).
-    fn test_eod_path(root: &std::path::Path, ul: &str, date: NaiveDate) -> std::path::PathBuf {
-        root.join("option").join("usa").join("daily")
-            .join(ul.to_lowercase())
-            .join(format!("{}_eod.parquet", date.format("%Y%m%d")))
+    /// Test helper: construct the option EOD partition path.
+    fn test_eod_path(root: &std::path::Path, _ul: &str, date: NaiveDate) -> std::path::PathBuf {
+        root.join("option")
+            .join("usa")
+            .join("daily")
+            .join("trade")
+            .join(format!("date={date}"))
+            .join("data.parquet")
     }
 
     #[test]
     fn test_option_eod_parquet_write_and_read() {
         // Write bars for a date, read them back — entire file is for that date,
         // no predicate filtering needed.
-        use lean_storage::{ParquetWriter, ParquetReader, WriterConfig, OptionEodBar};
+        use lean_storage::{OptionEodBar, ParquetReader, ParquetWriter, WriterConfig};
         use rust_decimal::Decimal;
         use std::str::FromStr;
         use tempfile::TempDir;
@@ -1720,14 +1831,16 @@ mod tests {
             ask_size: 5,
         };
 
-        // Date-partitioned: one file per date.
+        // Date-partitioned: one file per date for all underlyings.
         let path = test_eod_path(root, "SPY", date);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let writer = ParquetWriter::new(WriterConfig::default());
-        writer.write_option_eod_bars(&[bar.clone()], &path).expect("write");
+        writer
+            .write_option_eod_bars(&[bar.clone()], &path)
+            .expect("write");
         assert!(path.exists(), "parquet file should be created");
 
-        // Read back — no date predicate needed, all rows in this file are for `date`.
+        // Read back — all rows in this partition are for `date`.
         let reader = ParquetReader::new();
         let rows = reader.read_option_eod_bars(&[path]).expect("read");
         assert_eq!(rows.len(), 1);
@@ -1740,8 +1853,8 @@ mod tests {
 
     #[test]
     fn test_option_eod_parquet_cache_miss_for_different_date() {
-        // Writing bars for date A must NOT affect date B — they live in separate files.
-        use lean_storage::{ParquetWriter, WriterConfig, OptionEodBar};
+        // Writing bars for date A must NOT affect date B; they live in separate partitions.
+        use lean_storage::{OptionEodBar, ParquetWriter, WriterConfig};
         use rust_decimal::Decimal;
         use tempfile::TempDir;
 
@@ -1773,9 +1886,11 @@ mod tests {
         let path_a = test_eod_path(root, "SPY", date_a);
         std::fs::create_dir_all(path_a.parent().unwrap()).unwrap();
         let writer = ParquetWriter::new(WriterConfig::default());
-        writer.write_option_eod_bars(&[bar], &path_a).expect("write");
+        writer
+            .write_option_eod_bars(&[bar], &path_a)
+            .expect("write");
 
-        // Cache check is just file.exists() — date B has its own file path.
+        // Cache check is just file.exists(); date B has its own partition path.
         let path_b = test_eod_path(root, "SPY", date_b);
         assert!(
             !path_b.exists(),
@@ -1785,7 +1900,7 @@ mod tests {
 
     #[test]
     fn test_option_eod_parquet_path_layout() {
-        // Date-partitioned: option/usa/daily/{underlying}/{YYYYMMDD}_eod.parquet
+        // Date-partitioned: option/usa/daily/trade/date=YYYY-MM-DD/data.parquet
         use std::path::Path;
 
         let root = Path::new("/data");
@@ -1794,13 +1909,13 @@ mod tests {
         let path = test_eod_path(root, "SPY", date);
         assert_eq!(
             path.to_str().unwrap(),
-            "/data/option/usa/daily/spy/20210507_eod.parquet"
+            "/data/option/usa/daily/trade/date=2021-05-07/data.parquet"
         );
 
         let path2 = test_eod_path(root, "QQQ", date);
         assert_eq!(
             path2.to_str().unwrap(),
-            "/data/option/usa/daily/qqq/20210507_eod.parquet"
+            "/data/option/usa/daily/trade/date=2021-05-07/data.parquet"
         );
     }
 

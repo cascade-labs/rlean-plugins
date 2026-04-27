@@ -17,9 +17,11 @@ use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::str::FromStr;
 
-use lean_data::custom::{CustomDataConfig, CustomDataFormat, CustomDataPoint, CustomDataSource, CustomDataTransport};
+use lean_data::custom::{
+    CustomDataConfig, CustomDataFormat, CustomDataPoint, CustomDataSource, CustomDataTransport,
+};
 use lean_data_providers::ICustomDataSource;
-use lean_plugin::{PluginKind, rlean_plugin};
+use lean_plugin::{rlean_plugin, PluginKind};
 
 // ---------------------------------------------------------------------------
 // FRED implementation
@@ -47,9 +49,7 @@ impl FredDataSource {
                 "https://api.stlouisfed.org/fred/series/observations\
                 ?series_id={series_id}&api_key={key}&file_type=json"
             ),
-            None => format!(
-                "https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-            ),
+            None => format!("https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"),
         }
     }
 }
@@ -126,26 +126,29 @@ impl ICustomDataSource for FredDataSource {
             serde_json::Value::String(config.ticker.clone()),
         );
 
-        Some(CustomDataPoint { time: parsed_date, end_time: None, value, fields })
+        Some(CustomDataPoint {
+            time: parsed_date,
+            end_time: None,
+            value,
+            fields,
+        })
     }
 
-    fn is_full_history_source(&self) -> bool { true }
+    fn is_full_history_source(&self) -> bool {
+        true
+    }
 
     /// Parse one CSV line from the full FRED history without filtering by date.
     ///
     /// Expected format: `YYYY-MM-DD,VALUE`. Sets `time` from the date in the line.
-    fn read_history_line(
-        &self,
-        line: &str,
-        config: &CustomDataConfig,
-    ) -> Option<CustomDataPoint> {
+    fn read_history_line(&self, line: &str, config: &CustomDataConfig) -> Option<CustomDataPoint> {
         let line = line.trim();
         if line.is_empty() || line.starts_with("DATE") {
             return None;
         }
 
         let mut parts = line.splitn(2, ',');
-        let date_str  = parts.next()?.trim();
+        let date_str = parts.next()?.trim();
         let value_str = parts.next()?.trim();
 
         let date = NaiveDate::parse_from_str(date_str, "%Y-%m-%d").ok()?;
@@ -162,7 +165,12 @@ impl ICustomDataSource for FredDataSource {
             serde_json::Value::String(config.ticker.clone()),
         );
 
-        Some(CustomDataPoint { time: date, end_time: None, value, fields })
+        Some(CustomDataPoint {
+            time: date,
+            end_time: None,
+            value,
+            fields,
+        })
     }
 }
 
@@ -229,7 +237,10 @@ mod tests {
         let src = FredDataSource::new();
         let config = make_config("UNRATE");
         let result = src.get_source("UNRATE", date(2024, 1, 1), &config).unwrap();
-        assert_eq!(result.uri, "https://fred.stlouisfed.org/graph/fredgraph.csv?id=UNRATE");
+        assert_eq!(
+            result.uri,
+            "https://fred.stlouisfed.org/graph/fredgraph.csv?id=UNRATE"
+        );
     }
 
     #[test]
@@ -246,8 +257,14 @@ mod tests {
     fn get_source_same_url_for_different_dates() {
         let src = FredDataSource::new();
         let config = make_config("FEDFUNDS");
-        let url1 = src.get_source("FEDFUNDS", date(2020, 1, 1), &config).unwrap().uri;
-        let url2 = src.get_source("FEDFUNDS", date(2023, 6, 15), &config).unwrap().uri;
+        let url1 = src
+            .get_source("FEDFUNDS", date(2020, 1, 1), &config)
+            .unwrap()
+            .uri;
+        let url2 = src
+            .get_source("FEDFUNDS", date(2023, 6, 15), &config)
+            .unwrap()
+            .uri;
         assert_eq!(url1, url2);
     }
 
@@ -256,31 +273,42 @@ mod tests {
         let src = FredDataSource::new();
         let config = make_config("UNRATE");
         let target = date(2024, 1, 1);
-        let point = src.reader("2024-01-01,3.7", target, &config).expect("should parse");
+        let point = src
+            .reader("2024-01-01,3.7", target, &config)
+            .expect("should parse");
         assert_eq!(point.time, target);
         assert_eq!(point.value, Decimal::from_str("3.7").unwrap());
-        assert_eq!(point.fields["series_id"], serde_json::Value::String("UNRATE".to_string()));
+        assert_eq!(
+            point.fields["series_id"],
+            serde_json::Value::String("UNRATE".to_string())
+        );
     }
 
     #[test]
     fn reader_skips_header_line() {
         let src = FredDataSource::new();
         let config = make_config("UNRATE");
-        assert!(src.reader("DATE,UNRATE", date(2024, 1, 1), &config).is_none());
+        assert!(src
+            .reader("DATE,UNRATE", date(2024, 1, 1), &config)
+            .is_none());
     }
 
     #[test]
     fn reader_returns_none_for_wrong_date() {
         let src = FredDataSource::new();
         let config = make_config("CPIAUCSL");
-        assert!(src.reader("2024-01-01,310.326", date(2024, 2, 1), &config).is_none());
+        assert!(src
+            .reader("2024-01-01,310.326", date(2024, 2, 1), &config)
+            .is_none());
     }
 
     #[test]
     fn reader_returns_none_for_missing_observation() {
         let src = FredDataSource::new();
         let config = make_config("DGS10");
-        assert!(src.reader("2024-03-15,.", date(2024, 3, 15), &config).is_none());
+        assert!(src
+            .reader("2024-03-15,.", date(2024, 3, 15), &config)
+            .is_none());
     }
 
     #[test]
@@ -294,7 +322,9 @@ mod tests {
     fn reader_returns_none_for_malformed_line() {
         let src = FredDataSource::new();
         let config = make_config("UNRATE");
-        assert!(src.reader("not-a-date,not-a-number", date(2024, 1, 1), &config).is_none());
+        assert!(src
+            .reader("not-a-date,not-a-number", date(2024, 1, 1), &config)
+            .is_none());
     }
 
     #[test]
@@ -302,7 +332,9 @@ mod tests {
         let src = FredDataSource::new();
         let config = make_config("CPIAUCSL");
         let target = date(2023, 12, 1);
-        let point = src.reader("2023-12-01,310.326", target, &config).expect("should parse");
+        let point = src
+            .reader("2023-12-01,310.326", target, &config)
+            .expect("should parse");
         assert_eq!(point.value, Decimal::from_str("310.326").unwrap());
     }
 

@@ -191,9 +191,9 @@ pub struct QuoteBar {
 
 impl QuoteBar {
     pub fn datetime_et(&self) -> Option<NaiveDateTime> {
-        self.date.and_hms_milli_opt(0, 0, 0, 0).map(|t| {
-            t + chrono::Duration::milliseconds(self.ms_of_day as i64)
-        })
+        self.date
+            .and_hms_milli_opt(0, 0, 0, 0)
+            .map(|t| t + chrono::Duration::milliseconds(self.ms_of_day as i64))
     }
 }
 
@@ -292,8 +292,8 @@ pub fn ms_of_day_from_timestamp(timestamp: &str) -> u32 {
 pub fn normalize_right(right: &str) -> &'static str {
     match right.trim().to_lowercase().as_str() {
         "c" | "call" => "c",
-        "p" | "put"  => "p",
-        _            => "c",
+        "p" | "put" => "p",
+        _ => "c",
     }
 }
 
@@ -310,17 +310,45 @@ pub fn normalize_expiration(exp: &str) -> String {
 /// Exchange code → exchange name.
 pub fn exchange_name(code: u8) -> &'static str {
     match code {
-        1  => "NQEX", 2  => "NQAD", 3  => "NYSE",  4  => "AMEX",
-        5  => "CBOE", 6  => "ISEX", 7  => "PACF",  8  => "CINC",
-        9  => "PHIL", 10 => "OPRA", 11 => "BOST",  12 => "NQNM",
-        13 => "NQSC", 14 => "NQBB", 15 => "NQPK",  16 => "NQIX",
-        17 => "CHIC", 18 => "TSE",  19 => "CDNX",  20 => "CME",
-        21 => "NYBT", 22 => "MRCY", 23 => "COMX",  24 => "CBOT",
-        25 => "NYMX", 26 => "KCBT", 27 => "MGEX",  28 => "NYBO",
-        42 => "C2",   43 => "MIAX", 54 => "CFE",   60 => "BATS",
-        63 => "BATY", 64 => "EDGE", 65 => "EDGX",  68 => "IEX",
-        73 => "MEMX", 75 => "LTSE",
-        _  => "",
+        1 => "NQEX",
+        2 => "NQAD",
+        3 => "NYSE",
+        4 => "AMEX",
+        5 => "CBOE",
+        6 => "ISEX",
+        7 => "PACF",
+        8 => "CINC",
+        9 => "PHIL",
+        10 => "OPRA",
+        11 => "BOST",
+        12 => "NQNM",
+        13 => "NQSC",
+        14 => "NQBB",
+        15 => "NQPK",
+        16 => "NQIX",
+        17 => "CHIC",
+        18 => "TSE",
+        19 => "CDNX",
+        20 => "CME",
+        21 => "NYBT",
+        22 => "MRCY",
+        23 => "COMX",
+        24 => "CBOT",
+        25 => "NYMX",
+        26 => "KCBT",
+        27 => "MGEX",
+        28 => "NYBO",
+        42 => "C2",
+        43 => "MIAX",
+        54 => "CFE",
+        60 => "BATS",
+        63 => "BATY",
+        64 => "EDGE",
+        65 => "EDGX",
+        68 => "IEX",
+        73 => "MEMX",
+        75 => "LTSE",
+        _ => "",
     }
 }
 
@@ -473,8 +501,8 @@ mod tests {
 
     #[test]
     fn test_exchange_name_known_codes() {
-        assert_eq!(exchange_name(3),  "NYSE");
-        assert_eq!(exchange_name(5),  "CBOE");
+        assert_eq!(exchange_name(3), "NYSE");
+        assert_eq!(exchange_name(5), "CBOE");
         assert_eq!(exchange_name(60), "BATS");
         assert_eq!(exchange_name(43), "MIAX");
     }
@@ -482,7 +510,7 @@ mod tests {
     #[test]
     fn test_exchange_name_unknown_code_empty() {
         assert_eq!(exchange_name(255), "");
-        assert_eq!(exchange_name(0),   "");
+        assert_eq!(exchange_name(0), "");
     }
 
     // ── V3 wire type deserialization ───────────────────────────────────────────
@@ -510,10 +538,10 @@ mod tests {
         assert_eq!(row.expiration, "20240119");
         assert!((row.strike - 185_000.0).abs() < f64::EPSILON);
         assert_eq!(row.right, "C");
-        assert!((row.open   - 2.50).abs() < f64::EPSILON);
-        assert!((row.high   - 3.10).abs() < f64::EPSILON);
-        assert!((row.low    - 2.40).abs() < f64::EPSILON);
-        assert!((row.close  - 2.90).abs() < f64::EPSILON);
+        assert!((row.open - 2.50).abs() < f64::EPSILON);
+        assert!((row.high - 3.10).abs() < f64::EPSILON);
+        assert!((row.low - 2.40).abs() < f64::EPSILON);
+        assert!((row.close - 2.90).abs() < f64::EPSILON);
         assert!((row.volume - 1500.0).abs() < f64::EPSILON);
         assert_eq!(row.count, 42);
         assert_eq!(row.ms_of_day, 36_000_000);
@@ -523,7 +551,8 @@ mod tests {
     fn test_deserialize_v3_option_ohlc_missing_optional_fields() {
         // Only mandatory business fields present; serde `default` fills the rest.
         let json = r#"{"open": 1.0, "high": 1.5, "low": 0.9, "close": 1.2}"#;
-        let row: V3OptionOhlc = serde_json::from_str(json).expect("should deserialize with defaults");
+        let row: V3OptionOhlc =
+            serde_json::from_str(json).expect("should deserialize with defaults");
         assert_eq!(row.symbol, "");
         assert_eq!(row.ms_of_day, 0);
         assert_eq!(row.count, 0);
@@ -550,7 +579,8 @@ mod tests {
             "timestamp": "2024-01-15T10:00:00.000"
         }"#;
 
-        let row: V3OptionQuote = serde_json::from_str(json).expect("should deserialize bid/ask aliases");
+        let row: V3OptionQuote =
+            serde_json::from_str(json).expect("should deserialize bid/ask aliases");
         assert!((row.bid_price - 1.25).abs() < f64::EPSILON);
         assert!((row.ask_price - 1.30).abs() < f64::EPSILON);
         assert_eq!(row.right, "P");
@@ -576,7 +606,7 @@ mod tests {
         let row: V3OptionTrade = serde_json::from_str(json).expect("should deserialize trade row");
         assert_eq!(row.symbol, "TSLA");
         assert!((row.price - 12.75).abs() < f64::EPSILON);
-        assert!((row.size  - 5.0).abs()   < f64::EPSILON);
+        assert!((row.size - 5.0).abs() < f64::EPSILON);
         assert_eq!(row.exchange, 60);
         assert_eq!(row.sequence, 123_456_789);
     }
@@ -629,8 +659,14 @@ mod tests {
         let bar = QuoteBar {
             date: NaiveDate::from_ymd_opt(2024, 1, 15).unwrap(),
             ms_of_day: 34_200_000,
-            bid_size: 10.0, bid_exchange: 3, bid_price: 99.50, bid_condition: 0,
-            ask_size: 10.0, ask_exchange: 3, ask_price: 99.60, ask_condition: 0,
+            bid_size: 10.0,
+            bid_exchange: 3,
+            bid_price: 99.50,
+            bid_condition: 0,
+            ask_size: 10.0,
+            ask_exchange: 3,
+            ask_price: 99.60,
+            ask_condition: 0,
         };
         let dt = bar.datetime_et().expect("should produce datetime");
         assert_eq!(dt.date(), NaiveDate::from_ymd_opt(2024, 1, 15).unwrap());
@@ -645,8 +681,14 @@ mod tests {
         let bar = QuoteBar {
             date: NaiveDate::from_ymd_opt(2024, 6, 1).unwrap(),
             ms_of_day: 0,
-            bid_size: 1.0, bid_exchange: 0, bid_price: 1.0, bid_condition: 0,
-            ask_size: 1.0, ask_exchange: 0, ask_price: 1.0, ask_condition: 0,
+            bid_size: 1.0,
+            bid_exchange: 0,
+            bid_price: 1.0,
+            bid_condition: 0,
+            ask_size: 1.0,
+            ask_exchange: 0,
+            ask_price: 1.0,
+            ask_condition: 0,
         };
         let dt = bar.datetime_et().expect("should produce datetime");
         use chrono::Timelike;

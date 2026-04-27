@@ -53,7 +53,11 @@ impl MassiveSplitItem {
     /// Factor to multiply pre-split raw prices by to get adjusted prices.
     /// = split_from / split_to  (e.g. 4:1 split → 0.25)
     pub fn split_factor(&self) -> f64 {
-        if self.split_to != 0.0 { self.split_from / self.split_to } else { 1.0 }
+        if self.split_to != 0.0 {
+            self.split_from / self.split_to
+        } else {
+            1.0
+        }
     }
 }
 

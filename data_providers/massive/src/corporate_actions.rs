@@ -51,24 +51,43 @@ pub fn compute_factor_rows(
             // bars on execution_date+1, leaving the ex-date bar with the wrong
             // (pre-split) factor.  Shift the row one calendar day back so it
             // applies starting on the ex-date itself.
-            if f != 0.0 { events.push(Event::Split { date: d - chrono::Duration::days(1), factor: f }); }
+            if f != 0.0 {
+                events.push(Event::Split {
+                    date: d - chrono::Duration::days(1),
+                    factor: f,
+                });
+            }
         }
     }
     for div in dividends {
         if let Ok(d) = NaiveDate::parse_from_str(&div.ex_dividend_date, "%Y-%m-%d") {
-            if div.cash_amount > 0.0 { events.push(Event::Dividend { date: d, amount: div.cash_amount }); }
+            if div.cash_amount > 0.0 {
+                events.push(Event::Dividend {
+                    date: d,
+                    amount: div.cash_amount,
+                });
+            }
         }
     }
 
     events.sort_by(|a, b| {
-        let da = match a { Event::Split { date, .. } | Event::Dividend { date, .. } => date };
-        let db = match b { Event::Split { date, .. } | Event::Dividend { date, .. } => date };
+        let da = match a {
+            Event::Split { date, .. } | Event::Dividend { date, .. } => date,
+        };
+        let db = match b {
+            Event::Split { date, .. } | Event::Dividend { date, .. } => date,
+        };
         db.cmp(da)
     });
 
     // Sentinel row: today's date, all factors = 1.0, reference_price = 0.
     let mut rows: Vec<FactorFileEntry> = Vec::new();
-    rows.push(FactorFileEntry { date: today, price_factor: 1.0, split_factor: 1.0, reference_price: 0.0 });
+    rows.push(FactorFileEntry {
+        date: today,
+        price_factor: 1.0,
+        split_factor: 1.0,
+        reference_price: 0.0,
+    });
 
     let mut cum_price = 1.0_f64;
     let mut cum_split = 1.0_f64;
@@ -134,7 +153,9 @@ pub fn compute_factor_rows(
 fn find_prev_close(event_date: NaiveDate, prices: &HashMap<NaiveDate, f64>) -> f64 {
     for i in 1..=5 {
         let d = event_date - chrono::Duration::days(i);
-        if let Some(&p) = prices.get(&d) { return p; }
+        if let Some(&p) = prices.get(&d) {
+            return p;
+        }
     }
     0.0
 }
@@ -147,7 +168,8 @@ pub fn write_factor_file(path: &Path, rows: &[FactorFileEntry]) -> Result<()> {
         std::fs::create_dir_all(parent).context("create factor_files dir")?;
     }
     let writer = ParquetWriter::new(WriterConfig::default());
-    writer.write_factor_file(rows, path)
+    writer
+        .write_factor_file(rows, path)
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
@@ -155,7 +177,8 @@ pub fn write_factor_file(path: &Path, rows: &[FactorFileEntry]) -> Result<()> {
 /// Returns an empty Vec (no error) if the file doesn't exist.
 pub fn read_factor_file(path: &Path) -> Result<Vec<FactorFileEntry>> {
     let reader = ParquetReader::new();
-    reader.read_factor_file(path)
+    reader
+        .read_factor_file(path)
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
@@ -175,12 +198,14 @@ pub async fn fetch_and_write_factor_file(
 ) -> Result<Vec<FactorFileEntry>> {
     info!("Massive: fetching corporate actions for {}", ticker);
 
-    let splits    = client.get_splits(ticker, start, end).await?;
+    let splits = client.get_splits(ticker, start, end).await?;
     let dividends = client.get_dividends(ticker, start, end).await?;
 
     info!(
         "Massive: {} splits, {} dividends for {}",
-        splits.len(), dividends.len(), ticker
+        splits.len(),
+        dividends.len(),
+        ticker
     );
 
     let today = chrono::Utc::now().date_naive();
@@ -194,7 +219,9 @@ pub async fn fetch_and_write_factor_file(
 
 /// Given factor rows (newest first) and a bar date, return `(price_factor, split_factor)`.
 pub fn factor_for_date(rows: &[FactorFileEntry], bar_date: NaiveDate) -> (f64, f64) {
-    if rows.is_empty() { return (1.0, 1.0); }
+    if rows.is_empty() {
+        return (1.0, 1.0);
+    }
 
     let mut best: Option<&FactorFileEntry> = None;
     for r in rows {
@@ -209,7 +236,7 @@ pub fn factor_for_date(rows: &[FactorFileEntry], bar_date: NaiveDate) -> (f64, f
 
     match best {
         Some(r) => (r.price_factor, r.split_factor),
-        None    => (1.0, 1.0),
+        None => (1.0, 1.0),
     }
 }
 
@@ -335,7 +362,8 @@ mod tests {
         let rows = compute_factor_rows(&[split], &[], &HashMap::new(), today);
 
         // Find the boundary row at ex_date-1.
-        let split_row = rows.iter()
+        let split_row = rows
+            .iter()
             .find(|r| r.date == expected_row_date)
             .expect("split boundary row at ex_date-1 must exist");
 
@@ -352,7 +380,8 @@ mod tests {
         );
 
         // A base row must exist with sf=0.5 (pre-split era, halve raw prices).
-        let base_row = rows.iter()
+        let base_row = rows
+            .iter()
             .min_by_key(|r| r.date)
             .expect("at least one row must exist");
         assert!(
@@ -383,8 +412,18 @@ mod tests {
         let path = dir.path().join("aapl.parquet");
 
         let rows = vec![
-            FactorFileEntry { date: date(2024, 1, 1), price_factor: 1.0,  split_factor: 1.0,  reference_price: 0.0 },
-            FactorFileEntry { date: date(2022, 8, 31), price_factor: 1.0,  split_factor: 0.25, reference_price: 150.0 },
+            FactorFileEntry {
+                date: date(2024, 1, 1),
+                price_factor: 1.0,
+                split_factor: 1.0,
+                reference_price: 0.0,
+            },
+            FactorFileEntry {
+                date: date(2022, 8, 31),
+                price_factor: 1.0,
+                split_factor: 0.25,
+                reference_price: 150.0,
+            },
         ];
 
         write_factor_file(&path, &rows).unwrap();

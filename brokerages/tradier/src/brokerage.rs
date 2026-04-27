@@ -5,16 +5,16 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use rust_decimal::Decimal;
 use tracing::{error, info, warn};
 
 use lean_core::{DateTime, Market, Price, Quantity, Symbol};
 use lean_orders::{Order, OrderStatus, OrderType};
 
-use lean_brokerages::Brokerage;
 use super::client::TradierClient;
 use super::models::{TradierOrder, TradierOrderDirection, TradierOrderStatus, TradierOrderType};
+use lean_brokerages::Brokerage;
 
 /// Live brokerage backed by Tradier's REST API.
 pub struct TradierBrokerage {
@@ -41,14 +41,21 @@ impl TradierBrokerage {
     /// Retrieve live open positions as (symbol → quantity).
     pub async fn fetch_positions(&self) -> Result<HashMap<String, i64>> {
         let positions = self.client.get_positions(&self.account_id).await?;
-        Ok(positions.into_iter().map(|p| (p.symbol, p.quantity)).collect())
+        Ok(positions
+            .into_iter()
+            .map(|p| (p.symbol, p.quantity))
+            .collect())
     }
 }
 
 impl Brokerage for TradierBrokerage {
-    fn name(&self) -> &str { "Tradier" }
+    fn name(&self) -> &str {
+        "Tradier"
+    }
 
-    fn is_connected(&self) -> bool { self.connected }
+    fn is_connected(&self) -> bool {
+        self.connected
+    }
 
     fn connect(&mut self) -> lean_core::Result<()> {
         // Tradier is stateless REST — just verify credentials by fetching profile.
@@ -83,14 +90,17 @@ impl Brokerage for TradierBrokerage {
         let tradier_id = match parse_brokerage_id(order) {
             Some(id) => id,
             None => {
-                warn!("Tradier: update_order — no brokerage ID on order {}", order.id);
+                warn!(
+                    "Tradier: update_order — no brokerage ID on order {}",
+                    order.id
+                );
                 return Ok(false);
             }
         };
 
         let order_type_str = match order.order_type {
-            OrderType::Market    => "market",
-            OrderType::Limit     => "limit",
+            OrderType::Market => "market",
+            OrderType::Limit => "limit",
             OrderType::StopLimit => "stop_limit",
             OrderType::StopMarket => "stop",
             other => {
@@ -100,15 +110,22 @@ impl Brokerage for TradierBrokerage {
         };
 
         let price = order.limit_price.and_then(|p| p.to_f64());
-        let stop  = order.stop_price.and_then(|p| p.to_f64());
+        let stop = order.stop_price.and_then(|p| p.to_f64());
 
         match tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(
-                self.modify_order_async(tradier_id, order_type_str, "day", price, stop)
-            )
+            tokio::runtime::Handle::current().block_on(self.modify_order_async(
+                tradier_id,
+                order_type_str,
+                "day",
+                price,
+                stop,
+            ))
         }) {
             Ok(()) => {
-                info!("Tradier: update_order succeeded for tradier_id={}", tradier_id);
+                info!(
+                    "Tradier: update_order succeeded for tradier_id={}",
+                    tradier_id
+                );
                 Ok(true)
             }
             Err(e) => {
@@ -122,7 +139,10 @@ impl Brokerage for TradierBrokerage {
         let tradier_id = match parse_brokerage_id(order) {
             Some(id) => id,
             None => {
-                warn!("Tradier: cancel_order — no brokerage ID on order {}", order.id);
+                warn!(
+                    "Tradier: cancel_order — no brokerage ID on order {}",
+                    order.id
+                );
                 return Ok(false);
             }
         };
@@ -131,7 +151,10 @@ impl Brokerage for TradierBrokerage {
             tokio::runtime::Handle::current().block_on(self.cancel_order_async(tradier_id))
         }) {
             Ok(()) => {
-                info!("Tradier: cancel_order succeeded for tradier_id={}", tradier_id);
+                info!(
+                    "Tradier: cancel_order succeeded for tradier_id={}",
+                    tradier_id
+                );
                 Ok(true)
             }
             Err(e) => {
@@ -143,16 +166,13 @@ impl Brokerage for TradierBrokerage {
 
     fn get_open_orders(&self) -> Vec<Order> {
         match tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(self.client.get_orders(&self.account_id))
+            tokio::runtime::Handle::current().block_on(self.client.get_orders(&self.account_id))
         }) {
-            Ok(tradier_orders) => {
-                tradier_orders
-                    .into_iter()
-                    .filter(|o| is_open_tradier_status(&o.status))
-                    .filter_map(|o| lean_order_from_tradier(&o))
-                    .collect()
-            }
+            Ok(tradier_orders) => tradier_orders
+                .into_iter()
+                .filter(|o| is_open_tradier_status(&o.status))
+                .filter_map(|o| lean_order_from_tradier(&o))
+                .collect(),
             Err(e) => {
                 error!("Tradier: get_open_orders failed: {}", e);
                 Vec::new()
@@ -203,23 +223,26 @@ impl Brokerage for TradierBrokerage {
 impl TradierBrokerage {
     /// Place a LEAN order via Tradier's REST API (async).
     pub async fn place_order_async(&self, order: &Order) -> Result<i64> {
-        let (direction, class, order_type_str, price_str, stop_str) =
-            translate_order(order)?;
+        let (direction, class, order_type_str, price_str, stop_str) = translate_order(order)?;
 
         let symbol = order.symbol.permtick.to_uppercase();
         let qty = order.quantity.abs().to_string();
         let dur = "day".to_string();
 
         let mut params: Vec<(&str, String)> = vec![
-            ("class",    class),
-            ("symbol",   symbol),
-            ("side",     direction),
+            ("class", class),
+            ("symbol", symbol),
+            ("side", direction),
             ("quantity", qty),
-            ("type",     order_type_str),
+            ("type", order_type_str),
             ("duration", dur),
         ];
-        if let Some(p) = price_str { params.push(("price", p)); }
-        if let Some(s) = stop_str  { params.push(("stop",  s)); }
+        if let Some(p) = price_str {
+            params.push(("price", p));
+        }
+        if let Some(s) = stop_str {
+            params.push(("stop", s));
+        }
 
         let resp = self.client.place_order(&self.account_id, &params).await?;
 
@@ -229,7 +252,10 @@ impl TradierBrokerage {
             }
         }
 
-        info!("Tradier: placed order id={} status={}", resp.order.id, resp.order.status);
+        info!(
+            "Tradier: placed order id={} status={}",
+            resp.order.id, resp.order.status
+        );
         Ok(resp.order.id)
     }
 
@@ -243,17 +269,24 @@ impl TradierBrokerage {
         stop: Option<f64>,
     ) -> Result<()> {
         let mut params: Vec<(&str, String)> = vec![
-            ("type",     order_type.to_string()),
+            ("type", order_type.to_string()),
             ("duration", duration.to_string()),
         ];
-        if let Some(p) = price { params.push(("price", format!("{p:.2}"))); }
-        if let Some(s) = stop  { params.push(("stop",  format!("{s:.2}"))); }
+        if let Some(p) = price {
+            params.push(("price", format!("{p:.2}")));
+        }
+        if let Some(s) = stop {
+            params.push(("stop", format!("{s:.2}")));
+        }
 
         let resp = self
             .client
             .modify_order(&self.account_id, tradier_order_id, &params)
             .await?;
-        info!("Tradier: modified order id={} status={}", resp.order.id, resp.order.status);
+        info!(
+            "Tradier: modified order id={} status={}",
+            resp.order.id, resp.order.status
+        );
         Ok(())
     }
 
@@ -263,7 +296,10 @@ impl TradierBrokerage {
             .client
             .cancel_order(&self.account_id, tradier_order_id)
             .await?;
-        info!("Tradier: cancelled order id={} status={}", resp.order.id, resp.order.status);
+        info!(
+            "Tradier: cancelled order id={} status={}",
+            resp.order.id, resp.order.status
+        );
         Ok(())
     }
 }
@@ -309,14 +345,14 @@ fn lean_order_from_tradier(o: &TradierOrder) -> Option<Order> {
     };
 
     let lean_status = match o.status {
-        TradierOrderStatus::Filled         => OrderStatus::Filled,
-        TradierOrderStatus::Cancelled      => OrderStatus::Canceled,
-        TradierOrderStatus::Rejected       => OrderStatus::Invalid,
-        TradierOrderStatus::Expired        => OrderStatus::Canceled,
+        TradierOrderStatus::Filled => OrderStatus::Filled,
+        TradierOrderStatus::Cancelled => OrderStatus::Canceled,
+        TradierOrderStatus::Rejected => OrderStatus::Invalid,
+        TradierOrderStatus::Expired => OrderStatus::Canceled,
         TradierOrderStatus::Open
         | TradierOrderStatus::PartiallyFilled
         | TradierOrderStatus::Pending
-        | TradierOrderStatus::Submitted    => OrderStatus::Submitted,
+        | TradierOrderStatus::Submitted => OrderStatus::Submitted,
     };
 
     let now = DateTime::now();
@@ -357,23 +393,21 @@ fn translate_order(
 
     // Equity direction
     let side = match (is_buy, order.quantity < Decimal::ZERO) {
-        (true,  _) if order.quantity > Decimal::ZERO => "buy",
-        (false, _)                                    => "sell",
-        _                                             => "buy",
+        (true, _) if order.quantity > Decimal::ZERO => "buy",
+        (false, _) => "sell",
+        _ => "buy",
     };
 
     let order_type = match order.order_type {
-        OrderType::Market    => "market",
-        OrderType::Limit     => "limit",
+        OrderType::Market => "market",
+        OrderType::Limit => "limit",
         OrderType::StopLimit => "stop_limit",
         OrderType::StopMarket => "stop",
         other => anyhow::bail!("Tradier: unsupported order type {:?}", other),
     };
 
     let price_str = match order.order_type {
-        OrderType::Limit | OrderType::StopLimit => {
-            order.limit_price.map(|p| format!("{:.2}", p))
-        }
+        OrderType::Limit | OrderType::StopLimit => order.limit_price.map(|p| format!("{:.2}", p)),
         _ => None,
     };
 

@@ -21,15 +21,15 @@
 ///     price (whichever is tighter).
 ///   - Time-in-force must be GoodTilCanceled.
 use lean_brokerages::BrokerageModel;
-use lean_orders::security_transaction_model::{
-    FlatFeeModel, SecurityTransactionModel,
-};
+use lean_orders::security_transaction_model::{FlatFeeModel, SecurityTransactionModel};
 
 /// Brokerage model for FXCM.
 pub struct FxcmBrokerageModel;
 
 impl BrokerageModel for FxcmBrokerageModel {
-    fn name(&self) -> &str { "FXCM" }
+    fn name(&self) -> &str {
+        "FXCM"
+    }
 
     /// FXCM charges approximately $4 per standard lot per side.
     ///
@@ -44,18 +44,26 @@ impl BrokerageModel for FxcmBrokerageModel {
     /// FXCM offers up to 400:1 leverage on major forex pairs for US retail
     /// accounts.  Minor pairs and CFDs receive lower leverage.
     /// We return 400.0 as the account-wide upper bound.
-    fn default_leverage(&self) -> f64 { 400.0 }
+    fn default_leverage(&self) -> f64 {
+        400.0
+    }
 
     /// FXCM accepts Forex and CFD orders.
     /// Supported types: Market, Limit, StopMarket (GTC only).
     /// Quantities must be whole multiples of the instrument's lot size.
-    fn can_submit_order(&self) -> bool { true }
+    fn can_submit_order(&self) -> bool {
+        true
+    }
 
     /// FXCM allows order modifications subject to the same lot-size and
     /// price-distance constraints as new order submission.
-    fn can_update_order(&self) -> bool { true }
+    fn can_update_order(&self) -> bool {
+        true
+    }
 
-    fn can_execute_order(&self) -> bool { true }
+    fn can_execute_order(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -66,15 +74,24 @@ mod tests {
     use rust_decimal_macros::dec;
 
     #[test]
-    fn name() { assert_eq!(FxcmBrokerageModel.name(), "FXCM"); }
+    fn name() {
+        assert_eq!(FxcmBrokerageModel.name(), "FXCM");
+    }
 
     #[test]
-    fn high_leverage() { assert!(FxcmBrokerageModel.default_leverage() > 100.0); }
+    fn high_leverage() {
+        assert!(FxcmBrokerageModel.default_leverage() > 100.0);
+    }
 
     #[test]
     fn flat_fee_per_lot() {
-        let fee = FxcmBrokerageModel.transaction_model()
-            .get_order_fee(&OrderFeeParameters { security_price: dec!(1), order_quantity: dec!(100000), order_direction: OrderDirection::Buy });
+        let fee = FxcmBrokerageModel
+            .transaction_model()
+            .get_order_fee(&OrderFeeParameters {
+                security_price: dec!(1),
+                order_quantity: dec!(100000),
+                order_direction: OrderDirection::Buy,
+            });
         assert!(fee.value > dec!(0), "FXCM charges a flat fee per lot");
     }
 }

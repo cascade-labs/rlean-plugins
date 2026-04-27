@@ -323,8 +323,7 @@ mod tests {
     fn test_tradier_parse_quote_container_no_quotes() {
         // Tradier returns null for quotes when no symbols match.
         let json = r#"{"quotes": null}"#;
-        let container: TradierQuoteContainer =
-            serde_json::from_str(json).expect("should parse");
+        let container: TradierQuoteContainer = serde_json::from_str(json).expect("should parse");
         assert!(container.quotes.is_none());
     }
 
@@ -443,10 +442,7 @@ mod tests {
         let order: TradierOrder = serde_json::from_str(json).expect("should parse");
         assert_eq!(order.order_class, TradierOrderClass::Option);
         assert_eq!(order.side, TradierOrderDirection::BuyToOpen);
-        assert_eq!(
-            order.option_symbol.as_deref(),
-            Some("AAPL240119C00180000")
-        );
+        assert_eq!(order.option_symbol.as_deref(), Some("AAPL240119C00180000"));
     }
 
     // ── TradierOrderResponse JSON parsing ─────────────────────────────────────
@@ -489,8 +485,7 @@ mod tests {
 
     #[test]
     fn test_tradier_order_status_filled_deserializes() {
-        let s: TradierOrderStatus =
-            serde_json::from_str("\"filled\"").expect("deserialize filled");
+        let s: TradierOrderStatus = serde_json::from_str("\"filled\"").expect("deserialize filled");
         assert_eq!(s, TradierOrderStatus::Filled);
     }
 
@@ -518,8 +513,7 @@ mod tests {
 
     #[test]
     fn test_tradier_order_status_open_deserializes() {
-        let s: TradierOrderStatus =
-            serde_json::from_str("\"open\"").expect("deserialize open");
+        let s: TradierOrderStatus = serde_json::from_str("\"open\"").expect("deserialize open");
         assert_eq!(s, TradierOrderStatus::Open);
     }
 
@@ -600,7 +594,10 @@ mod tests {
         // OCC option symbols: ROOT + YYMMDD + C/P + 8-digit strike (padded to 3dp).
         // E.g. AAPL240119C00180000 → AAPL, 24-01-19, Call, $180.00
         let occ = "AAPL240119C00180000";
-        let root: String = occ.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+        let root: String = occ
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .collect();
         assert_eq!(root, "AAPL");
         let rest = &occ[root.len()..];
         let direction_char = rest.chars().nth(6).expect("should have direction char");
@@ -627,8 +624,7 @@ mod tests {
                 "pending_orders_count": 2
             }
         }"#;
-        let container: TradierBalanceContainer =
-            serde_json::from_str(json).expect("should parse");
+        let container: TradierBalanceContainer = serde_json::from_str(json).expect("should parse");
         let bal = container.balances;
         assert_eq!(bal.account_number, "123456789");
         assert_eq!(bal.account_type, TradierAccountType::Margin);
@@ -647,8 +643,7 @@ mod tests {
                 "total_equity": 10000.00
             }
         }"#;
-        let container: TradierBalanceContainer =
-            serde_json::from_str(json).expect("should parse");
+        let container: TradierBalanceContainer = serde_json::from_str(json).expect("should parse");
         assert_eq!(container.balances.account_type, TradierAccountType::Cash);
     }
 
@@ -662,9 +657,11 @@ mod tests {
                 "total_equity": 25000.00
             }
         }"#;
-        let container: TradierBalanceContainer =
-            serde_json::from_str(json).expect("should parse");
-        assert_eq!(container.balances.account_type, TradierAccountType::DayTrader);
+        let container: TradierBalanceContainer = serde_json::from_str(json).expect("should parse");
+        assert_eq!(
+            container.balances.account_type,
+            TradierAccountType::DayTrader
+        );
     }
 
     // ── TradierOrderClass ─────────────────────────────────────────────────────
@@ -724,8 +721,7 @@ mod tests {
     fn test_tradier_orders_container_null_orders() {
         // Tradier returns "orders": null when there are no orders.
         let json = r#"{"orders": null}"#;
-        let container: TradierOrdersContainer =
-            serde_json::from_str(json).expect("should parse");
+        let container: TradierOrdersContainer = serde_json::from_str(json).expect("should parse");
         assert!(container.orders.is_none());
     }
 

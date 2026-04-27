@@ -8,18 +8,19 @@ use std::path::Path;
 use std::pin::Pin;
 
 use anyhow::Result;
+use async_trait::async_trait;
 use chrono::{NaiveDate, TimeZone, Utc};
 use chrono_tz::America::New_York;
-use rust_decimal::Decimal;
 use rust_decimal::prelude::FromPrimitive;
+use rust_decimal::Decimal;
 use tracing::info;
 
 use lean_core::{
     DateTime, LeanError, Market, NanosecondTimestamp, OptionRight, OptionStyle, Resolution,
-    Result as LeanResult, Symbol, SymbolOptionsExt, TimeSpan,
+    Result as LeanResult, Symbol, SymbolOptionsExt, TickType, TimeSpan,
 };
 use lean_data::{Bar as LeanBar, IHistoricalDataProvider, QuoteBar, Tick, TradeBar, TradeBarData};
-use lean_storage::{OptionUniverseRow, ParquetWriter, PathResolver, WriterConfig};
+use lean_storage::{OptionUniverseRow, ParquetReader, ParquetWriter, PathResolver, WriterConfig};
 
 use crate::client::ThetaDataClient;
 use crate::models::{
@@ -28,9 +29,9 @@ use crate::models::{
 };
 
 pub struct ThetaDataHistoryProvider {
-    client:              ThetaDataClient,
-    resolver:            PathResolver,
-    writer:              ParquetWriter,
+    client: ThetaDataClient,
+    resolver: PathResolver,
+    writer: ParquetWriter,
     /// Earliest date this subscription tier covers.  Requests that start before
     /// this date are silently clipped to avoid HTTP 403 subscription errors.
     /// Defaults to 2018-01-01 (ThetaData STANDARD tier lower bound).
@@ -61,8 +62,8 @@ impl ThetaDataHistoryProvider {
                 max_concurrent,
                 data_root.as_ref(),
             ),
-            resolver:            PathResolver::new(data_root),
-            writer:              ParquetWriter::new(WriterConfig::default()),
+            resolver: PathResolver::new(data_root),
+            writer: ParquetWriter::new(WriterConfig::default()),
             standard_start_date: standard_start_date
                 .unwrap_or_else(|| NaiveDate::from_ymd_opt(2018, 1, 1).unwrap()),
         }
@@ -76,116 +77,136 @@ impl ThetaDataHistoryProvider {
         end: DateTime,
     ) -> LeanResult<Vec<TradeBar>> {
         let requested_start = start.to_naive_utc().date();
-        let end_date        = end.to_naive_utc().date();
-        let ticker          = symbol.permtick.to_uppercase();
+        let end_date = end.to_naive_utc().date();
+        let ticker = symbol.permtick.to_uppercase();
 
         // Clip to the subscription's lower bound to avoid HTTP 403 errors.
         let start_date = if requested_start < self.standard_start_date {
             tracing::warn!(
                 "ThetaData: requested start {} is before subscription start {}; \
                  clipping to {}",
-                requested_start, self.standard_start_date, self.standard_start_date
+                requested_start,
+                self.standard_start_date,
+                self.standard_start_date
             );
             self.standard_start_date
         } else {
             requested_start
         };
 
-        info!("ThetaData: fetching {} {} bars for {} ({start_date} → {end_date})",
-            resolution, ticker, symbol.value);
+        info!(
+            "ThetaData: fetching {} {} bars for {} ({start_date} → {end_date})",
+            resolution, ticker, symbol.value
+        );
 
         let bars: Vec<TradeBar> = match resolution {
             Resolution::Daily => {
-                let eod_bars = self.client
+                let eod_bars = self
+                    .client
                     .get_stock_eod(&ticker, start_date, end_date)
                     .await
                     .map_err(|e| LeanError::DataError(e.to_string()))?;
 
-                eod_bars.into_iter().filter_map(|b| {
-                    let period = TimeSpan::ONE_DAY;
-                    let time = date_to_lean_datetime(b.date, 16, 0, 0);
-                    let dec = |f: f64| Decimal::from_f64(f).unwrap_or_default();
-                    Some(TradeBar {
-                        symbol:   symbol.clone(),
-                        time,
-                        end_time: NanosecondTimestamp(time.0 + period.nanos),
-                        open:     dec(b.open),
-                        high:     dec(b.high),
-                        low:      dec(b.low),
-                        close:    dec(b.close),
-                        volume:   dec(b.volume),
-                        period,
+                eod_bars
+                    .into_iter()
+                    .filter_map(|b| {
+                        let period = TimeSpan::ONE_DAY;
+                        let time = date_to_lean_datetime(b.date, 16, 0, 0);
+                        let dec = |f: f64| Decimal::from_f64(f).unwrap_or_default();
+                        Some(TradeBar {
+                            symbol: symbol.clone(),
+                            time,
+                            end_time: NanosecondTimestamp(time.0 + period.nanos),
+                            open: dec(b.open),
+                            high: dec(b.high),
+                            low: dec(b.low),
+                            close: dec(b.close),
+                            volume: dec(b.volume),
+                            period,
+                        })
                     })
-                }).collect()
+                    .collect()
             }
             Resolution::Minute => {
-                let ohlc_bars = self.client
+                let ohlc_bars = self
+                    .client
                     .get_stock_ohlc(&ticker, start_date, end_date, "1m", None, None)
                     .await
                     .map_err(|e| LeanError::DataError(e.to_string()))?;
 
                 let period = TimeSpan::from_nanos(60_000_000_000);
-                ohlc_bars.into_iter().filter_map(|b| {
-                    let time = date_ms_to_lean_datetime(b.date, b.ms_of_day);
-                    let dec  = |f: f64| Decimal::from_f64(f).unwrap_or_default();
-                    Some(TradeBar {
-                        symbol:   symbol.clone(),
-                        time,
-                        end_time: NanosecondTimestamp(time.0 + period.nanos),
-                        open:     dec(b.open),
-                        high:     dec(b.high),
-                        low:      dec(b.low),
-                        close:    dec(b.close),
-                        volume:   dec(b.volume),
-                        period,
+                ohlc_bars
+                    .into_iter()
+                    .filter_map(|b| {
+                        let time = date_ms_to_lean_datetime(b.date, b.ms_of_day);
+                        let dec = |f: f64| Decimal::from_f64(f).unwrap_or_default();
+                        Some(TradeBar {
+                            symbol: symbol.clone(),
+                            time,
+                            end_time: NanosecondTimestamp(time.0 + period.nanos),
+                            open: dec(b.open),
+                            high: dec(b.high),
+                            low: dec(b.low),
+                            close: dec(b.close),
+                            volume: dec(b.volume),
+                            period,
+                        })
                     })
-                }).collect()
+                    .collect()
             }
             Resolution::Hour => {
-                let ohlc_bars = self.client
+                let ohlc_bars = self
+                    .client
                     .get_stock_ohlc(&ticker, start_date, end_date, "1h", None, None)
                     .await
                     .map_err(|e| LeanError::DataError(e.to_string()))?;
 
                 let period = TimeSpan::from_nanos(3_600_000_000_000);
-                ohlc_bars.into_iter().filter_map(|b| {
-                    let time = date_ms_to_lean_datetime(b.date, b.ms_of_day);
-                    let dec  = |f: f64| Decimal::from_f64(f).unwrap_or_default();
-                    Some(TradeBar {
-                        symbol:   symbol.clone(),
-                        time,
-                        end_time: NanosecondTimestamp(time.0 + period.nanos),
-                        open:     dec(b.open),
-                        high:     dec(b.high),
-                        low:      dec(b.low),
-                        close:    dec(b.close),
-                        volume:   dec(b.volume),
-                        period,
+                ohlc_bars
+                    .into_iter()
+                    .filter_map(|b| {
+                        let time = date_ms_to_lean_datetime(b.date, b.ms_of_day);
+                        let dec = |f: f64| Decimal::from_f64(f).unwrap_or_default();
+                        Some(TradeBar {
+                            symbol: symbol.clone(),
+                            time,
+                            end_time: NanosecondTimestamp(time.0 + period.nanos),
+                            open: dec(b.open),
+                            high: dec(b.high),
+                            low: dec(b.low),
+                            close: dec(b.close),
+                            volume: dec(b.volume),
+                            period,
+                        })
                     })
-                }).collect()
+                    .collect()
             }
             Resolution::Second => {
-                let ohlc_bars = self.client
+                let ohlc_bars = self
+                    .client
                     .get_stock_ohlc(&ticker, start_date, end_date, "1s", None, None)
                     .await
                     .map_err(|e| LeanError::DataError(e.to_string()))?;
 
                 let period = TimeSpan::from_nanos(1_000_000_000);
-                ohlc_bars.into_iter().filter_map(|b| {
-                    let time = date_ms_to_lean_datetime(b.date, b.ms_of_day);
-                    let dec  = |f: f64| Decimal::from_f64(f).unwrap_or_default();
-                    Some(TradeBar {
-                        symbol:   symbol.clone(),
-                        time,
-                        end_time: NanosecondTimestamp(time.0 + period.nanos),
-                        open:     dec(b.open),
-                        high:     dec(b.high),
-                        low:      dec(b.low),
-                        close:    dec(b.close),
-                        volume:   dec(b.volume),
-                        period,
+                ohlc_bars
+                    .into_iter()
+                    .filter_map(|b| {
+                        let time = date_ms_to_lean_datetime(b.date, b.ms_of_day);
+                        let dec = |f: f64| Decimal::from_f64(f).unwrap_or_default();
+                        Some(TradeBar {
+                            symbol: symbol.clone(),
+                            time,
+                            end_time: NanosecondTimestamp(time.0 + period.nanos),
+                            open: dec(b.open),
+                            high: dec(b.high),
+                            low: dec(b.low),
+                            close: dec(b.close),
+                            volume: dec(b.volume),
+                            period,
+                        })
                     })
-                }).collect()
+                    .collect()
             }
             Resolution::Tick => {
                 return Err(LeanError::DataError(
@@ -195,7 +216,10 @@ impl ThetaDataHistoryProvider {
         };
 
         if bars.is_empty() {
-            info!("ThetaData: no bars returned for {} [{start_date}–{end_date}]", ticker);
+            info!(
+                "ThetaData: no bars returned for {} [{start_date}–{end_date}]",
+                ticker
+            );
             return Ok(bars);
         }
 
@@ -220,18 +244,7 @@ impl ThetaDataHistoryProvider {
             return Ok(());
         }
 
-        // For non-date-partitioned resolutions (daily, hour) all bars share the
-        // same file path regardless of date — write once.
-        if !resolution.is_high_resolution() {
-            let first_date = bars[0].time.to_naive_utc().date();
-            let path = self.resolver.trade_bar(symbol, resolution, first_date).to_path();
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            return self.writer.write_trade_bars(bars, &path).map_err(Into::into);
-        }
-
-        // For intraday resolutions, group bars by date → one parquet file per day.
+        // All resolutions use date partitions with all symbols for the day.
         let mut by_date: HashMap<NaiveDate, Vec<&TradeBar>> = HashMap::new();
         for bar in bars {
             let date = bar.time.to_naive_utc().date();
@@ -240,11 +253,13 @@ impl ThetaDataHistoryProvider {
 
         for (date, day_bars) in by_date {
             let owned: Vec<TradeBar> = day_bars.into_iter().cloned().collect();
-            let path = self.resolver.trade_bar(symbol, resolution, date).to_path();
+            let path =
+                self.resolver
+                    .market_data_partition(symbol, resolution, TickType::Trade, date);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            self.writer.write_trade_bars(&owned, &path)?;
+            self.writer.merge_trade_bar_partition(&owned, &path)?;
         }
         Ok(())
     }
@@ -261,12 +276,6 @@ impl ThetaDataHistoryProvider {
             return Ok(());
         }
 
-        if !resolution.is_high_resolution() {
-            let first_date = bars[0].time.to_naive_utc().date();
-            let path = self.resolver.quote_bar(symbol, resolution, first_date).to_path();
-            return self.writer.write_quote_bars(bars, &path).map_err(Into::into);
-        }
-
         let mut by_date: HashMap<NaiveDate, Vec<&QuoteBar>> = HashMap::new();
         for bar in bars {
             by_date
@@ -277,8 +286,10 @@ impl ThetaDataHistoryProvider {
 
         for (date, day_bars) in by_date {
             let owned: Vec<QuoteBar> = day_bars.into_iter().cloned().collect();
-            let path = self.resolver.quote_bar(symbol, resolution, date).to_path();
-            self.writer.write_quote_bars(&owned, &path)?;
+            let path =
+                self.resolver
+                    .market_data_partition(symbol, resolution, TickType::Quote, date);
+            self.writer.merge_quote_bar_partition(&owned, &path)?;
         }
         Ok(())
     }
@@ -300,8 +311,14 @@ impl ThetaDataHistoryProvider {
 
         for (date, day_ticks) in by_date {
             let owned: Vec<Tick> = day_ticks.into_iter().cloned().collect();
-            let path = self.resolver.tick(symbol, date).to_path();
-            self.writer.write_ticks(&owned, &path)?;
+            let tick_type = owned
+                .first()
+                .map(|tick| tick.tick_type)
+                .unwrap_or(TickType::Trade);
+            let path =
+                self.resolver
+                    .market_data_partition(symbol, Resolution::Tick, tick_type, date);
+            self.writer.merge_tick_partition(&owned, &path)?;
         }
         Ok(())
     }
@@ -315,14 +332,22 @@ impl ThetaDataHistoryProvider {
         if rows.is_empty() {
             return Ok(());
         }
-        let underlying = Symbol::create_equity(ticker, &Market::usa());
-        let path = self.resolver.option_universe(&underlying, date).to_path();
-        self.writer.write_option_universe(rows, &path).map_err(Into::into)
+        let path = self.resolver.option_universe_partition(date);
+        let mut merged = if path.exists() {
+            ParquetReader::new().read_option_universe(&[path.clone()])?
+        } else {
+            Vec::new()
+        };
+        merged.retain(|row| !row.underlying.eq_ignore_ascii_case(ticker));
+        merged.extend_from_slice(rows);
+        self.writer
+            .write_option_universe(&merged, &path)
+            .map_err(Into::into)
     }
 
     fn write_option_trade_bars_to_disk(
         &self,
-        ticker: &str,
+        _ticker: &str,
         resolution: Resolution,
         date: NaiveDate,
         bars: &[TradeBar],
@@ -330,17 +355,17 @@ impl ThetaDataHistoryProvider {
         if bars.is_empty() {
             return Ok(());
         }
-        let underlying = Symbol::create_equity(ticker, &Market::usa());
         let path = self
             .resolver
-            .option_trade_bar(&underlying, resolution, date)
-            .to_path();
-        self.writer.write_trade_bars(bars, &path).map_err(Into::into)
+            .option_partition(resolution, TickType::Trade, date);
+        self.writer
+            .merge_trade_bar_partition(bars, &path)
+            .map_err(Into::into)
     }
 
     fn write_option_quote_bars_to_disk(
         &self,
-        ticker: &str,
+        _ticker: &str,
         resolution: Resolution,
         date: NaiveDate,
         bars: &[QuoteBar],
@@ -348,26 +373,33 @@ impl ThetaDataHistoryProvider {
         if bars.is_empty() {
             return Ok(());
         }
-        let underlying = Symbol::create_equity(ticker, &Market::usa());
         let path = self
             .resolver
-            .option_quote_bar(&underlying, resolution, date)
-            .to_path();
-        self.writer.write_quote_bars(bars, &path).map_err(Into::into)
+            .option_partition(resolution, TickType::Quote, date);
+        self.writer
+            .merge_quote_bar_partition(bars, &path)
+            .map_err(Into::into)
     }
 
     fn write_option_ticks_to_disk(
         &self,
-        ticker: &str,
+        _ticker: &str,
         date: NaiveDate,
         ticks: &[Tick],
     ) -> Result<()> {
         if ticks.is_empty() {
             return Ok(());
         }
-        let underlying = Symbol::create_equity(ticker, &Market::usa());
-        let path = self.resolver.option_tick(&underlying, date).to_path();
-        self.writer.write_ticks(ticks, &path).map_err(Into::into)
+        let tick_type = ticks
+            .first()
+            .map(|tick| tick.tick_type)
+            .unwrap_or(TickType::Trade);
+        let path = self
+            .resolver
+            .option_partition(Resolution::Tick, tick_type, date);
+        self.writer
+            .merge_tick_partition(ticks, &path)
+            .map_err(Into::into)
     }
 }
 
@@ -384,18 +416,14 @@ impl IHistoricalDataProvider for ThetaDataHistoryProvider {
 }
 
 // ─── lean_data_providers::IHistoryProvider ────────────────────────────────────
-//
-// IHistoryProvider::get_history is synchronous: this cdylib has its own copy
-// of tokio and cannot share thread-locals with the host binary's runtime.
-// We create a lightweight current-thread runtime per call; the host bridges
-// to async via spawn_blocking so no tokio worker thread is blocked.
 
+#[async_trait]
 impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
     fn earliest_date(&self) -> Option<chrono::NaiveDate> {
         Some(self.standard_start_date)
     }
 
-    fn get_history(
+    async fn get_history(
         &self,
         request: &lean_data_providers::HistoryRequest,
     ) -> anyhow::Result<Vec<TradeBar>> {
@@ -409,41 +437,37 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
             ));
         }
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| anyhow::anyhow!("failed to build thetadata runtime: {e}"))?;
-
-        rt.block_on(self.fetch_and_cache(
+        self.fetch_and_cache(
             request.symbol.clone(),
             request.resolution,
             request.start,
             request.end,
-        ))
+        )
+        .await
         .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
-    fn get_quote_bars(
+    async fn get_quote_bars(
         &self,
         request: &lean_data_providers::HistoryRequest,
     ) -> anyhow::Result<Vec<QuoteBar>> {
-        let interval = resolution_to_interval(request.resolution)
-            .ok_or_else(|| anyhow::anyhow!("ThetaData quote bars require minute/second/hour resolution"))?;
+        let interval = resolution_to_interval(request.resolution).ok_or_else(|| {
+            anyhow::anyhow!("ThetaData quote bars require minute/second/hour resolution")
+        })?;
         let period = resolution_to_period(request.resolution)
             .ok_or_else(|| anyhow::anyhow!("ThetaData quote bars require bar resolution"))?;
         let ticker = request.symbol.permtick.to_uppercase();
-        let start_date = request.start.to_naive_utc().date().max(self.standard_start_date);
+        let start_date = request
+            .start
+            .to_naive_utc()
+            .date()
+            .max(self.standard_start_date);
         let end_date = request.end.to_naive_utc().date();
 
-        let rt = build_runtime()?;
-        let rows = rt.block_on(self.client.get_stock_quotes(
-            &ticker,
-            start_date,
-            end_date,
-            interval,
-            None,
-            None,
-        ))?;
+        let rows = self
+            .client
+            .get_stock_quotes(&ticker, start_date, end_date, interval, None, None)
+            .await?;
 
         let bars: Vec<QuoteBar> = rows
             .into_iter()
@@ -454,22 +478,22 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
         Ok(bars)
     }
 
-    fn get_ticks(
+    async fn get_ticks(
         &self,
         request: &lean_data_providers::HistoryRequest,
     ) -> anyhow::Result<Vec<Tick>> {
         let ticker = request.symbol.permtick.to_uppercase();
-        let start_date = request.start.to_naive_utc().date().max(self.standard_start_date);
+        let start_date = request
+            .start
+            .to_naive_utc()
+            .date()
+            .max(self.standard_start_date);
         let end_date = request.end.to_naive_utc().date();
 
-        let rt = build_runtime()?;
-        let rows = rt.block_on(self.client.get_stock_trades(
-            &ticker,
-            start_date,
-            end_date,
-            None,
-            None,
-        ))?;
+        let rows = self
+            .client
+            .get_stock_trades(&ticker, start_date, end_date, None, None)
+            .await?;
 
         let ticks: Vec<Tick> = rows
             .into_iter()
@@ -480,26 +504,23 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
         Ok(ticks)
     }
 
-    fn get_option_eod_bars(
+    async fn get_option_eod_bars(
         &self,
         ticker: &str,
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<lean_storage::OptionEodBar>> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| anyhow::anyhow!("failed to build thetadata runtime: {e}"))?;
-
-        rt.block_on(self.client.get_option_eod_bars_for_date(ticker, date))
+        self.client.get_option_eod_bars_for_date(ticker, date).await
     }
 
-    fn get_option_universe(
+    async fn get_option_universe(
         &self,
         ticker: &str,
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<OptionUniverseRow>> {
-        let rt = build_runtime()?;
-        let contracts = rt.block_on(self.client.get_option_contracts_for_date(ticker, date))?;
+        let contracts = self
+            .client
+            .get_option_contracts_for_date(ticker, date)
+            .await?;
         let rows: Vec<OptionUniverseRow> = contracts
             .iter()
             .filter_map(|row| option_contract_to_universe_row(ticker, date, row))
@@ -508,22 +529,25 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
         Ok(rows)
     }
 
-    fn get_option_trade_bars(
+    async fn get_option_trade_bars(
         &self,
         ticker: &str,
         resolution: Resolution,
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<TradeBar>> {
-        let interval = resolution_to_interval(resolution)
-            .ok_or_else(|| anyhow::anyhow!("ThetaData option trade bars require minute/second/hour resolution"))?;
+        let interval = resolution_to_interval(resolution).ok_or_else(|| {
+            anyhow::anyhow!("ThetaData option trade bars require minute/second/hour resolution")
+        })?;
         let period = resolution_to_period(resolution)
             .ok_or_else(|| anyhow::anyhow!("ThetaData option trade bars require bar resolution"))?;
         let underlying = Symbol::create_equity(ticker, &Market::usa());
 
-        let _ = self.get_option_universe(ticker, date)?;
+        let _ = self.get_option_universe(ticker, date).await?;
 
-        let rt = build_runtime()?;
-        let rows = rt.block_on(self.client.get_option_ohlc_chain_for_date(ticker, date, interval))?;
+        let rows = self
+            .client
+            .get_option_ohlc_chain_for_date(ticker, date, interval)
+            .await?;
         let bars: Vec<TradeBar> = rows
             .into_iter()
             .filter_map(|row| option_ohlc_to_trade_bar(&underlying, row, period))
@@ -532,22 +556,25 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
         Ok(bars)
     }
 
-    fn get_option_quote_bars(
+    async fn get_option_quote_bars(
         &self,
         ticker: &str,
         resolution: Resolution,
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<QuoteBar>> {
-        let interval = resolution_to_interval(resolution)
-            .ok_or_else(|| anyhow::anyhow!("ThetaData option quote bars require minute/second/hour resolution"))?;
+        let interval = resolution_to_interval(resolution).ok_or_else(|| {
+            anyhow::anyhow!("ThetaData option quote bars require minute/second/hour resolution")
+        })?;
         let period = resolution_to_period(resolution)
             .ok_or_else(|| anyhow::anyhow!("ThetaData option quote bars require bar resolution"))?;
         let underlying = Symbol::create_equity(ticker, &Market::usa());
 
-        let _ = self.get_option_universe(ticker, date)?;
+        let _ = self.get_option_universe(ticker, date).await?;
 
-        let rt = build_runtime()?;
-        let rows = rt.block_on(self.client.get_option_quote_chain_for_date(ticker, date, interval))?;
+        let rows = self
+            .client
+            .get_option_quote_chain_for_date(ticker, date, interval)
+            .await?;
         let bars: Vec<QuoteBar> = rows
             .into_iter()
             .filter_map(|row| option_quote_to_quote_bar(&underlying, row, period))
@@ -556,18 +583,23 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
         Ok(bars)
     }
 
-    fn get_option_ticks(
+    async fn get_option_ticks(
         &self,
         ticker: &str,
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<Tick>> {
         let underlying = Symbol::create_equity(ticker, &Market::usa());
 
-        let _ = self.get_option_universe(ticker, date)?;
+        let _ = self.get_option_universe(ticker, date).await?;
 
-        let rt = build_runtime()?;
-        let trade_rows = rt.block_on(self.client.get_option_trade_chain_for_date(ticker, date))?;
-        let quote_rows = rt.block_on(self.client.get_option_quote_chain_for_date(ticker, date, "tick"))?;
+        let trade_rows = self
+            .client
+            .get_option_trade_chain_for_date(ticker, date)
+            .await?;
+        let quote_rows = self
+            .client
+            .get_option_quote_chain_for_date(ticker, date, "tick")
+            .await?;
 
         let mut ticks: Vec<Tick> = quote_rows
             .into_iter()
@@ -583,13 +615,6 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
         self.write_option_ticks_to_disk(ticker, date, &ticks)?;
         Ok(ticks)
     }
-}
-
-fn build_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| anyhow::anyhow!("failed to build thetadata runtime: {e}"))
 }
 
 fn resolution_to_interval(resolution: Resolution) -> Option<&'static str> {
@@ -775,16 +800,17 @@ fn date_ms_to_lean_datetime(date: NaiveDate, ms_of_day: u32) -> NanosecondTimest
     // ms_of_day is milliseconds since midnight ET (Eastern time, DST-aware).
     // Convert to UTC using the actual New York timezone offset for this date.
     let midnight_naive = date.and_hms_opt(0, 0, 0).unwrap();
-    let midnight_ny = New_York.from_local_datetime(&midnight_naive)
+    let midnight_ny = New_York
+        .from_local_datetime(&midnight_naive)
         .earliest()
         .unwrap_or_else(|| {
             // Spring-forward gap: add 1h to get past the gap, then go to midnight.
-            New_York.from_local_datetime(
-                &(midnight_naive + chrono::Duration::hours(1))
-            ).unwrap()
+            New_York
+                .from_local_datetime(&(midnight_naive + chrono::Duration::hours(1)))
+                .unwrap()
         });
-    let dt_utc = (midnight_ny + chrono::Duration::milliseconds(ms_of_day as i64))
-        .with_timezone(&Utc);
+    let dt_utc =
+        (midnight_ny + chrono::Duration::milliseconds(ms_of_day as i64)).with_timezone(&Utc);
     let lean_dt = DateTime::from(dt_utc);
     NanosecondTimestamp(lean_dt.0)
 }

@@ -11,9 +11,9 @@ pub use client::ThetaDataClient;
 pub use history_provider::ThetaDataHistoryProvider;
 
 use lean_data_providers::IHistoryProvider;
-use lean_plugin::{PluginKind, rlean_plugin};
-use std::sync::Arc;
+use lean_plugin::{rlean_plugin, PluginKind};
 use std::ffi::CStr;
+use std::sync::Arc;
 
 rlean_plugin! {
     name    = "thetadata",
@@ -39,13 +39,15 @@ pub unsafe extern "C" fn rlean_create_history_provider(
 
     // Config priority: JSON config → env var → default.
     // Bearer token is optional (not needed for local sidecar).
-    let api_key = config["api_key"].as_str().map(|s| s.to_string())
+    let api_key = config["api_key"]
+        .as_str()
+        .map(|s| s.to_string())
         .or_else(|| std::env::var("THETADATA_API_KEY").ok());
-    let base_url = config["base_url"].as_str().map(|s| s.to_string())
+    let base_url = config["base_url"]
+        .as_str()
+        .map(|s| s.to_string())
         .or_else(|| std::env::var("THETADATA_BASE_URL").ok());
-    let data_root = std::path::PathBuf::from(
-        config["data_root"].as_str().unwrap_or("data")
-    );
+    let data_root = std::path::PathBuf::from(config["data_root"].as_str().unwrap_or("data"));
     let rps = config["requests_per_second"].as_f64().unwrap_or(4.0);
     let max_concurrent = config["max_concurrent"].as_u64().unwrap_or(4) as usize;
 

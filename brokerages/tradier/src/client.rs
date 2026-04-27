@@ -12,9 +12,9 @@ use tokio::sync::Mutex;
 use tracing::debug;
 
 use super::models::{
-    TradierBalanceDetails, TradierOrder, TradierOrderResponse, TradierOrdersContainer,
-    TradierPosition, TradierPositionsContainer, TradierQuote, TradierQuoteContainer,
-    TradierUserProfile, TradierUserProfileContainer, TradierBalanceContainer,
+    TradierBalanceContainer, TradierBalanceDetails, TradierOrder, TradierOrderResponse,
+    TradierOrdersContainer, TradierPosition, TradierPositionsContainer, TradierQuote,
+    TradierQuoteContainer, TradierUserProfile, TradierUserProfileContainer,
 };
 
 const LIVE_BASE: &str = "https://api.tradier.com/v1";
@@ -80,8 +80,7 @@ impl TradierClient {
     // ─── Account endpoints ───────────────────────────────────────────────────
 
     pub async fn get_user_profile(&self) -> Result<TradierUserProfile> {
-        let container: TradierUserProfileContainer =
-            self.get_standard("user/profile").await?;
+        let container: TradierUserProfileContainer = self.get_standard("user/profile").await?;
         Ok(container.profile)
     }
 
@@ -182,7 +181,10 @@ impl TradierClient {
         }
         self.standard_limiter.wait().await;
         let csv = symbols.join(",");
-        let url = format!("{}/markets/quotes?symbols={}&greeks=false", self.base_url, csv);
+        let url = format!(
+            "{}/markets/quotes?symbols={}&greeks=false",
+            self.base_url, csv
+        );
         let resp = self
             .http
             .get(&url)

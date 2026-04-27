@@ -13,9 +13,7 @@
 ///
 /// 24/7 trading for all crypto assets.
 use lean_brokerages::BrokerageModel;
-use lean_orders::security_transaction_model::{
-    BinanceFeeModel, SecurityTransactionModel,
-};
+use lean_orders::security_transaction_model::{BinanceFeeModel, SecurityTransactionModel};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
@@ -30,33 +28,39 @@ pub struct CoinbaseBrokerageModel {
 }
 
 impl Default for CoinbaseBrokerageModel {
-    fn default() -> Self { Self { volume_tier: 0 } }
+    fn default() -> Self {
+        Self { volume_tier: 0 }
+    }
 }
 
 impl CoinbaseBrokerageModel {
-    pub fn new(volume_tier: u32) -> Self { Self { volume_tier } }
+    pub fn new(volume_tier: u32) -> Self {
+        Self { volume_tier }
+    }
 
     /// Taker rate for the configured volume tier.
     pub fn taker_rate(&self) -> Decimal {
         match self.volume_tier {
-            0 => dec!(0.008),  // 0.80%
-            1 => dec!(0.006),  // 0.60%
-            _ => dec!(0.003),  // 0.30% (high-volume tier and above)
+            0 => dec!(0.008), // 0.80%
+            1 => dec!(0.006), // 0.60%
+            _ => dec!(0.003), // 0.30% (high-volume tier and above)
         }
     }
 
     /// Maker rate for the configured volume tier.
     pub fn maker_rate(&self) -> Decimal {
         match self.volume_tier {
-            0 => dec!(0.006),  // 0.60%
-            1 => dec!(0.004),  // 0.40%
-            _ => dec!(0.002),  // 0.20%
+            0 => dec!(0.006), // 0.60%
+            1 => dec!(0.004), // 0.40%
+            _ => dec!(0.002), // 0.20%
         }
     }
 }
 
 impl BrokerageModel for CoinbaseBrokerageModel {
-    fn name(&self) -> &str { "Coinbase" }
+    fn name(&self) -> &str {
+        "Coinbase"
+    }
 
     /// Returns a fee model approximating Coinbase's taker rate.
     ///
@@ -69,16 +73,24 @@ impl BrokerageModel for CoinbaseBrokerageModel {
     }
 
     /// Coinbase does not offer margin — leverage is always 1×.
-    fn default_leverage(&self) -> f64 { 1.0 }
+    fn default_leverage(&self) -> f64 {
+        1.0
+    }
 
     /// Coinbase accepts crypto-only spot orders (Market, Limit, StopLimit).
     /// StopMarket orders are no longer accepted (removed 2019-03-23).
-    fn can_submit_order(&self) -> bool { true }
+    fn can_submit_order(&self) -> bool {
+        true
+    }
 
     /// Coinbase only allows updates to GTC Limit orders.
-    fn can_update_order(&self) -> bool { true }
+    fn can_update_order(&self) -> bool {
+        true
+    }
 
-    fn can_execute_order(&self) -> bool { true }
+    fn can_execute_order(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -89,20 +101,32 @@ mod tests {
     use rust_decimal_macros::dec;
 
     #[test]
-    fn name() { assert_eq!(CoinbaseBrokerageModel::default().name(), "Coinbase"); }
+    fn name() {
+        assert_eq!(CoinbaseBrokerageModel::default().name(), "Coinbase");
+    }
 
     #[test]
-    fn no_margin() { assert_eq!(CoinbaseBrokerageModel::default().default_leverage(), 1.0); }
+    fn no_margin() {
+        assert_eq!(CoinbaseBrokerageModel::default().default_leverage(), 1.0);
+    }
 
     #[test]
     fn taker_rate_decreases_with_volume() {
-        assert!(CoinbaseBrokerageModel::new(0).taker_rate() > CoinbaseBrokerageModel::new(2).taker_rate());
+        assert!(
+            CoinbaseBrokerageModel::new(0).taker_rate()
+                > CoinbaseBrokerageModel::new(2).taker_rate()
+        );
     }
 
     #[test]
     fn fee_positive() {
-        let fee = CoinbaseBrokerageModel::default().transaction_model()
-            .get_order_fee(&OrderFeeParameters { security_price: dec!(100), order_quantity: dec!(1), order_direction: OrderDirection::Buy });
+        let fee = CoinbaseBrokerageModel::default()
+            .transaction_model()
+            .get_order_fee(&OrderFeeParameters {
+                security_price: dec!(100),
+                order_quantity: dec!(1),
+                order_direction: OrderDirection::Buy,
+            });
         assert!(fee.value > dec!(0));
     }
 }

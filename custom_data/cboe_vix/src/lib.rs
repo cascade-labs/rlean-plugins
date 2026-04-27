@@ -1,136 +1,229 @@
 //! CBOE VIX daily OHLC custom data source plugin for rlean.
 //!
-//! Fetches the free VIX history CSV published by CBOE at:
-//! `https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv`
-//!
-//! The file contains the full history going back to January 1990 and is
-//! updated daily by CBOE. No API key is required.
-//!
-//! CSV format (dates in MM/DD/YYYY):
-//! ```text
-//! DATE,OPEN,HIGH,LOW,CLOSE
-//! 01/02/1990,17.24,17.24,17.24,17.24
-//! 01/03/1990,18.19,18.34,17.44,17.91
-//! ```
-//!
-//! # Usage
-//! ```python
-//! vix = self.add_data("cboe_vix", "VIX")
-//! # In on_data: data.custom["VIX"].value  (== CLOSE)
-//! #             data.custom["VIX"].fields["high"]
-//! ```
+//! rlean reads this plugin as native Parquet only. The plugin owns any upstream
+//! wire conversion and persists canonical files under:
+//! `{RLEAN_DATA_DIR}/alternative/cboe_vix/vix/daily/{YYYY}/{MM}/{DD}/1600.parquet`.
 
-use chrono::NaiveDate;
-use rust_decimal::Decimal;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::OnceLock;
 
-use lean_data::custom::{CustomDataConfig, CustomDataFormat, CustomDataPoint, CustomDataSource, CustomDataTransport};
+use arrow_array::{Float64Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
+use chrono::{Datelike, NaiveDate};
+use lean_data::custom::{CustomDataConfig, CustomDataPoint, CustomDataQuery, CustomParquetSource};
 use lean_data_providers::ICustomDataSource;
-use lean_plugin::{PluginKind, rlean_plugin};
-
-// ---------------------------------------------------------------------------
-// CBOE VIX implementation
-// ---------------------------------------------------------------------------
+use lean_plugin::{rlean_plugin, PluginKind};
+use parquet::arrow::ArrowWriter;
+use parquet::basic::{Compression, ZstdLevel};
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
+use rust_decimal::Decimal;
+use std::sync::Arc;
 
 pub const CBOE_VIX_URL: &str =
     "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv";
 
-/// CBOE VIX custom data source.
-///
-/// The `ticker` parameter in `get_source` is ignored because there is only
-/// one series. The same URL is always returned.
-pub struct CboeVixDataSource;
+static POPULATE_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+
+pub struct CboeVixDataSource {
+    data_dir: PathBuf,
+}
 
 impl CboeVixDataSource {
-    pub fn new() -> Self { CboeVixDataSource }
+    pub fn new() -> Self {
+        CboeVixDataSource {
+            data_dir: get_data_dir(),
+        }
+    }
 }
 
 impl Default for CboeVixDataSource {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ICustomDataSource for CboeVixDataSource {
-    fn name(&self) -> &str { "cboe_vix" }
+    fn name(&self) -> &str {
+        "cboe_vix"
+    }
 
     fn get_source(
         &self,
         _ticker: &str,
         _date: NaiveDate,
         _config: &CustomDataConfig,
-    ) -> Option<CustomDataSource> {
-        Some(CustomDataSource {
-            uri: CBOE_VIX_URL.to_string(),
-            transport: CustomDataTransport::Http,
-            format: CustomDataFormat::Csv,
+    ) -> Option<lean_data::custom::CustomDataSource> {
+        None
+    }
+
+    fn get_parquet_source(
+        &self,
+        _ticker: &str,
+        date: NaiveDate,
+        _config: &CustomDataConfig,
+        _query: &CustomDataQuery,
+    ) -> Option<CustomParquetSource> {
+        match POPULATE_RESULT.get_or_init(|| populate_parquet_cache(&self.data_dir)) {
+            Ok(()) => {}
+            Err(error) => {
+                eprintln!("[cboe_vix] {error}");
+                return None;
+            }
+        }
+
+        let path = vix_path(&self.data_dir, date);
+        path.exists().then(|| CustomParquetSource {
+            paths: vec![path.to_string_lossy().into_owned()],
+            time_column: None,
+            time_format: None,
+            time_zone: None,
+            symbol_column: None,
+            value_column: Some("close".to_string()),
         })
     }
 
-    /// Parse one CSV line from the CBOE VIX history file.
-    ///
-    /// Expected format: `MM/DD/YYYY,OPEN,HIGH,LOW,CLOSE`
-    /// `value` is set to CLOSE. All four OHLC values are available in `fields`.
-    fn reader(
-        &self,
-        line: &str,
-        date: NaiveDate,
-        _config: &CustomDataConfig,
-    ) -> Option<CustomDataPoint> {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("DATE") {
-            return None;
-        }
-
-        let mut parts = line.splitn(5, ',');
-        let date_str  = parts.next()?.trim();
-        let open_str  = parts.next()?.trim();
-        let high_str  = parts.next()?.trim();
-        let low_str   = parts.next()?.trim();
-        let close_str = parts.next()?.trim();
-
-        let parsed_date = NaiveDate::parse_from_str(date_str, "%m/%d/%Y").ok()?;
-        if parsed_date != date {
-            return None;
-        }
-
-        let open  = Decimal::from_str(open_str).ok()?;
-        let high  = Decimal::from_str(high_str).ok()?;
-        let low   = Decimal::from_str(low_str).ok()?;
-        let close = Decimal::from_str(close_str).ok()?;
-
-        let mut fields = HashMap::new();
-        fields.insert("open".to_string(),  serde_json::json!(open.to_string()));
-        fields.insert("high".to_string(),  serde_json::json!(high.to_string()));
-        fields.insert("low".to_string(),   serde_json::json!(low.to_string()));
-        fields.insert("close".to_string(), serde_json::json!(close.to_string()));
-
-        Some(CustomDataPoint { time: parsed_date, end_time: None, value: close, fields })
+    fn is_parquet_native(&self) -> bool {
+        true
     }
 
-    fn is_full_history_source(&self) -> bool { true }
+    fn default_resolution(&self) -> lean_core::Resolution {
+        lean_core::Resolution::Daily
+    }
 
-    /// Parse one CSV line from the full CBOE history without filtering by date.
-    ///
-    /// Expected format: `MM/DD/YYYY,OPEN,HIGH,LOW,CLOSE`. Sets `time` from the line.
+    fn reader(
+        &self,
+        _line: &str,
+        _date: NaiveDate,
+        _config: &CustomDataConfig,
+    ) -> Option<CustomDataPoint> {
+        None
+    }
+
+    fn is_full_history_source(&self) -> bool {
+        false
+    }
+
     fn read_history_line(
         &self,
-        line: &str,
-        config: &CustomDataConfig,
+        _line: &str,
+        _config: &CustomDataConfig,
     ) -> Option<CustomDataPoint> {
-        // Reuse reader() with the date parsed from the line itself.
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("DATE") {
-            return None;
-        }
-        let date_str = line.splitn(2, ',').next()?.trim();
-        let date = NaiveDate::parse_from_str(date_str, "%m/%d/%Y").ok()?;
-        self.reader(line, date, config)
+        None
     }
 }
 
-// ---------------------------------------------------------------------------
-// Plugin ABI exports
-// ---------------------------------------------------------------------------
+fn get_data_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("RLEAN_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let path = PathBuf::from(home).join(".rlean").join("data");
+        if path.exists() {
+            return path;
+        }
+    }
+    PathBuf::from("data")
+}
+
+fn vix_path(data_dir: &Path, date: NaiveDate) -> PathBuf {
+    data_dir
+        .join("alternative")
+        .join("cboe_vix")
+        .join("vix")
+        .join("daily")
+        .join(format!("{:04}", date.year()))
+        .join(format!("{:02}", date.month()))
+        .join(format!("{:02}", date.day()))
+        .join("1600.parquet")
+}
+
+fn populate_parquet_cache(data_dir: &Path) -> Result<(), String> {
+    let text = fetch_history_text().map_err(|error| format!("fetch failed: {error}"))?;
+    for row in text.lines().filter_map(parse_history_row) {
+        let path = vix_path(data_dir, row.date);
+        if path.exists() {
+            continue;
+        }
+        write_vix_row(&path, &row).map_err(|error| format!("write {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn fetch_history_text() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let response = reqwest::get(CBOE_VIX_URL).await?.error_for_status()?;
+        Ok(response.text().await?)
+    })
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct VixRow {
+    date: NaiveDate,
+    open: Decimal,
+    high: Decimal,
+    low: Decimal,
+    close: Decimal,
+}
+
+fn parse_history_row(line: &str) -> Option<VixRow> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with("DATE") {
+        return None;
+    }
+
+    let mut parts = line.splitn(5, ',');
+    let date = NaiveDate::parse_from_str(parts.next()?.trim(), "%m/%d/%Y").ok()?;
+    let open = Decimal::from_str(parts.next()?.trim()).ok()?;
+    let high = Decimal::from_str(parts.next()?.trim()).ok()?;
+    let low = Decimal::from_str(parts.next()?.trim()).ok()?;
+    let close = Decimal::from_str(parts.next()?.trim()).ok()?;
+
+    Some(VixRow {
+        date,
+        open,
+        high,
+        low,
+        close,
+    })
+}
+
+fn write_vix_row(path: &Path, row: &VixRow) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("open", DataType::Float64, false),
+        Field::new("high", DataType::Float64, false),
+        Field::new("low", DataType::Float64, false),
+        Field::new("close", DataType::Float64, false),
+    ]));
+    let decimal_to_f64 = |value: Decimal| value.to_string().parse::<f64>().unwrap_or(0.0);
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Float64Array::from(vec![decimal_to_f64(row.open)])),
+            Arc::new(Float64Array::from(vec![decimal_to_f64(row.high)])),
+            Arc::new(Float64Array::from(vec![decimal_to_f64(row.low)])),
+            Arc::new(Float64Array::from(vec![decimal_to_f64(row.close)])),
+        ],
+    )?;
+
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+        .set_statistics_enabled(EnabledStatistics::Page)
+        .build();
+    let file = std::fs::File::create(path)?;
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
+    writer.write(&batch)?;
+    writer.close()?;
+    Ok(())
+}
 
 rlean_plugin! {
     name    = "cboe_vix",
@@ -138,107 +231,51 @@ rlean_plugin! {
     kind    = PluginKind::CustomData,
 }
 
-/// C-stable factory: allocate a `CboeVixDataSource` and return a thin pointer.
-///
-/// Returns `*mut ()` pointing to a heap-allocated `Box<dyn ICustomDataSource>`.
-/// Double-boxed so that only a thin (8-byte) pointer crosses the FFI boundary —
-/// fat pointers (`*mut dyn Trait`) are not C-ABI-safe.
-///
-/// # Safety
-/// The returned pointer must be freed by the loader via:
-/// `*Box::from_raw(raw as *mut Box<dyn ICustomDataSource>)`
 #[no_mangle]
 pub extern "C" fn rlean_custom_data_factory() -> *mut () {
     let source: Box<dyn ICustomDataSource> = Box::new(CboeVixDataSource::new());
     Box::into_raw(Box::new(source)) as *mut ()
 }
 
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
-
-    fn make_config() -> CustomDataConfig {
-        CustomDataConfig {
-            ticker: "VIX".to_string(),
-            source_type: "cboe_vix".to_string(),
-            resolution: lean_core::Resolution::Daily,
-            properties: HashMap::new(),
-        }
-    }
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
     }
 
     #[test]
-    fn get_source_returns_cboe_url() {
-        let result = CboeVixDataSource::new().get_source("VIX", date(2024, 1, 2), &make_config()).unwrap();
-        assert_eq!(result.uri, CBOE_VIX_URL);
+    fn parse_history_row_parses_ohlc() {
+        let row = parse_history_row("03/16/2020,82.69,85.47,74.53,82.69").unwrap();
+        assert_eq!(row.date, date(2020, 3, 16));
+        assert_eq!(row.high, Decimal::from_str("85.47").unwrap());
+        assert_eq!(row.low, Decimal::from_str("74.53").unwrap());
     }
 
     #[test]
-    fn get_source_same_url_regardless_of_ticker_or_date() {
-        let src = CboeVixDataSource::new();
-        let cfg = make_config();
-        let url1 = src.get_source("VIX",     date(1990, 1, 2),  &cfg).unwrap().uri;
-        let url2 = src.get_source("anything", date(2023, 12, 29), &cfg).unwrap().uri;
-        assert_eq!(url1, url2);
-        assert_eq!(url1, CBOE_VIX_URL);
+    fn vix_path_uses_alternative_layout() {
+        assert_eq!(
+            vix_path(Path::new("/data"), date(2024, 1, 15)),
+            PathBuf::from("/data/alternative/cboe_vix/vix/daily/2024/01/15/1600.parquet")
+        );
     }
 
     #[test]
-    fn reader_parses_valid_line() {
-        let src = CboeVixDataSource::new();
-        let target = date(1990, 1, 2);
-        let point = src.reader("01/02/1990,17.24,17.24,17.24,17.24", target, &make_config()).unwrap();
-        assert_eq!(point.time, target);
-        assert_eq!(point.value, Decimal::from_str("17.24").unwrap());
-        assert_eq!(point.fields["close"], serde_json::json!("17.24"));
-    }
-
-    #[test]
-    fn reader_parses_different_ohlc_values() {
-        let src = CboeVixDataSource::new();
-        let target = date(2020, 3, 16);
-        let point = src.reader("03/16/2020,82.69,85.47,74.53,82.69", target, &make_config()).unwrap();
-        assert_eq!(point.value, Decimal::from_str("82.69").unwrap());
-        assert_eq!(point.fields["high"], serde_json::json!("85.47"));
-        assert_eq!(point.fields["low"],  serde_json::json!("74.53"));
-    }
-
-    #[test]
-    fn reader_skips_header_line() {
-        assert!(CboeVixDataSource::new().reader("DATE,OPEN,HIGH,LOW,CLOSE", date(2024, 1, 2), &make_config()).is_none());
-    }
-
-    #[test]
-    fn reader_returns_none_for_wrong_date() {
-        assert!(CboeVixDataSource::new().reader("01/02/1990,17.24,17.24,17.24,17.24", date(1990, 1, 3), &make_config()).is_none());
-    }
-
-    #[test]
-    fn reader_returns_none_for_empty_line() {
-        assert!(CboeVixDataSource::new().reader("", date(2024, 1, 2), &make_config()).is_none());
-    }
-
-    #[test]
-    fn reader_returns_none_for_malformed_line() {
-        assert!(CboeVixDataSource::new().reader("not-a-date,x,y,z,w", date(2024, 1, 2), &make_config()).is_none());
-    }
-
-    #[test]
-    fn reader_returns_none_for_incomplete_columns() {
-        // Missing CLOSE column.
-        assert!(CboeVixDataSource::new().reader("01/02/1990,17.24,17.24,17.24", date(1990, 1, 2), &make_config()).is_none());
-    }
-
-    #[test]
-    fn plugin_name() {
-        assert_eq!(CboeVixDataSource::new().name(), "cboe_vix");
+    fn plugin_is_parquet_native() {
+        assert!(CboeVixDataSource::new().is_parquet_native());
+        assert!(CboeVixDataSource::new()
+            .get_source(
+                "VIX",
+                date(2024, 1, 2),
+                &CustomDataConfig {
+                    ticker: "VIX".to_string(),
+                    source_type: "cboe_vix".to_string(),
+                    resolution: lean_core::Resolution::Daily,
+                    properties: HashMap::new(),
+                    query: CustomDataQuery::default(),
+                }
+            )
+            .is_none());
     }
 }
