@@ -32,6 +32,16 @@ const API_VERSION: &str = "/v3";
 const MAX_RETRIES: u32 = 3;
 const MAX_RATE_LIMIT_RETRIES: u32 = 5;
 
+pub struct OptionQuoteRequest<'a> {
+    pub root: &'a str,
+    pub expiration: &'a str,
+    pub strike: f64,
+    pub right: &'a str,
+    pub start: NaiveDate,
+    pub end: NaiveDate,
+    pub interval: &'a str,
+}
+
 /// Minimal token-bucket rate limiter.
 struct RateLimiter {
     min_interval: Duration,
@@ -383,29 +393,25 @@ impl ThetaDataClient {
     /// Option quote history for a single contract (bulk chain per day, filtered to contract).
     pub async fn get_option_quotes(
         &self,
-        root: &str,
-        expiration: &str,
-        strike: f64,
-        right: &str,
-        start: chrono::NaiveDate,
-        end: chrono::NaiveDate,
-        interval: &str,
+        request: OptionQuoteRequest<'_>,
     ) -> Result<Vec<QuoteBar>> {
-        let contract_key = option_contract_key(expiration, strike, right);
+        let contract_key = option_contract_key(request.expiration, request.strike, request.right);
         let cache_key = format!(
-            "{root}-{}-{}-quote-{interval}",
-            fmt_date(start),
-            fmt_date(end)
+            "{}-{}-{}-quote-{}",
+            request.root,
+            fmt_date(request.start),
+            fmt_date(request.end),
+            request.interval
         );
         let all_rows: Vec<V3OptionQuote> = self
             .get_or_fetch_chain(&cache_key, || {
-                let root = root.to_string();
-                let expiration = expiration.to_string();
-                let interval = interval.to_string();
+                let root = request.root.to_string();
+                let expiration = request.expiration.to_string();
+                let interval = request.interval.to_string();
                 Box::pin(async move {
                     let mut rows = Vec::new();
-                    let mut d = start;
-                    while d <= end {
+                    let mut d = request.start;
+                    while d <= request.end {
                         let params = vec![
                             ("symbol", root.clone()),
                             ("expiration", expiration.clone()),
@@ -548,7 +554,7 @@ impl ThetaDataClient {
             let new_bars: Vec<OptionEodBar> = v3_to_option_eod_bars(root, date, &api_rows);
             let mut merged = if parquet_path.exists() {
                 self.parquet_reader
-                    .read_option_eod_bars(&[parquet_path.clone()])
+                    .read_option_eod_bars(std::slice::from_ref(&parquet_path))
                     .unwrap_or_default()
             } else {
                 Vec::new()
@@ -613,7 +619,7 @@ impl ThetaDataClient {
         if !bars.is_empty() {
             let mut merged = if parquet_path.exists() {
                 self.parquet_reader
-                    .read_option_eod_bars(&[parquet_path.clone()])
+                    .read_option_eod_bars(std::slice::from_ref(&parquet_path))
                     .unwrap_or_default()
             } else {
                 Vec::new()
@@ -1779,7 +1785,7 @@ mod tests {
             last_trade: String::new(),
         };
         let date = NaiveDate::from_ymd_opt(2021, 4, 19).unwrap();
-        let bars = v3_to_option_eod_bars("SPY", date, &[row.clone()]);
+        let bars = v3_to_option_eod_bars("SPY", date, std::slice::from_ref(&row));
         let back = option_eod_bars_to_v3(bars);
         assert_eq!(back.len(), 1);
         let r = &back[0];
@@ -1836,7 +1842,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let writer = ParquetWriter::new(WriterConfig::default());
         writer
-            .write_option_eod_bars(&[bar.clone()], &path)
+            .write_option_eod_bars(std::slice::from_ref(&bar), &path)
             .expect("write");
         assert!(path.exists(), "parquet file should be created");
 

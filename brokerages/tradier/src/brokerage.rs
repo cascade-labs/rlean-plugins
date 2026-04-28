@@ -383,12 +383,12 @@ fn lean_order_from_tradier(o: &TradierOrder) -> Option<Order> {
 
 // ─── Order translation ────────────────────────────────────────────────────────
 
+type TradierOrderParams = (String, String, String, Option<String>, Option<String>);
+
 /// Translate a LEAN order into Tradier API parameters.
 ///
 /// Returns `(side, class, type, price?, stop?)`.
-fn translate_order(
-    order: &Order,
-) -> Result<(String, String, String, Option<String>, Option<String>)> {
+fn translate_order(order: &Order) -> Result<TradierOrderParams> {
     let is_buy = order.quantity > Decimal::ZERO;
 
     // Equity direction

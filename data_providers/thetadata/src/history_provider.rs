@@ -109,11 +109,11 @@ impl ThetaDataHistoryProvider {
 
                 eod_bars
                     .into_iter()
-                    .filter_map(|b| {
+                    .map(|b| {
                         let period = TimeSpan::ONE_DAY;
                         let time = date_to_lean_datetime(b.date, 16, 0, 0);
                         let dec = |f: f64| Decimal::from_f64(f).unwrap_or_default();
-                        Some(TradeBar {
+                        TradeBar {
                             symbol: symbol.clone(),
                             time,
                             end_time: NanosecondTimestamp(time.0 + period.nanos),
@@ -123,7 +123,7 @@ impl ThetaDataHistoryProvider {
                             close: dec(b.close),
                             volume: dec(b.volume),
                             period,
-                        })
+                        }
                     })
                     .collect()
             }
@@ -137,10 +137,10 @@ impl ThetaDataHistoryProvider {
                 let period = TimeSpan::from_nanos(60_000_000_000);
                 ohlc_bars
                     .into_iter()
-                    .filter_map(|b| {
+                    .map(|b| {
                         let time = date_ms_to_lean_datetime(b.date, b.ms_of_day);
                         let dec = |f: f64| Decimal::from_f64(f).unwrap_or_default();
-                        Some(TradeBar {
+                        TradeBar {
                             symbol: symbol.clone(),
                             time,
                             end_time: NanosecondTimestamp(time.0 + period.nanos),
@@ -150,7 +150,7 @@ impl ThetaDataHistoryProvider {
                             close: dec(b.close),
                             volume: dec(b.volume),
                             period,
-                        })
+                        }
                     })
                     .collect()
             }
@@ -164,10 +164,10 @@ impl ThetaDataHistoryProvider {
                 let period = TimeSpan::from_nanos(3_600_000_000_000);
                 ohlc_bars
                     .into_iter()
-                    .filter_map(|b| {
+                    .map(|b| {
                         let time = date_ms_to_lean_datetime(b.date, b.ms_of_day);
                         let dec = |f: f64| Decimal::from_f64(f).unwrap_or_default();
-                        Some(TradeBar {
+                        TradeBar {
                             symbol: symbol.clone(),
                             time,
                             end_time: NanosecondTimestamp(time.0 + period.nanos),
@@ -177,7 +177,7 @@ impl ThetaDataHistoryProvider {
                             close: dec(b.close),
                             volume: dec(b.volume),
                             period,
-                        })
+                        }
                     })
                     .collect()
             }
@@ -191,10 +191,10 @@ impl ThetaDataHistoryProvider {
                 let period = TimeSpan::from_nanos(1_000_000_000);
                 ohlc_bars
                     .into_iter()
-                    .filter_map(|b| {
+                    .map(|b| {
                         let time = date_ms_to_lean_datetime(b.date, b.ms_of_day);
                         let dec = |f: f64| Decimal::from_f64(f).unwrap_or_default();
-                        Some(TradeBar {
+                        TradeBar {
                             symbol: symbol.clone(),
                             time,
                             end_time: NanosecondTimestamp(time.0 + period.nanos),
@@ -204,7 +204,7 @@ impl ThetaDataHistoryProvider {
                             close: dec(b.close),
                             volume: dec(b.volume),
                             period,
-                        })
+                        }
                     })
                     .collect()
             }
@@ -334,7 +334,7 @@ impl ThetaDataHistoryProvider {
         }
         let path = self.resolver.option_universe_partition(date);
         let mut merged = if path.exists() {
-            ParquetReader::new().read_option_universe(&[path.clone()])?
+            ParquetReader::new().read_option_universe(std::slice::from_ref(&path))?
         } else {
             Vec::new()
         };
@@ -666,7 +666,7 @@ fn row_time(date: &str, timestamp: &str, ms_of_day: u32) -> Option<NanosecondTim
     }
     for fmt in &["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"] {
         if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(timestamp, fmt) {
-            return Some(DateTime::from(dt.and_utc()).into());
+            return Some(DateTime::from(dt.and_utc()));
         }
     }
     None

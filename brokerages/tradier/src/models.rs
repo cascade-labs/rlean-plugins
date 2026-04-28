@@ -797,7 +797,7 @@ mod tests {
     #[test]
     fn test_tradier_quotes_url_format() {
         let base = "https://api.tradier.com/v1";
-        let symbols = vec!["AAPL", "MSFT", "GOOG"];
+        let symbols = ["AAPL", "MSFT", "GOOG"];
         let csv = symbols.join(",");
         let url = format!("{}/markets/quotes?symbols={}&greeks=false", base, csv);
         assert_eq!(

@@ -4,7 +4,6 @@
 //! wire conversion and persists canonical files under:
 //! `{RLEAN_DATA_DIR}/alternative/cboe_vix/vix/daily/{YYYY}/{MM}/{DD}/1600.parquet`.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::OnceLock;
@@ -240,6 +239,7 @@ pub extern "C" fn rlean_custom_data_factory() -> *mut () {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()

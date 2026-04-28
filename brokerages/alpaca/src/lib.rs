@@ -8,10 +8,10 @@
 /// limited to 3 day trades per 5 rolling business days.
 ///
 /// Supported order types:
-///   - Equity: Market, Limit, StopMarket, StopLimit, TrailingStop,
-///             MarketOnOpen, MarketOnClose
-///   - Crypto:  Market, Limit, StopLimit
-///   - Options: Market, Limit
+/// - Equity: Market, Limit, StopMarket, StopLimit, TrailingStop,
+///   MarketOnOpen, MarketOnClose
+/// - Crypto:  Market, Limit, StopLimit
+/// - Options: Market, Limit
 use lean_brokerages::BrokerageModel;
 use lean_orders::security_transaction_model::{FlatFeeModel, SecurityTransactionModel};
 
@@ -19,15 +19,10 @@ use lean_orders::security_transaction_model::{FlatFeeModel, SecurityTransactionM
 ///
 /// `is_live` can be used to toggle live vs. paper trading behaviour in future
 /// extensions; the brokerage model rules are identical for both modes.
+#[derive(Default)]
 pub struct AlpacaBrokerageModel {
     /// `true` when connected to live endpoints, `false` for paper trading.
     pub is_live: bool,
-}
-
-impl Default for AlpacaBrokerageModel {
-    fn default() -> Self {
-        Self { is_live: false }
-    }
 }
 
 impl AlpacaBrokerageModel {

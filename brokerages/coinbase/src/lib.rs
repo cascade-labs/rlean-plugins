@@ -23,14 +23,9 @@ use rust_decimal_macros::dec;
 ///   0 = Basic / lowest volume
 ///   1 = Medium volume
 ///   2 = High volume (institutional / VIP)
+#[derive(Default)]
 pub struct CoinbaseBrokerageModel {
     pub volume_tier: u32,
-}
-
-impl Default for CoinbaseBrokerageModel {
-    fn default() -> Self {
-        Self { volume_tier: 0 }
-    }
 }
 
 impl CoinbaseBrokerageModel {

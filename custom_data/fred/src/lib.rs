@@ -207,6 +207,7 @@ pub extern "C" fn rlean_custom_data_factory() -> *mut () {
 mod tests {
     use super::*;
     use chrono::NaiveDate;
+    use lean_data::custom::CustomDataQuery;
 
     fn make_config(ticker: &str) -> CustomDataConfig {
         CustomDataConfig {
@@ -214,6 +215,7 @@ mod tests {
             source_type: "fred".to_string(),
             resolution: lean_core::Resolution::Daily,
             properties: HashMap::new(),
+            query: CustomDataQuery::default(),
         }
     }
 
@@ -225,6 +227,7 @@ mod tests {
             source_type: "fred".to_string(),
             resolution: lean_core::Resolution::Daily,
             properties: props,
+            query: CustomDataQuery::default(),
         }
     }
 
