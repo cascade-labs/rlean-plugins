@@ -10,14 +10,16 @@
 ///   - Option EOD chain data is cached in partitioned Parquet files under
 ///     `{data_root}/option/usa/daily/trade/date=YYYY-MM-DD/data.parquet`
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use chrono::NaiveDate;
 use reqwest::blocking::Client;
+use reqwest::header::RETRY_AFTER;
 use rust_decimal::Decimal;
 use serde::de::DeserializeOwned;
+use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 use lean_storage::{OptionEodBar, ParquetReader, ParquetWriter, WriterConfig};
@@ -42,27 +44,52 @@ pub struct OptionQuoteRequest<'a> {
     pub interval: &'a str,
 }
 
-/// Minimal token-bucket rate limiter.
+/// Minimal process-local request scheduler.
+///
+/// ThetaData's local sidecar can return 429s when a burst of concurrent
+/// requests arrives even if the average request rate is within the configured
+/// limit. Keep one shared "next allowed request" instant and push it forward on
+/// 429s so all in-flight prefetch tasks observe the same cooldown.
 struct RateLimiter {
     min_interval: Duration,
-    last: Mutex<Instant>,
+    next_allowed: Mutex<Instant>,
 }
 
 impl RateLimiter {
     fn new(rps: f64) -> Self {
+        let rps = if rps.is_finite() && rps > 0.0 {
+            rps
+        } else {
+            1.0
+        };
         RateLimiter {
             min_interval: Duration::from_secs_f64(1.0 / rps),
-            last: Mutex::new(Instant::now() - Duration::from_secs(60)),
+            next_allowed: Mutex::new(Instant::now()),
         }
     }
 
-    async fn wait(&self) {
-        let mut last = self.last.lock().expect("rate limiter mutex poisoned");
-        let elapsed = last.elapsed();
-        if elapsed < self.min_interval {
-            std::thread::sleep(self.min_interval - elapsed);
+    fn wait(&self) {
+        let mut next_allowed = self
+            .next_allowed
+            .lock()
+            .expect("rate limiter mutex poisoned");
+        let now = Instant::now();
+        if now < *next_allowed {
+            std::thread::sleep(*next_allowed - now);
         }
-        *last = Instant::now();
+        let now = Instant::now();
+        *next_allowed = now + self.min_interval;
+    }
+
+    fn cool_down(&self, delay: Duration) {
+        let mut next_allowed = self
+            .next_allowed
+            .lock()
+            .expect("rate limiter mutex poisoned");
+        let cooldown_until = Instant::now() + delay;
+        if cooldown_until > *next_allowed {
+            *next_allowed = cooldown_until;
+        }
     }
 }
 
@@ -71,6 +98,8 @@ pub struct ThetaDataClient {
     access_token: Option<String>,
     base_url: String,
     limiter: RateLimiter,
+    concurrency: Arc<Semaphore>,
+    max_concurrent: usize,
     /// Root of the structured data store.
     data_root: PathBuf,
     parquet_writer: ParquetWriter,
@@ -99,7 +128,7 @@ impl ThetaDataClient {
         access_token: Option<String>,
         base_url: Option<String>,
         requests_per_second: f64,
-        _max_concurrent: usize,
+        max_concurrent: usize,
         data_root: impl AsRef<Path>,
     ) -> Self {
         let http = Client::builder()
@@ -116,10 +145,16 @@ impl ThetaDataClient {
             access_token,
             base_url,
             limiter: RateLimiter::new(requests_per_second),
+            concurrency: Arc::new(Semaphore::new(max_concurrent.max(1))),
+            max_concurrent: max_concurrent.max(1),
             data_root: data_root.as_ref().to_path_buf(),
             parquet_writer: ParquetWriter::new(WriterConfig::default()),
             parquet_reader: ParquetReader::new(),
         }
+    }
+
+    pub fn max_concurrent(&self) -> usize {
+        self.max_concurrent
     }
 
     // ─── Stock endpoints ──────────────────────────────────────────────────────
@@ -775,20 +810,33 @@ impl ThetaDataClient {
         let mut gen_retries: u32 = 0;
 
         loop {
-            self.limiter.wait().await;
+            self.limiter.wait();
+            let permit = self
+                .concurrency
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("ThetaData concurrency semaphore closed");
             let mut req = self.http.get(&query);
             if let Some(token) = &self.access_token {
                 req = req.bearer_auth(token);
             }
             let resp = match req.send() {
-                Ok(r) => r,
+                Ok(r) => {
+                    drop(permit);
+                    r
+                }
                 Err(e) if gen_retries < MAX_RETRIES => {
+                    drop(permit);
                     gen_retries += 1;
                     warn!("ThetaData: request error (retry {gen_retries}): {e}");
                     std::thread::sleep(Duration::from_secs(gen_retries as u64));
                     continue;
                 }
-                Err(e) => bail!("ThetaData: {e}"),
+                Err(e) => {
+                    drop(permit);
+                    bail!("ThetaData: {e}");
+                }
             };
 
             let status = resp.status().as_u16();
@@ -805,9 +853,15 @@ impl ThetaDataClient {
                     bail!("ThetaData: rate limit exceeded after {MAX_RATE_LIMIT_RETRIES} retries");
                 }
                 rl_retries += 1;
-                let delay_ms = (2u64.pow(rl_retries)) * 1000 + (rand_jitter() as u64);
-                warn!("ThetaData: rate limited (429), waiting {delay_ms}ms");
-                std::thread::sleep(Duration::from_millis(delay_ms));
+                let delay = retry_after_delay(&resp).unwrap_or_else(|| {
+                    Duration::from_millis((2u64.pow(rl_retries)) * 1000 + (rand_jitter() as u64))
+                });
+                self.limiter.cool_down(delay);
+                warn!(
+                    "ThetaData: rate limited (429), cooling down shared limiter for {:.1}s",
+                    delay.as_secs_f64()
+                );
+                std::thread::sleep(delay);
                 continue;
             }
 
@@ -1178,6 +1232,14 @@ fn rand_jitter() -> u32 {
         .unwrap_or_default()
         .subsec_millis()
         % 500
+}
+
+fn retry_after_delay(resp: &reqwest::blocking::Response) -> Option<Duration> {
+    let header = resp.headers().get(RETRY_AFTER)?.to_str().ok()?.trim();
+    if let Ok(seconds) = header.parse::<u64>() {
+        return Some(Duration::from_secs(seconds.max(1)));
+    }
+    None
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

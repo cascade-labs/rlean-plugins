@@ -97,6 +97,31 @@ pub struct TickerDetails {
     pub active: bool,
 }
 
+/// Response from Massive's `/vX/reference/tickers/{id}/events` endpoint.
+#[derive(Debug, Deserialize)]
+pub struct TickerEventsResponse {
+    pub results: Option<TickerEventsResults>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TickerEventsResults {
+    #[serde(default)]
+    pub events: Vec<TickerEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TickerEvent {
+    pub date: String,
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub ticker_change: TickerChange,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TickerChange {
+    pub ticker: String,
+}
+
 fn default_true() -> bool {
     true
 }

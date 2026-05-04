@@ -48,8 +48,8 @@ pub unsafe extern "C" fn rlean_create_history_provider(
         .map(|s| s.to_string())
         .or_else(|| std::env::var("THETADATA_BASE_URL").ok());
     let data_root = std::path::PathBuf::from(config["data_root"].as_str().unwrap_or("data"));
-    let rps = config["requests_per_second"].as_f64().unwrap_or(4.0);
-    let max_concurrent = config["max_concurrent"].as_u64().unwrap_or(4) as usize;
+    let rps = numeric_f64(&config["requests_per_second"]).unwrap_or(4.0);
+    let max_concurrent = numeric_u64(&config["max_concurrent"]).unwrap_or(4) as usize;
 
     // Parse optional override for the subscription's earliest date.
     // Default (None) → 2018-01-01 (ThetaData STANDARD lower bound).
@@ -67,6 +67,18 @@ pub unsafe extern "C" fn rlean_create_history_provider(
     ));
     let boxed: Box<Arc<dyn IHistoryProvider>> = Box::new(provider);
     Box::into_raw(boxed) as *mut ()
+}
+
+fn numeric_f64(value: &serde_json::Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|s| s.parse::<f64>().ok()))
+}
+
+fn numeric_u64(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|s| s.parse::<u64>().ok()))
 }
 
 /// Free a provider returned by `rlean_create_history_provider`.

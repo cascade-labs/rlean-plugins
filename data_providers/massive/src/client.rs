@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 
 use crate::models::{
     AggregatesResponse, MassiveDividendItem, MassiveSplitItem, PaginatedResponse, TickerDetails,
-    TickerDetailsResponse,
+    TickerDetailsResponse, TickerEvent, TickerEventsResponse,
 };
 
 const BASE_URL: &str = "https://api.massive.com";
@@ -252,6 +252,41 @@ impl MassiveRestClient {
                 Ok(r) if r.status().is_success() => {
                     let resp = r.json::<TickerDetailsResponse>()?;
                     return Ok(resp.results);
+                }
+                Ok(r) => bail!("Massive API error: HTTP {}", r.status()),
+                Err(e) if attempt + 1 < MAX_RETRIES => {
+                    warn!("Massive: request error (attempt {}): {}", attempt + 1, e);
+                    std::thread::sleep(Duration::from_secs(2u64.pow(attempt)));
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        bail!("Massive: max retries ({MAX_RETRIES}) exceeded");
+    }
+
+    /// Fetch ticker-change events for a ticker, CUSIP, or Composite FIGI.
+    pub async fn get_ticker_events(&self, id: &str) -> Result<Vec<TickerEvent>> {
+        let url = format!(
+            "{BASE_URL}/vX/reference/tickers/{id}/events?types=ticker_change&apiKey={}",
+            self.api_key
+        );
+        self.limiter.wait().await;
+        for attempt in 0..MAX_RETRIES {
+            match self.http.get(&url).send() {
+                Ok(r) if r.status() == 404 => return Ok(Vec::new()),
+                Ok(r) if r.status() == 429 => {
+                    let wait = Duration::from_secs(10 * (attempt as u64 + 1));
+                    warn!(
+                        "Massive: rate limited (429), waiting {:.0}s",
+                        wait.as_secs_f64()
+                    );
+                    std::thread::sleep(wait);
+                    continue;
+                }
+                Ok(r) if r.status().is_success() => {
+                    let resp = r.json::<TickerEventsResponse>()?;
+                    return Ok(resp.results.map(|r| r.events).unwrap_or_default());
                 }
                 Ok(r) => bail!("Massive API error: HTTP {}", r.status()),
                 Err(e) if attempt + 1 < MAX_RETRIES => {

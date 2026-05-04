@@ -18,7 +18,7 @@ use tracing::{info, warn};
 use lean_storage::schema::{FactorFileEntry, MapFileEntry};
 use lean_storage::{ParquetReader, ParquetWriter, WriterConfig};
 
-use crate::models::{MassiveDividendItem, MassiveSplitItem};
+use crate::models::{MassiveDividendItem, MassiveSplitItem, TickerEvent};
 
 // ─── Computation ─────────────────────────────────────────────────────────────
 
@@ -95,6 +95,8 @@ pub fn compute_factor_rows(
     for event in &events {
         match event {
             Event::Split { date, factor } => {
+                let reference_price =
+                    find_prev_close(*date + chrono::Duration::days(1), ref_prices);
                 // Push the boundary row BEFORE updating cum_split.
                 //
                 // Rows are processed newest → oldest.  The boundary row at
@@ -107,7 +109,7 @@ pub fn compute_factor_rows(
                     date: *date,
                     price_factor: cum_price,
                     split_factor: cum_split,
-                    reference_price: 0.0,
+                    reference_price,
                 });
                 cum_split *= factor;
             }
@@ -137,15 +139,18 @@ pub fn compute_factor_rows(
     // returns the oldest row for any bar_date that predates all explicit rows.
     // Without this row, bars in the pre-split era fall back to the split boundary
     // row (sf=1.0) instead of the correct pre-split factor (e.g. sf=0.5).
-    if (cum_price - 1.0).abs() > 1e-9 || (cum_split - 1.0).abs() > 1e-9 {
-        let base_date = NaiveDate::from_ymd_opt(1900, 1, 1).unwrap();
-        rows.push(FactorFileEntry {
-            date: base_date,
-            price_factor: cum_price,
-            split_factor: cum_split,
-            reference_price: 0.0,
-        });
-    }
+    //
+    // Even when there are no corporate actions, this row records that the file
+    // covers the past.  Otherwise a sentinel-only factor file generated for a
+    // narrow later request is indistinguishable from one that safely covers a
+    // multi-year backtest.
+    let base_date = NaiveDate::from_ymd_opt(1900, 1, 1).unwrap();
+    rows.push(FactorFileEntry {
+        date: base_date,
+        price_factor: cum_price,
+        split_factor: cum_split,
+        reference_price: 0.0,
+    });
 
     rows
 }
@@ -244,21 +249,31 @@ pub fn factor_for_date(rows: &[FactorFileEntry], bar_date: NaiveDate) -> (f64, f
 
 /// Build map file rows from ticker details.
 ///
-/// LEAN convention (Parquet, sorted newest first):
-///   - Row 0 (newest): sentinel / delisting date with current ticker
-///   - Row 1 ... N: historical ticker mappings (if any renames)
+/// LEAN convention (Parquet, sorted oldest first):
+///   - Row 0: listing / first known date with the first ticker
+///   - Intermediate rows: last date the previous ticker was valid
+///   - Last row: sentinel / delisting date with current ticker
 ///
 /// For a simple active ticker with no renames:
-///   [{date: FAR_FUTURE, ticker: "XLK"}, {date: list_date, ticker: "XLK"}]
+///   [{date: list_date, ticker: "XLK"}, {date: FAR_FUTURE, ticker: "XLK"}]
 ///
 /// For a delisted ticker:
-///   [{date: delisting_date, ticker: "META"}, ..., {date: list_date, ticker: "FB"}]
+///   [{date: list_date, ticker: "FB"}, ..., {date: delisting_date, ticker: "META"}]
 ///
-/// DelistingDate = first (newest) row's date if ≤ today + 1 year; else active.
+/// DelistingDate = last row's date if ≤ today + 1 year; else active.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TickerChangeEvent {
+    /// First date the new ticker is effective.
+    pub effective_date: NaiveDate,
+    pub old_ticker: String,
+    pub new_ticker: String,
+}
+
 pub fn compute_map_file_rows(
     ticker: &str,
     list_date: Option<NaiveDate>,
     delisting_date: Option<NaiveDate>,
+    ticker_changes: &[TickerChangeEvent],
     _today: NaiveDate,
 ) -> Vec<MapFileEntry> {
     let ticker_upper = ticker.to_uppercase();
@@ -274,18 +289,69 @@ pub fn compute_map_file_rows(
         NaiveDate::from_ymd_opt(1998, 1, 2).unwrap()
     });
 
-    // Newest first (LEAN file ordering)
-    let mut rows = vec![MapFileEntry {
-        date: end_date,
-        ticker: ticker_upper.clone(),
-    }];
+    let mut changes = ticker_changes
+        .iter()
+        .filter(|ev| ev.effective_date >= start_date && ev.effective_date <= end_date)
+        .cloned()
+        .collect::<Vec<_>>();
+    changes.sort_by_key(|ev| ev.effective_date);
+
+    let mut rows = Vec::new();
+    rows.push(MapFileEntry {
+        date: start_date,
+        ticker: changes
+            .first()
+            .map(|ev| ev.old_ticker.to_uppercase())
+            .unwrap_or_else(|| ticker_upper.clone()),
+    });
+
+    for change in &changes {
+        let last_old_date = change
+            .effective_date
+            .checked_sub_signed(chrono::Duration::days(1))
+            .unwrap_or(change.effective_date);
+        if last_old_date >= start_date {
+            rows.push(MapFileEntry {
+                date: last_old_date,
+                ticker: change.old_ticker.to_uppercase(),
+            });
+        }
+    }
+
     if start_date < end_date {
         rows.push(MapFileEntry {
-            date: start_date,
+            date: end_date,
             ticker: ticker_upper,
         });
     }
+    rows.sort_by_key(|r| r.date);
+    rows.dedup();
     rows
+}
+
+fn ticker_event_date(event: &TickerEvent) -> Option<NaiveDate> {
+    NaiveDate::parse_from_str(
+        event.date.split('T').next().unwrap_or(&event.date),
+        "%Y-%m-%d",
+    )
+    .ok()
+}
+
+fn parse_ticker_change_event(
+    previous_ticker: &str,
+    event: &TickerEvent,
+) -> Option<TickerChangeEvent> {
+    let effective_date = ticker_event_date(event)?;
+    let old_ticker = previous_ticker.to_uppercase();
+    let new_ticker = event.ticker_change.ticker.to_uppercase();
+    if old_ticker == new_ticker {
+        return None;
+    }
+    Some(TickerChangeEvent {
+        effective_date,
+        old_ticker,
+        new_ticker,
+    })
 }
 
 /// Fetch ticker details and write a map file for `ticker`.
@@ -302,7 +368,7 @@ pub async fn fetch_and_write_map_file(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let (list_date, delisting_date) = if let Some(d) = details {
+    let (mut list_date, delisting_date) = if let Some(d) = details {
         let ld = d
             .list_date
             .as_deref()
@@ -317,12 +383,31 @@ pub async fn fetch_and_write_map_file(
         (None, None)
     };
 
-    let rows = compute_map_file_rows(ticker, list_date, delisting_date, today);
+    let mut ticker_changes = Vec::new();
+    match client.get_ticker_events(ticker).await {
+        Ok(mut events) => {
+            events.sort_by(|a, b| a.date.cmp(&b.date));
+            events.retain(|ev| ev.event_type == "ticker_change");
+            if let Some(first_event) = events.first() {
+                list_date = list_date.or_else(|| ticker_event_date(first_event));
+                let mut previous_ticker = first_event.ticker_change.ticker.to_uppercase();
+                for event in events.iter().skip(1) {
+                    if let Some(change) = parse_ticker_change_event(&previous_ticker, event) {
+                        previous_ticker = change.new_ticker.clone();
+                        ticker_changes.push(change);
+                    }
+                }
+            }
+        }
+        Err(e) => tracing::warn!("Massive: could not fetch ticker events for {ticker}: {e}"),
+    }
+
+    let rows = compute_map_file_rows(ticker, list_date, delisting_date, &ticker_changes, today);
     write_map_file(map_path, &rows)?;
     Ok(rows)
 }
 
-/// Write map file rows (newest first) to a Parquet file.
+/// Write map file rows (oldest first) to a Parquet file.
 pub fn write_map_file(path: &Path, rows: &[MapFileEntry]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).context("create map_files dir")?;
@@ -392,6 +477,62 @@ mod tests {
     }
 
     #[test]
+    fn reverse_split_uses_lean_old_over_new_factor() {
+        let split = crate::models::MassiveSplitItem {
+            ticker: "DPST".to_string(),
+            execution_date: "2023-06-05".to_string(),
+            split_from: 10.0,
+            split_to: 1.0,
+        };
+
+        let rows = compute_factor_rows(&[split], &[], &HashMap::new(), date(2026, 1, 1));
+        let boundary = rows
+            .iter()
+            .find(|row| row.date == date(2023, 6, 4))
+            .expect("boundary row should be the day before the split");
+        let base = rows
+            .iter()
+            .min_by_key(|row| row.date)
+            .expect("base row should exist");
+
+        assert_eq!(boundary.split_factor, 1.0);
+        assert_eq!(base.split_factor, 10.0);
+    }
+
+    #[test]
+    fn map_rows_follow_lean_boundaries_for_ticker_rename() {
+        let rows = compute_map_file_rows(
+            "META",
+            Some(date(2012, 5, 18)),
+            None,
+            &[TickerChangeEvent {
+                effective_date: date(2022, 6, 9),
+                old_ticker: "FB".to_string(),
+                new_ticker: "META".to_string(),
+            }],
+            date(2026, 4, 28),
+        );
+
+        assert_eq!(
+            rows,
+            vec![
+                MapFileEntry {
+                    date: date(2012, 5, 18),
+                    ticker: "FB".to_string()
+                },
+                MapFileEntry {
+                    date: date(2022, 6, 8),
+                    ticker: "FB".to_string()
+                },
+                MapFileEntry {
+                    date: date(2050, 12, 31),
+                    ticker: "META".to_string()
+                }
+            ]
+        );
+    }
+
+    #[test]
     fn compute_factor_rows_sentinel_row_is_always_present() {
         let today = date(2024, 1, 1);
         let rows = compute_factor_rows(&[], &[], &HashMap::new(), today);
@@ -399,6 +540,20 @@ mod tests {
         assert_eq!(rows[0].date, today);
         assert_eq!(rows[0].price_factor, 1.0);
         assert_eq!(rows[0].split_factor, 1.0);
+    }
+
+    #[test]
+    fn compute_factor_rows_base_row_is_always_present() {
+        let today = date(2024, 1, 1);
+        let rows = compute_factor_rows(&[], &[], &HashMap::new(), today);
+        let base_row = rows
+            .iter()
+            .min_by_key(|row| row.date)
+            .expect("factor file should contain a base row");
+
+        assert_eq!(base_row.date, date(1900, 1, 1));
+        assert_eq!(base_row.price_factor, 1.0);
+        assert_eq!(base_row.split_factor, 1.0);
     }
 
     #[test]
