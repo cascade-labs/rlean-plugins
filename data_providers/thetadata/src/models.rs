@@ -71,6 +71,102 @@ pub struct V3OptionTrade {
     pub timestamp: String,
 }
 
+/// One row from `option/history/trade_quote`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct V3OptionTradeQuote {
+    #[serde(default)]
+    pub symbol: String,
+    #[serde(default)]
+    pub expiration: String,
+    #[serde(default)]
+    pub strike: f64,
+    #[serde(default)]
+    pub right: String,
+    #[serde(default)]
+    pub trade_timestamp: String,
+    #[serde(default)]
+    pub quote_timestamp: String,
+    #[serde(default)]
+    pub sequence: i64,
+    #[serde(default)]
+    pub ext_condition1: i32,
+    #[serde(default)]
+    pub ext_condition2: i32,
+    #[serde(default)]
+    pub ext_condition3: i32,
+    #[serde(default)]
+    pub ext_condition4: i32,
+    #[serde(default)]
+    pub condition: i32,
+    #[serde(default)]
+    pub size: f64,
+    #[serde(default)]
+    pub exchange: u8,
+    #[serde(default)]
+    pub price: f64,
+    #[serde(default)]
+    pub bid_size: f64,
+    #[serde(default)]
+    pub bid_exchange: u8,
+    #[serde(rename = "bid", default)]
+    pub bid_price: f64,
+    #[serde(default)]
+    pub bid_condition: i32,
+    #[serde(default)]
+    pub ask_size: f64,
+    #[serde(default)]
+    pub ask_exchange: u8,
+    #[serde(rename = "ask", default)]
+    pub ask_price: f64,
+    #[serde(default)]
+    pub ask_condition: i32,
+}
+
+/// One row from `stock/history/trade_quote`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct V3StockTradeQuote {
+    #[serde(default)]
+    pub symbol: String,
+    #[serde(default)]
+    pub trade_timestamp: String,
+    #[serde(default)]
+    pub quote_timestamp: String,
+    #[serde(default)]
+    pub sequence: i64,
+    #[serde(default)]
+    pub ext_condition1: i32,
+    #[serde(default)]
+    pub ext_condition2: i32,
+    #[serde(default)]
+    pub ext_condition3: i32,
+    #[serde(default)]
+    pub ext_condition4: i32,
+    #[serde(default)]
+    pub condition: i32,
+    #[serde(default)]
+    pub size: f64,
+    #[serde(default)]
+    pub exchange: u8,
+    #[serde(default)]
+    pub price: f64,
+    #[serde(default)]
+    pub bid_size: f64,
+    #[serde(default)]
+    pub bid_exchange: u8,
+    #[serde(rename = "bid", default)]
+    pub bid_price: f64,
+    #[serde(default)]
+    pub bid_condition: i32,
+    #[serde(default)]
+    pub ask_size: f64,
+    #[serde(default)]
+    pub ask_exchange: u8,
+    #[serde(rename = "ask", default)]
+    pub ask_price: f64,
+    #[serde(default)]
+    pub ask_condition: i32,
+}
+
 /// One row from `option/history/ohlc`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct V3OptionOhlc {
@@ -297,9 +393,9 @@ pub fn normalize_right(right: &str) -> &'static str {
     }
 }
 
-/// Strike in milli-dollars → dollars (ThetaData stores strikes × 1000).
-pub fn normalize_strike(strike_millidollars: f64) -> f64 {
-    strike_millidollars / 1000.0
+/// ThetaData v3 option strikes are encoded in real dollar strike units.
+pub fn normalize_strike(strike: f64) -> f64 {
+    strike
 }
 
 /// Normalize an expiration string (remove hyphens, trim whitespace).
@@ -465,14 +561,12 @@ mod tests {
 
     #[test]
     fn test_normalize_strike_round() {
-        // ThetaData stores strikes as milli-dollars.  450000 → $450.00
-        assert!((normalize_strike(450_000.0) - 450.0).abs() < f64::EPSILON);
+        assert!((normalize_strike(450.0) - 450.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_normalize_strike_fractional() {
-        // $127.50 stored as 127500
-        assert!((normalize_strike(127_500.0) - 127.5).abs() < f64::EPSILON);
+        assert!((normalize_strike(127.5) - 127.5).abs() < f64::EPSILON);
     }
 
     #[test]

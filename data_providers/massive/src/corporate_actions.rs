@@ -134,23 +134,22 @@ pub fn compute_factor_rows(
         }
     }
 
-    // Push a base row at a far-past date carrying the final cumulative factors.
+    // Push a base row at a far-past date carrying the final cumulative factors
+    // only when there is a real adjustment to carry backward.
     // This is the "bottom" of the factor file: rlean's backward-extension logic
     // returns the oldest row for any bar_date that predates all explicit rows.
     // Without this row, bars in the pre-split era fall back to the split boundary
     // row (sf=1.0) instead of the correct pre-split factor (e.g. sf=0.5).
     //
-    // Even when there are no corporate actions, this row records that the file
-    // covers the past.  Otherwise a sentinel-only factor file generated for a
-    // narrow later request is indistinguishable from one that safely covers a
-    // multi-year backtest.
-    let base_date = NaiveDate::from_ymd_opt(1900, 1, 1).unwrap();
-    rows.push(FactorFileEntry {
-        date: base_date,
-        price_factor: cum_price,
-        split_factor: cum_split,
-        reference_price: 0.0,
-    });
+    if (cum_price - 1.0).abs() > 1e-12 || (cum_split - 1.0).abs() > 1e-12 {
+        let base_date = NaiveDate::from_ymd_opt(1900, 1, 1).unwrap();
+        rows.push(FactorFileEntry {
+            date: base_date,
+            price_factor: cum_price,
+            split_factor: cum_split,
+            reference_price: 0.0,
+        });
+    }
 
     rows
 }
@@ -543,17 +542,12 @@ mod tests {
     }
 
     #[test]
-    fn compute_factor_rows_base_row_is_always_present() {
+    fn compute_factor_rows_does_not_write_identity_base_placeholder() {
         let today = date(2024, 1, 1);
         let rows = compute_factor_rows(&[], &[], &HashMap::new(), today);
-        let base_row = rows
-            .iter()
-            .min_by_key(|row| row.date)
-            .expect("factor file should contain a base row");
 
-        assert_eq!(base_row.date, date(1900, 1, 1));
-        assert_eq!(base_row.price_factor, 1.0);
-        assert_eq!(base_row.split_factor, 1.0);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].date, today);
     }
 
     #[test]

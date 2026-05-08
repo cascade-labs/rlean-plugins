@@ -4,10 +4,13 @@ use std::path::Path;
 use std::pin::Pin;
 
 use async_trait::async_trait;
+use chrono::Duration as ChronoDuration;
 use chrono::NaiveDate;
 use tracing::info;
 
-use lean_core::{DateTime, LeanError, Resolution, Result as LeanResult, Symbol, TickType};
+use lean_core::{
+    DateTime, LeanError, Resolution, Result as LeanResult, Symbol, TickType, TimeSpan,
+};
 use lean_data::{IHistoricalDataProvider, TradeBar};
 use lean_storage::{ParquetWriter, PathResolver, WriterConfig};
 
@@ -126,6 +129,7 @@ impl MassiveHistoryProvider {
         let ticker = symbol.permtick.to_uppercase();
         let start_day = start.date_utc();
         let end_day = end.date_utc();
+        let action_start_day = start_day - ChronoDuration::days(10);
 
         let ref_prices: HashMap<NaiveDate, f64> = bars
             .iter()
@@ -142,7 +146,7 @@ impl MassiveHistoryProvider {
             &self.client,
             &factor_path,
             &ticker,
-            start_day,
+            action_start_day,
             end_day,
             &ref_prices,
         )
@@ -208,28 +212,39 @@ impl lean_data_providers::IHistoryProvider for MassiveHistoryProvider {
             DataType::FactorFile => {
                 // Fetch daily bars only for reference prices (needed to compute
                 // dividend adjustment factors); do NOT write bars to disk.
-                let bars = self
+                // Splits do not need reference prices, so a bars endpoint
+                // permission failure must not prevent split factor generation.
+                let bars_start = request.start - TimeSpan::from_days(10);
+                let bars = match self
                     .client
                     .get_aggregates(
                         &request.symbol,
                         lean_core::Resolution::Daily,
-                        request.start,
+                        bars_start,
                         request.end,
                         false,
                     )
                     .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                {
+                    Ok(bars) => bars,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Massive: could not fetch daily bars for {} factor refs ({}); continuing with corporate actions only",
+                            request.symbol.value,
+                            e
+                        );
+                        Vec::new()
+                    }
+                };
 
-                if !bars.is_empty() {
-                    self.fetch_and_write_factor_file(
-                        &request.symbol,
-                        request.start,
-                        request.end,
-                        &bars,
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                }
+                self.fetch_and_write_factor_file(
+                    &request.symbol,
+                    request.start,
+                    request.end,
+                    &bars,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
 
                 Ok(vec![])
             }

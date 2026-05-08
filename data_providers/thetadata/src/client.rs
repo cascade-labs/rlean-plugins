@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 /// ThetaData REST API client.
 ///
 /// Mirrors the C# `ThetaDataRestClient`:
@@ -9,6 +10,7 @@
 ///   - Treat HTTP 472 / 475 / 572 as "no data" (empty result, not an error)
 ///   - Option EOD chain data is cached in partitioned Parquet files under
 ///     `{data_root}/option/usa/daily/trade/date=YYYY-MM-DD/data.parquet`
+use std::io::{BufRead, BufReader, Lines};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -104,6 +106,32 @@ pub struct ThetaDataClient {
     data_root: PathBuf,
     parquet_writer: ParquetWriter,
     parquet_reader: ParquetReader,
+}
+
+pub struct ThetaDataNdjsonStream<T> {
+    lines: Lines<BufReader<reqwest::blocking::Response>>,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<T> Iterator for ThetaDataNdjsonStream<T>
+where
+    T: DeserializeOwned,
+{
+    type Item = anyhow::Result<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let line = match self.lines.next()? {
+                Ok(line) => line,
+                Err(e) => return Some(Err(e.into())),
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            return Some(serde_json::from_str::<T>(trimmed).map_err(Into::into));
+        }
+    }
 }
 
 impl ThetaDataClient {
@@ -285,6 +313,32 @@ impl ThetaDataClient {
         Ok(all)
     }
 
+    /// Equity trades paired with the NBBO quote active at each trade.
+    pub async fn get_stock_trade_quotes(
+        &self,
+        symbol: &str,
+        start: chrono::NaiveDate,
+        end: chrono::NaiveDate,
+        start_time: Option<&str>,
+        end_time: Option<&str>,
+    ) -> Result<Vec<V3StockTradeQuote>> {
+        let mut all = Vec::new();
+        let mut d = start;
+        while d <= end {
+            let mut params = vec![("symbol", symbol.to_string()), ("date", fmt_date(d))];
+            if let Some(st) = start_time {
+                params.push(("start_time", st.to_string()));
+            }
+            if let Some(et) = end_time {
+                params.push(("end_time", et.to_string()));
+            }
+            let rows = self.execute("stock/history/trade_quote", &params).await?;
+            all.extend(rows);
+            d += chrono::Duration::days(1);
+        }
+        Ok(all)
+    }
+
     // ─── Option endpoints ─────────────────────────────────────────────────────
 
     /// Contract universe for a root symbol on a single trading day.
@@ -293,15 +347,8 @@ impl ThetaDataClient {
         root: &str,
         date: NaiveDate,
     ) -> Result<Vec<V3OptionContract>> {
-        let cache_key = format!("{root}-{}-contracts-quote", fmt_date(date));
-        self.get_or_fetch_chain(&cache_key, || {
-            let root = root.to_string();
-            Box::pin(async move {
-                let params = vec![("symbol", root), ("date", fmt_date(date))];
-                self.execute("option/list/contracts/quote", &params).await
-            })
-        })
-        .await
+        let params = vec![("symbol", root.to_string()), ("date", fmt_date(date))];
+        self.execute("option/list/contracts/quote", &params).await
     }
 
     /// Full option OHLC chain for a root symbol on a single trading day.
@@ -311,39 +358,31 @@ impl ThetaDataClient {
         date: NaiveDate,
         interval: &str,
     ) -> Result<Vec<V3OptionOhlc>> {
-        let cache_key = format!("{root}-{}-ohlc-{interval}", fmt_date(date));
-        self.get_or_fetch_chain(&cache_key, || {
-            let root = root.to_string();
-            let interval = interval.to_string();
-            Box::pin(async move {
-                let contracts = self.get_option_contracts_for_date(&root, date).await?;
-                let expirations: std::collections::BTreeSet<String> = contracts
-                    .into_iter()
-                    .map(|contract| normalize_expiration(&contract.expiration))
-                    .collect();
+        let contracts = self.get_option_contracts_for_date(root, date).await?;
+        let expirations: std::collections::BTreeSet<String> = contracts
+            .into_iter()
+            .map(|contract| normalize_expiration(&contract.expiration))
+            .collect();
 
-                let mut rows = Vec::new();
-                for expiration in expirations {
-                    let params = vec![
-                        ("symbol", root.clone()),
-                        ("expiration", expiration),
-                        ("strike", "*".to_string()),
-                        ("start_date", fmt_date(date)),
-                        ("end_date", fmt_date(date)),
-                        ("interval", interval.clone()),
-                    ];
-                    match self.execute("option/history/ohlc", &params).await {
-                        Ok(batch) => rows.extend(batch),
-                        Err(e) => warn!(
-                            "ThetaData: option OHLC fetch failed for {} {}: {}",
-                            root, date, e
-                        ),
-                    }
-                }
-                Ok(rows)
-            })
-        })
-        .await
+        let mut rows = Vec::new();
+        for expiration in expirations {
+            let params = vec![
+                ("symbol", root.to_string()),
+                ("expiration", expiration),
+                ("strike", "*".to_string()),
+                ("start_date", fmt_date(date)),
+                ("end_date", fmt_date(date)),
+                ("interval", interval.to_string()),
+            ];
+            match self.execute("option/history/ohlc", &params).await {
+                Ok(batch) => rows.extend(batch),
+                Err(e) => warn!(
+                    "ThetaData: option OHLC fetch failed for {} {}: {}",
+                    root, date, e
+                ),
+            }
+        }
+        Ok(rows)
     }
 
     /// Full option quote chain for a root symbol on a single trading day.
@@ -353,38 +392,63 @@ impl ThetaDataClient {
         date: NaiveDate,
         interval: &str,
     ) -> Result<Vec<V3OptionQuote>> {
-        let cache_key = format!("{root}-{}-quotes-{interval}", fmt_date(date));
-        self.get_or_fetch_chain(&cache_key, || {
-            let root = root.to_string();
-            let interval = interval.to_string();
-            Box::pin(async move {
-                let contracts = self.get_option_contracts_for_date(&root, date).await?;
-                let expirations: std::collections::BTreeSet<String> = contracts
-                    .into_iter()
-                    .map(|contract| normalize_expiration(&contract.expiration))
-                    .collect();
+        let contracts = self.get_option_contracts_for_date(root, date).await?;
+        let expirations: std::collections::BTreeSet<String> = contracts
+            .into_iter()
+            .map(|contract| normalize_expiration(&contract.expiration))
+            .collect();
 
-                let mut rows = Vec::new();
-                for expiration in expirations {
-                    let params = vec![
-                        ("symbol", root.clone()),
-                        ("expiration", expiration),
-                        ("strike", "*".to_string()),
-                        ("date", fmt_date(date)),
-                        ("interval", interval.clone()),
-                    ];
-                    match self.execute("option/history/quote", &params).await {
-                        Ok(batch) => rows.extend(batch),
-                        Err(e) => warn!(
-                            "ThetaData: option quote fetch failed for {} {}: {}",
-                            root, date, e
-                        ),
-                    }
+        let mut rows = Vec::new();
+        for expiration in expirations {
+            let params = vec![
+                ("symbol", root.to_string()),
+                ("expiration", expiration),
+                ("strike", "*".to_string()),
+                ("date", fmt_date(date)),
+                ("interval", interval.to_string()),
+            ];
+            match self.execute("option/history/quote", &params).await {
+                Ok(batch) => rows.extend(batch),
+                Err(e) => warn!(
+                    "ThetaData: option quote fetch failed for {} {}: {}",
+                    root, date, e
+                ),
+            }
+        }
+        Ok(rows)
+    }
+
+    pub async fn get_option_quote_chain_for_contracts_for_date(
+        &self,
+        root: &str,
+        date: NaiveDate,
+        interval: &str,
+        contracts: &[(String, String)],
+    ) -> Result<Vec<V3OptionQuote>> {
+        let request_groups = grouped_option_requests(contracts);
+        if request_groups.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut rows = Vec::new();
+        for (expiration, strikes) in request_groups {
+            for strike in strikes {
+                let params = vec![
+                    ("symbol", root.to_string()),
+                    ("expiration", expiration.clone()),
+                    ("strike", strike),
+                    ("date", fmt_date(date)),
+                    ("interval", interval.to_string()),
+                ];
+                match self.execute("option/history/quote", &params).await {
+                    Ok(batch) => rows.extend(batch),
+                    Err(e) => warn!(
+                        "ThetaData: filtered option quote fetch failed for {} {}: {}",
+                        root, date, e
+                    ),
                 }
-                Ok(rows)
-            })
-        })
-        .await
+            }
+        }
+        Ok(rows)
     }
 
     /// Full option trade chain for a root symbol on a single trading day.
@@ -393,36 +457,108 @@ impl ThetaDataClient {
         root: &str,
         date: NaiveDate,
     ) -> Result<Vec<V3OptionTrade>> {
-        let cache_key = format!("{root}-{}-trades-tick", fmt_date(date));
-        self.get_or_fetch_chain(&cache_key, || {
-            let root = root.to_string();
-            Box::pin(async move {
-                let contracts = self.get_option_contracts_for_date(&root, date).await?;
-                let expirations: std::collections::BTreeSet<String> = contracts
-                    .into_iter()
-                    .map(|contract| normalize_expiration(&contract.expiration))
-                    .collect();
+        let contracts = self.get_option_contracts_for_date(root, date).await?;
+        let expirations: std::collections::BTreeSet<String> = contracts
+            .into_iter()
+            .map(|contract| normalize_expiration(&contract.expiration))
+            .collect();
 
-                let mut rows = Vec::new();
-                for expiration in expirations {
-                    let params = vec![
-                        ("symbol", root.clone()),
-                        ("expiration", expiration),
-                        ("strike", "*".to_string()),
-                        ("date", fmt_date(date)),
-                    ];
-                    match self.execute("option/history/trade", &params).await {
-                        Ok(batch) => rows.extend(batch),
-                        Err(e) => warn!(
-                            "ThetaData: option trade fetch failed for {} {}: {}",
-                            root, date, e
-                        ),
-                    }
+        let mut rows = Vec::new();
+        for expiration in expirations {
+            let params = vec![
+                ("symbol", root.to_string()),
+                ("expiration", expiration),
+                ("strike", "*".to_string()),
+                ("date", fmt_date(date)),
+            ];
+            match self.execute("option/history/trade", &params).await {
+                Ok(batch) => rows.extend(batch),
+                Err(e) => warn!(
+                    "ThetaData: option trade fetch failed for {} {}: {}",
+                    root, date, e
+                ),
+            }
+        }
+        Ok(rows)
+    }
+
+    pub async fn get_option_trade_chain_for_contracts_for_date(
+        &self,
+        root: &str,
+        date: NaiveDate,
+        contracts: &[(String, String)],
+    ) -> Result<Vec<V3OptionTrade>> {
+        let request_groups = grouped_option_requests(contracts);
+        if request_groups.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut rows = Vec::new();
+        for (expiration, strikes) in request_groups {
+            for strike in strikes {
+                let params = vec![
+                    ("symbol", root.to_string()),
+                    ("expiration", expiration.clone()),
+                    ("strike", strike),
+                    ("date", fmt_date(date)),
+                ];
+                match self.execute("option/history/trade", &params).await {
+                    Ok(batch) => rows.extend(batch),
+                    Err(e) => warn!(
+                        "ThetaData: filtered option trade fetch failed for {} {}: {}",
+                        root, date, e
+                    ),
                 }
-                Ok(rows)
-            })
-        })
-        .await
+            }
+        }
+        Ok(rows)
+    }
+
+    pub async fn get_option_trade_quote_chain_for_contracts_for_date(
+        &self,
+        root: &str,
+        date: NaiveDate,
+        contracts: &[(String, String)],
+    ) -> Result<Vec<V3OptionTradeQuote>> {
+        let request_groups = grouped_option_requests(contracts);
+        if request_groups.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut rows = Vec::new();
+        for (expiration, strikes) in request_groups {
+            for strike in strikes {
+                let params = vec![
+                    ("symbol", root.to_string()),
+                    ("expiration", expiration.clone()),
+                    ("strike", strike),
+                    ("date", fmt_date(date)),
+                ];
+                match self.execute("option/history/trade_quote", &params).await {
+                    Ok(batch) => rows.extend(batch),
+                    Err(e) => warn!(
+                        "ThetaData: filtered option trade_quote fetch failed for {} {}: {}",
+                        root, date, e
+                    ),
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    pub async fn get_option_trade_quote_chain_for_filter_for_date(
+        &self,
+        root: &str,
+        date: NaiveDate,
+        max_dte: i32,
+        strike_range: i32,
+    ) -> Result<Vec<V3OptionTradeQuote>> {
+        let params = vec![
+            ("symbol", root.to_string()),
+            ("expiration", "*".to_string()),
+            ("date", fmt_date(date)),
+            ("max_dte", max_dte.max(0).to_string()),
+            ("strike_range", strike_range.max(0).to_string()),
+        ];
+        self.execute("option/history/trade_quote", &params).await
     }
 
     /// Option quote history for a single contract (bulk chain per day, filtered to contract).
@@ -431,37 +567,19 @@ impl ThetaDataClient {
         request: OptionQuoteRequest<'_>,
     ) -> Result<Vec<QuoteBar>> {
         let contract_key = option_contract_key(request.expiration, request.strike, request.right);
-        let cache_key = format!(
-            "{}-{}-{}-quote-{}",
-            request.root,
-            fmt_date(request.start),
-            fmt_date(request.end),
-            request.interval
-        );
-        let all_rows: Vec<V3OptionQuote> = self
-            .get_or_fetch_chain(&cache_key, || {
-                let root = request.root.to_string();
-                let expiration = request.expiration.to_string();
-                let interval = request.interval.to_string();
-                Box::pin(async move {
-                    let mut rows = Vec::new();
-                    let mut d = request.start;
-                    while d <= request.end {
-                        let params = vec![
-                            ("symbol", root.clone()),
-                            ("expiration", expiration.clone()),
-                            ("date", fmt_date(d)),
-                            ("interval", interval.clone()),
-                        ];
-                        let batch: Vec<V3OptionQuote> =
-                            self.execute("option/history/quote", &params).await?;
-                        rows.extend(batch);
-                        d += chrono::Duration::days(1);
-                    }
-                    Ok(rows)
-                })
-            })
-            .await?;
+        let mut all_rows = Vec::new();
+        let mut d = request.start;
+        while d <= request.end {
+            let params = vec![
+                ("symbol", request.root.to_string()),
+                ("expiration", request.expiration.to_string()),
+                ("date", fmt_date(d)),
+                ("interval", request.interval.to_string()),
+            ];
+            let batch: Vec<V3OptionQuote> = self.execute("option/history/quote", &params).await?;
+            all_rows.extend(batch);
+            d += chrono::Duration::days(1);
+        }
 
         Ok(all_rows
             .into_iter()
@@ -500,29 +618,18 @@ impl ThetaDataClient {
         end: chrono::NaiveDate,
     ) -> Result<Vec<TradeTick>> {
         let contract_key = option_contract_key(expiration, strike, right);
-        let cache_key = format!("{root}-{}-{}-trade", fmt_date(start), fmt_date(end));
-        let all_rows: Vec<V3OptionTrade> = self
-            .get_or_fetch_chain(&cache_key, || {
-                let root = root.to_string();
-                let expiration = expiration.to_string();
-                Box::pin(async move {
-                    let mut rows = Vec::new();
-                    let mut d = start;
-                    while d <= end {
-                        let params = vec![
-                            ("symbol", root.clone()),
-                            ("expiration", expiration.clone()),
-                            ("date", fmt_date(d)),
-                        ];
-                        let batch: Vec<V3OptionTrade> =
-                            self.execute("option/history/trade", &params).await?;
-                        rows.extend(batch);
-                        d += chrono::Duration::days(1);
-                    }
-                    Ok(rows)
-                })
-            })
-            .await?;
+        let mut all_rows = Vec::new();
+        let mut d = start;
+        while d <= end {
+            let params = vec![
+                ("symbol", root.to_string()),
+                ("expiration", expiration.to_string()),
+                ("date", fmt_date(d)),
+            ];
+            let batch: Vec<V3OptionTrade> = self.execute("option/history/trade", &params).await?;
+            all_rows.extend(batch);
+            d += chrono::Duration::days(1);
+        }
 
         Ok(all_rows
             .into_iter()
@@ -682,22 +789,13 @@ impl ThetaDataClient {
         end: chrono::NaiveDate,
     ) -> Result<Vec<EodBar>> {
         let contract_key = option_contract_key(expiration, strike, right);
-        let cache_key = format!("{root}-{}-{}-eod", fmt_date(start), fmt_date(end));
-        let all_rows: Vec<V3OptionEod> = self
-            .get_or_fetch_chain(&cache_key, || {
-                let root = root.to_string();
-                let expiration = expiration.to_string();
-                Box::pin(async move {
-                    let params = vec![
-                        ("symbol", root.clone()),
-                        ("expiration", expiration.clone()),
-                        ("start_date", fmt_date(start)),
-                        ("end_date", fmt_date(end)),
-                    ];
-                    self.execute("option/history/eod", &params).await
-                })
-            })
-            .await?;
+        let params = vec![
+            ("symbol", root.to_string()),
+            ("expiration", expiration.to_string()),
+            ("start_date", fmt_date(start)),
+            ("end_date", fmt_date(end)),
+        ];
+        let all_rows: Vec<V3OptionEod> = self.execute("option/history/eod", &params).await?;
 
         Ok(all_rows
             .into_iter()
@@ -892,41 +990,96 @@ impl ThetaDataClient {
         }
     }
 
-    // ─── Chain caching ────────────────────────────────────────────────────────
-
-    /// Layer 1: disk cache for bulk option chain fetches.
-    ///
-    /// On miss, calls `fetch_fn`, serializes the result to disk, and returns it.
-    async fn get_or_fetch_chain<T, F, Fut>(&self, cache_key: &str, fetch_fn: F) -> Result<Vec<T>>
-    where
-        T: serde::Serialize + DeserializeOwned + Send + 'static,
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<Vec<T>>>,
-    {
-        // JSON cache for intraday/quote/trade chains (not EOD — those use Parquet).
-        let file_path = self
-            .data_root
-            .join(".chain-cache")
-            .join(format!("{cache_key}.json"));
-
-        if file_path.exists() {
-            debug!("ThetaData: chain disk-cache hit for {cache_key}");
-            let json = std::fs::read_to_string(&file_path)?;
-            return Ok(serde_json::from_str(&json).unwrap_or_default());
+    pub async fn stream_ndjson<T: DeserializeOwned>(
+        &self,
+        endpoint: &str,
+        params: &[(&str, String)],
+    ) -> Result<ThetaDataNdjsonStream<T>> {
+        let mut query = format!(
+            "{}{API_VERSION}/{}?format=ndjson",
+            self.base_url,
+            endpoint.trim_start_matches('/')
+        );
+        for (k, v) in params {
+            query.push('&');
+            query.push_str(k);
+            query.push('=');
+            query.push_str(&urlencoded(v));
         }
+        debug!("ThetaData streaming GET {query}");
 
-        let data = fetch_fn().await?;
+        let mut rl_retries: u32 = 0;
+        let mut gen_retries: u32 = 0;
 
-        if !data.is_empty() {
-            if let Some(parent) = file_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+        loop {
+            self.limiter.wait();
+            let permit = self
+                .concurrency
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("ThetaData concurrency semaphore closed");
+            let mut req = self.http.get(&query);
+            if let Some(token) = &self.access_token {
+                req = req.bearer_auth(token);
             }
-            if let Ok(json) = serde_json::to_string(&data) {
-                let _ = std::fs::write(&file_path, json);
+            let resp = match req.send() {
+                Ok(r) => {
+                    drop(permit);
+                    r
+                }
+                Err(e) if gen_retries < MAX_RETRIES => {
+                    drop(permit);
+                    gen_retries += 1;
+                    warn!("ThetaData: streaming request error (retry {gen_retries}): {e}");
+                    std::thread::sleep(Duration::from_secs(gen_retries as u64));
+                    continue;
+                }
+                Err(e) => {
+                    drop(permit);
+                    bail!("ThetaData: {e}");
+                }
+            };
+
+            let status = resp.status().as_u16();
+            if matches!(status, 472 | 475 | 572) {
+                debug!("ThetaData: no streaming data ({status}) for {endpoint}");
+                return Ok(ThetaDataNdjsonStream {
+                    lines: BufReader::new(resp).lines(),
+                    _marker: std::marker::PhantomData,
+                });
             }
+            if status == 429 {
+                if rl_retries >= MAX_RATE_LIMIT_RETRIES {
+                    bail!("ThetaData: rate limit exceeded after {MAX_RATE_LIMIT_RETRIES} retries");
+                }
+                rl_retries += 1;
+                let delay = retry_after_delay(&resp).unwrap_or_else(|| {
+                    Duration::from_millis((2u64.pow(rl_retries)) * 1000 + (rand_jitter() as u64))
+                });
+                self.limiter.cool_down(delay);
+                warn!(
+                    "ThetaData: rate limited (429), cooling down shared limiter for {:.1}s",
+                    delay.as_secs_f64()
+                );
+                std::thread::sleep(delay);
+                continue;
+            }
+            if !resp.status().is_success() {
+                let body = resp.text().unwrap_or_default();
+                if gen_retries < MAX_RETRIES {
+                    gen_retries += 1;
+                    warn!("ThetaData: HTTP {status} (stream retry {gen_retries}): {body}");
+                    std::thread::sleep(Duration::from_secs(gen_retries as u64));
+                    continue;
+                }
+                bail!("ThetaData: HTTP {status} for {endpoint}: {body}");
+            }
+            return Ok(ThetaDataNdjsonStream {
+                lines: BufReader::new(resp).lines(),
+                _marker: std::marker::PhantomData,
+            });
         }
-
-        Ok(data)
     }
 }
 
@@ -1173,6 +1326,17 @@ fn option_contract_key(expiration: &str, strike: f64, right: &str) -> String {
 
 fn option_row_matches(expiration: &str, row_strike: f64, row_right: &str, key: &str) -> bool {
     option_contract_key(expiration, row_strike, row_right) == *key
+}
+
+fn grouped_option_requests(contracts: &[(String, String)]) -> BTreeMap<String, BTreeSet<String>> {
+    let mut groups = BTreeMap::new();
+    for (expiration, strike) in contracts {
+        groups
+            .entry(normalize_expiration(expiration))
+            .or_insert_with(BTreeSet::new)
+            .insert(strike.clone());
+    }
+    groups
 }
 
 // ─── Misc helpers ─────────────────────────────────────────────────────────────
