@@ -8,14 +8,14 @@ use chrono::Duration as ChronoDuration;
 use chrono::NaiveDate;
 use tracing::info;
 
-use lean_core::{
-    DateTime, LeanError, Resolution, Result as LeanResult, Symbol, TickType, TimeSpan,
-};
+use lean_core::{DateTime, LeanError, Resolution, Result as LeanResult, Symbol, TickType};
 use lean_data::{IHistoricalDataProvider, TradeBar};
 use lean_storage::{ParquetWriter, PathResolver, WriterConfig};
 
 use crate::client::MassiveRestClient;
-use crate::corporate_actions::{fetch_and_write_factor_file, fetch_and_write_map_file};
+use crate::corporate_actions::{
+    fetch_and_write_factor_file, fetch_and_write_map_file, lean_factor_file_start_date,
+};
 
 /// Massive historical data provider.
 ///
@@ -127,11 +127,13 @@ impl MassiveHistoryProvider {
         bars: &[TradeBar],
     ) -> anyhow::Result<()> {
         let ticker = symbol.permtick.to_uppercase();
-        let start_day = start.date_utc();
+        let requested_start_day = start.date_utc();
         let end_day = end.date_utc();
-        let action_start_day = start_day - ChronoDuration::days(10);
+        let action_start_day = lean_factor_file_start_date();
+        let action_end_day = end_day.max(chrono::Utc::now().date_naive());
+        let action_end = date_to_datetime(action_end_day, 23, 59, 59);
 
-        let ref_prices: HashMap<NaiveDate, f64> = bars
+        let mut ref_prices: HashMap<NaiveDate, f64> = bars
             .iter()
             .map(|b| {
                 (
@@ -141,13 +143,46 @@ impl MassiveHistoryProvider {
             })
             .collect();
 
+        let missing_older_reference_prices = ref_prices
+            .keys()
+            .min()
+            .is_none_or(|first| *first > requested_start_day - ChronoDuration::days(10));
+        if missing_older_reference_prices && action_start_day < requested_start_day {
+            match self
+                .client
+                .get_aggregates(
+                    symbol,
+                    Resolution::Daily,
+                    date_to_datetime(action_start_day, 0, 0, 0),
+                    action_end,
+                    false,
+                )
+                .await
+            {
+                Ok(reference_bars) => {
+                    for bar in reference_bars {
+                        ref_prices
+                            .entry(bar.time.date_utc())
+                            .or_insert_with(|| bar.close.to_string().parse::<f64>().unwrap_or(0.0));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Massive: could not fetch full factor reference prices for {} ({}); dividends without reference closes will be skipped",
+                        symbol.value,
+                        e
+                    );
+                }
+            }
+        }
+
         let factor_path = self.factor_file_path(symbol);
         fetch_and_write_factor_file(
             &self.client,
             &factor_path,
             &ticker,
             action_start_day,
-            end_day,
+            action_end_day,
             &ref_prices,
         )
         .await?;
@@ -186,6 +221,10 @@ impl MassiveHistoryProvider {
     }
 }
 
+fn date_to_datetime(date: NaiveDate, hour: u32, minute: u32, second: u32) -> DateTime {
+    date.and_hms_opt(hour, minute, second).unwrap().into()
+}
+
 impl IHistoricalDataProvider for MassiveHistoryProvider {
     fn get_trade_bars(
         &self,
@@ -214,14 +253,20 @@ impl lean_data_providers::IHistoryProvider for MassiveHistoryProvider {
                 // dividend adjustment factors); do NOT write bars to disk.
                 // Splits do not need reference prices, so a bars endpoint
                 // permission failure must not prevent split factor generation.
-                let bars_start = request.start - TimeSpan::from_days(10);
+                let bars_start = date_to_datetime(lean_factor_file_start_date(), 0, 0, 0);
+                let bars_end = date_to_datetime(
+                    request.end.date_utc().max(chrono::Utc::now().date_naive()),
+                    23,
+                    59,
+                    59,
+                );
                 let bars = match self
                     .client
                     .get_aggregates(
                         &request.symbol,
                         lean_core::Resolution::Daily,
                         bars_start,
-                        request.end,
+                        bars_end,
                         false,
                     )
                     .await

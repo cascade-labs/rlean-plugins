@@ -2,7 +2,7 @@
 //!
 //! rlean reads this plugin as native Parquet only. The plugin owns any upstream
 //! wire conversion and persists canonical files under:
-//! `{RLEAN_DATA_DIR}/alternative/cboe_vix/vix/daily/{YYYY}/{MM}/{DD}/1600.parquet`.
+//! `{data_root}/alternative/cboe_vix/vix/daily/{YYYY}/{MM}/{DD}/1600.parquet`.
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -12,7 +12,7 @@ use arrow_array::{Float64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use chrono::{Datelike, NaiveDate};
 use lean_data::custom::{CustomDataConfig, CustomDataPoint, CustomDataQuery, CustomParquetSource};
-use lean_data_providers::ICustomDataSource;
+use lean_data_providers::{CustomDataContext, ICustomDataSource};
 use lean_plugin::{rlean_plugin, PluginKind};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
@@ -32,7 +32,7 @@ pub struct CboeVixDataSource {
 impl CboeVixDataSource {
     pub fn new() -> Self {
         CboeVixDataSource {
-            data_dir: get_data_dir(),
+            data_dir: PathBuf::from("data"),
         }
     }
 }
@@ -44,6 +44,10 @@ impl Default for CboeVixDataSource {
 }
 
 impl ICustomDataSource for CboeVixDataSource {
+    fn initialize(&mut self, context: &CustomDataContext) {
+        self.data_dir = context.data_root().to_path_buf();
+    }
+
     fn name(&self) -> &str {
         "cboe_vix"
     }
@@ -111,19 +115,6 @@ impl ICustomDataSource for CboeVixDataSource {
     ) -> Option<CustomDataPoint> {
         None
     }
-}
-
-fn get_data_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("RLEAN_DATA_DIR") {
-        return PathBuf::from(dir);
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let path = PathBuf::from(home).join(".rlean").join("data");
-        if path.exists() {
-            return path;
-        }
-    }
-    PathBuf::from("data")
 }
 
 fn vix_path(data_dir: &Path, date: NaiveDate) -> PathBuf {

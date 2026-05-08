@@ -435,6 +435,45 @@ impl ThetaDataHistoryProvider {
             .collect())
     }
 
+    async fn fetch_option_quote_bars_for_contracts(
+        &self,
+        ticker: &str,
+        resolution: Resolution,
+        date: NaiveDate,
+        contracts: &[OptionUniverseRow],
+    ) -> anyhow::Result<Vec<QuoteBar>> {
+        if contracts.is_empty() {
+            return Ok(vec![]);
+        }
+        let interval = resolution_to_interval(resolution).ok_or_else(|| {
+            anyhow::anyhow!("ThetaData option quote bars require minute/second/hour resolution")
+        })?;
+        let period = resolution_to_period(resolution)
+            .ok_or_else(|| anyhow::anyhow!("ThetaData option quote bars require bar resolution"))?;
+        let underlying = Symbol::create_equity(ticker, &Market::usa());
+        let allowed = allowed_option_symbol_values(&underlying, contracts);
+        let request_contracts = option_request_contracts(contracts);
+
+        info!(
+            "ThetaData filtered option quote fetch {ticker} {date}: {} contracts",
+            allowed.len()
+        );
+        let rows = self
+            .client
+            .get_option_quote_chain_for_contracts_for_date(
+                ticker,
+                date,
+                interval,
+                &request_contracts,
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| option_quote_to_quote_bar(&underlying, row, period))
+            .filter(|bar| allowed.contains(bar.symbol.value.as_str()))
+            .collect())
+    }
+
     async fn fetch_option_ticks(&self, ticker: &str, date: NaiveDate) -> anyhow::Result<Vec<Tick>> {
         let underlying = Symbol::create_equity(ticker, &Market::usa());
         let contracts = self.fetch_option_universe_rows(ticker, date).await?;
@@ -990,6 +1029,25 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
         Ok(bars)
     }
 
+    async fn get_option_trade_bars_filtered(
+        &self,
+        ticker: &str,
+        resolution: Resolution,
+        date: chrono::NaiveDate,
+        contracts: &[OptionUniverseRow],
+    ) -> anyhow::Result<Vec<TradeBar>> {
+        let underlying = Symbol::create_equity(ticker, &Market::usa());
+        let allowed = allowed_option_symbol_values(&underlying, contracts);
+        let mut bars = self
+            .fetch_option_trade_bars(ticker, resolution, date)
+            .await?;
+        if !allowed.is_empty() {
+            bars.retain(|bar| allowed.contains(bar.symbol.value.as_str()));
+        }
+        self.write_option_trade_bars_to_disk(ticker, resolution, date, &bars)?;
+        Ok(bars)
+    }
+
     async fn get_option_quote_bars(
         &self,
         ticker: &str,
@@ -998,6 +1056,20 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
     ) -> anyhow::Result<Vec<QuoteBar>> {
         let bars = self
             .fetch_option_quote_bars(ticker, resolution, date)
+            .await?;
+        self.write_option_quote_bars_to_disk(ticker, resolution, date, &bars)?;
+        Ok(bars)
+    }
+
+    async fn get_option_quote_bars_filtered(
+        &self,
+        ticker: &str,
+        resolution: Resolution,
+        date: chrono::NaiveDate,
+        contracts: &[OptionUniverseRow],
+    ) -> anyhow::Result<Vec<QuoteBar>> {
+        let bars = self
+            .fetch_option_quote_bars_for_contracts(ticker, resolution, date, contracts)
             .await?;
         self.write_option_quote_bars_to_disk(ticker, resolution, date, &bars)?;
         Ok(bars)
@@ -1280,6 +1352,17 @@ fn allowed_option_symbol_values(
             option_symbol_from_universe_row(underlying, row).map(|symbol| symbol.value)
         })
         .collect()
+}
+
+fn option_request_contracts(contracts: &[OptionUniverseRow]) -> Vec<(String, String)> {
+    let mut out = std::collections::BTreeSet::new();
+    for row in contracts {
+        out.insert((
+            row.expiration.format("%Y%m%d").to_string(),
+            row.strike.normalize().to_string(),
+        ));
+    }
+    out.into_iter().collect()
 }
 
 fn option_symbol_from_universe_row(underlying: &Symbol, row: &OptionUniverseRow) -> Option<Symbol> {

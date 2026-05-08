@@ -20,6 +20,14 @@ use lean_storage::{ParquetReader, ParquetWriter, WriterConfig};
 
 use crate::models::{MassiveDividendItem, MassiveSplitItem, TickerEvent};
 
+pub(crate) fn lean_factor_file_end_date() -> NaiveDate {
+    NaiveDate::from_ymd_opt(2050, 12, 31).unwrap()
+}
+
+pub(crate) fn lean_factor_file_start_date() -> NaiveDate {
+    NaiveDate::from_ymd_opt(1900, 1, 1).unwrap()
+}
+
 // ─── Computation ─────────────────────────────────────────────────────────────
 
 /// Build a list of `FactorFileEntry`s from raw Massive API data.
@@ -28,12 +36,12 @@ use crate::models::{MassiveDividendItem, MassiveSplitItem, TickerEvent};
 ///   the price factor for each dividend).
 ///
 /// Returns rows sorted **newest first** (LEAN file ordering), with a sentinel
-/// row at index 0 dated `today`.
+/// row at index 0 dated `sentinel_date`.
 pub fn compute_factor_rows(
     splits: &[MassiveSplitItem],
     dividends: &[MassiveDividendItem],
     ref_prices: &HashMap<NaiveDate, f64>,
-    today: NaiveDate,
+    sentinel_date: NaiveDate,
 ) -> Vec<FactorFileEntry> {
     #[derive(Debug)]
     enum Event {
@@ -80,10 +88,11 @@ pub fn compute_factor_rows(
         db.cmp(da)
     });
 
-    // Sentinel row: today's date, all factors = 1.0, reference_price = 0.
+    // LEAN factor files end with a future sentinel row (usually 2050-12-31),
+    // not the wall-clock date the file was generated.
     let mut rows: Vec<FactorFileEntry> = Vec::new();
     rows.push(FactorFileEntry {
-        date: today,
+        date: sentinel_date,
         price_factor: 1.0,
         split_factor: 1.0,
         reference_price: 0.0,
@@ -134,22 +143,14 @@ pub fn compute_factor_rows(
         }
     }
 
-    // Push a base row at a far-past date carrying the final cumulative factors
-    // only when there is a real adjustment to carry backward.
-    // This is the "bottom" of the factor file: rlean's backward-extension logic
-    // returns the oldest row for any bar_date that predates all explicit rows.
-    // Without this row, bars in the pre-split era fall back to the split boundary
-    // row (sf=1.0) instead of the correct pre-split factor (e.g. sf=0.5).
-    //
-    if (cum_price - 1.0).abs() > 1e-12 || (cum_split - 1.0).abs() > 1e-12 {
-        let base_date = NaiveDate::from_ymd_opt(1900, 1, 1).unwrap();
-        rows.push(FactorFileEntry {
-            date: base_date,
-            price_factor: cum_price,
-            split_factor: cum_split,
-            reference_price: 0.0,
-        });
-    }
+    // Always write a far-past base row. For symbols with no actions this is an
+    // identity row, but it still proves the file covers historical backtests.
+    rows.push(FactorFileEntry {
+        date: lean_factor_file_start_date(),
+        price_factor: cum_price,
+        split_factor: cum_split,
+        reference_price: 0.0,
+    });
 
     rows
 }
@@ -212,8 +213,7 @@ pub async fn fetch_and_write_factor_file(
         ticker
     );
 
-    let today = chrono::Utc::now().date_naive();
-    let rows = compute_factor_rows(&splits, &dividends, ref_prices, today);
+    let rows = compute_factor_rows(&splits, &dividends, ref_prices, lean_factor_file_end_date());
     write_factor_file(factor_path, &rows)?;
 
     Ok(rows)
@@ -533,21 +533,22 @@ mod tests {
 
     #[test]
     fn compute_factor_rows_sentinel_row_is_always_present() {
-        let today = date(2024, 1, 1);
-        let rows = compute_factor_rows(&[], &[], &HashMap::new(), today);
+        let rows = compute_factor_rows(&[], &[], &HashMap::new(), lean_factor_file_end_date());
         assert!(!rows.is_empty());
-        assert_eq!(rows[0].date, today);
+        assert_eq!(rows[0].date, lean_factor_file_end_date());
         assert_eq!(rows[0].price_factor, 1.0);
         assert_eq!(rows[0].split_factor, 1.0);
     }
 
     #[test]
-    fn compute_factor_rows_does_not_write_identity_base_placeholder() {
-        let today = date(2024, 1, 1);
-        let rows = compute_factor_rows(&[], &[], &HashMap::new(), today);
+    fn compute_factor_rows_writes_identity_base_for_no_action_symbols() {
+        let rows = compute_factor_rows(&[], &[], &HashMap::new(), lean_factor_file_end_date());
 
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].date, today);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].date, lean_factor_file_end_date());
+        assert_eq!(rows[1].date, lean_factor_file_start_date());
+        assert_eq!(rows[1].price_factor, 1.0);
+        assert_eq!(rows[1].split_factor, 1.0);
     }
 
     #[test]

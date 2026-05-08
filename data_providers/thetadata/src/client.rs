@@ -430,22 +430,20 @@ impl ThetaDataClient {
             return Ok(vec![]);
         }
         let mut rows = Vec::new();
-        for (expiration, strikes) in request_groups {
-            for strike in strikes {
-                let params = vec![
-                    ("symbol", root.to_string()),
-                    ("expiration", expiration.clone()),
-                    ("strike", strike),
-                    ("date", fmt_date(date)),
-                    ("interval", interval.to_string()),
-                ];
-                match self.execute("option/history/quote", &params).await {
-                    Ok(batch) => rows.extend(batch),
-                    Err(e) => warn!(
-                        "ThetaData: filtered option quote fetch failed for {} {}: {}",
-                        root, date, e
-                    ),
-                }
+        for (expiration, _strikes) in request_groups {
+            let params = vec![
+                ("symbol", root.to_string()),
+                ("expiration", expiration),
+                ("strike", "*".to_string()),
+                ("date", fmt_date(date)),
+                ("interval", interval.to_string()),
+            ];
+            match self.execute("option/history/quote", &params).await {
+                Ok(batch) => rows.extend(batch),
+                Err(e) => warn!(
+                    "ThetaData: filtered option quote fetch failed for {} {}: {}",
+                    root, date, e
+                ),
             }
         }
         Ok(rows)
@@ -493,21 +491,19 @@ impl ThetaDataClient {
             return Ok(vec![]);
         }
         let mut rows = Vec::new();
-        for (expiration, strikes) in request_groups {
-            for strike in strikes {
-                let params = vec![
-                    ("symbol", root.to_string()),
-                    ("expiration", expiration.clone()),
-                    ("strike", strike),
-                    ("date", fmt_date(date)),
-                ];
-                match self.execute("option/history/trade", &params).await {
-                    Ok(batch) => rows.extend(batch),
-                    Err(e) => warn!(
-                        "ThetaData: filtered option trade fetch failed for {} {}: {}",
-                        root, date, e
-                    ),
-                }
+        for (expiration, _strikes) in request_groups {
+            let params = vec![
+                ("symbol", root.to_string()),
+                ("expiration", expiration),
+                ("strike", "*".to_string()),
+                ("date", fmt_date(date)),
+            ];
+            match self.execute("option/history/trade", &params).await {
+                Ok(batch) => rows.extend(batch),
+                Err(e) => warn!(
+                    "ThetaData: filtered option trade fetch failed for {} {}: {}",
+                    root, date, e
+                ),
             }
         }
         Ok(rows)
@@ -524,21 +520,19 @@ impl ThetaDataClient {
             return Ok(vec![]);
         }
         let mut rows = Vec::new();
-        for (expiration, strikes) in request_groups {
-            for strike in strikes {
-                let params = vec![
-                    ("symbol", root.to_string()),
-                    ("expiration", expiration.clone()),
-                    ("strike", strike),
-                    ("date", fmt_date(date)),
-                ];
-                match self.execute("option/history/trade_quote", &params).await {
-                    Ok(batch) => rows.extend(batch),
-                    Err(e) => warn!(
-                        "ThetaData: filtered option trade_quote fetch failed for {} {}: {}",
-                        root, date, e
-                    ),
-                }
+        for (expiration, _strikes) in request_groups {
+            let params = vec![
+                ("symbol", root.to_string()),
+                ("expiration", expiration),
+                ("strike", "*".to_string()),
+                ("date", fmt_date(date)),
+            ];
+            match self.execute("option/history/trade_quote", &params).await {
+                Ok(batch) => rows.extend(batch),
+                Err(e) => warn!(
+                    "ThetaData: filtered option trade_quote fetch failed for {} {}: {}",
+                    root, date, e
+                ),
             }
         }
         Ok(rows)

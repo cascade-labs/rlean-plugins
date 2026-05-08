@@ -47,7 +47,11 @@ pub unsafe extern "C" fn rlean_create_history_provider(
         .as_str()
         .map(|s| s.to_string())
         .or_else(|| std::env::var("THETADATA_BASE_URL").ok());
-    let data_root = std::path::PathBuf::from(config["data_root"].as_str().unwrap_or("data"));
+    let Some(data_root) = config["data_root"].as_str() else {
+        eprintln!("rlean-plugin-thetadata: framework did not provide data_root.");
+        return std::ptr::null_mut();
+    };
+    let data_root = std::path::PathBuf::from(data_root);
     let rps = numeric_f64(&config["requests_per_second"]).unwrap_or(4.0);
     let max_concurrent = numeric_u64(&config["max_concurrent"]).unwrap_or(4) as usize;
 

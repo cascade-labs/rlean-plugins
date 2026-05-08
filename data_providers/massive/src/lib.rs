@@ -50,7 +50,11 @@ pub unsafe extern "C" fn rlean_create_history_provider(
         );
         return std::ptr::null_mut();
     }
-    let data_root = std::path::PathBuf::from(config["data_root"].as_str().unwrap_or("data"));
+    let Some(data_root) = config["data_root"].as_str() else {
+        eprintln!("rlean-plugin-massive: framework did not provide data_root.");
+        return std::ptr::null_mut();
+    };
+    let data_root = std::path::PathBuf::from(data_root);
     let rps = config["requests_per_second"].as_f64().unwrap_or(5.0);
 
     let provider = Arc::new(MassiveHistoryProvider::new(api_key, &data_root, rps));
