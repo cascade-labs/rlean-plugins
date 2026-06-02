@@ -18,6 +18,14 @@
       "subdir": "data_providers/thetadata"
     },
     {
+      "name": "hyperliquid",
+      "version": "0.1.0",
+      "kind": "data-provider",
+      "description": "Hyperliquid S3 archive historical data provider",
+      "git_url": "https://github.com/cascade-labs/rlean-plugins",
+      "subdir": "data_providers/hyperliquid"
+    },
+    {
       "name": "alpaca",
       "version": "0.1.0",
       "kind": "brokerage",
