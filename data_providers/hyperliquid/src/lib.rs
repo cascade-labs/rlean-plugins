@@ -70,6 +70,11 @@ pub unsafe extern "C" fn rlean_create_history_provider(
         .map(str::to_string)
         .or_else(|| std::env::var("HYPERLIQUID_REQUEST_PAYER").ok())
         .unwrap_or_else(|| "requester".to_string());
+    let region = config_string(&config, "aws_region")
+        .or_else(|| config_string(&config, "AWS_REGION"))
+        .or_else(|| std::env::var("AWS_REGION").ok())
+        .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+        .unwrap_or_else(default_archive_region);
     let credentials = parse_archive_credentials(&config);
 
     let coin_map = parse_coin_map(&config["coin_map"]);
@@ -81,6 +86,7 @@ pub unsafe extern "C" fn rlean_create_history_provider(
             fills: fills_bucket,
         },
         request_payer,
+        region,
         credentials,
     );
     let provider = Arc::new(HyperliquidHistoryProvider::new(
@@ -116,6 +122,10 @@ fn config_string(config: &serde_json::Value, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn default_archive_region() -> String {
+    "ap-northeast-1".to_string()
 }
 
 fn parse_coin_map(value: &serde_json::Value) -> HashMap<String, String> {

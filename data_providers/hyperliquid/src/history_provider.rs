@@ -721,6 +721,7 @@ mod tests {
                 fills: "hl-mainnet-node-data".to_string(),
             },
             "requester",
+            "ap-northeast-1",
             None,
         );
         HyperliquidHistoryProvider::new(&data_root, archive, HyperliquidArchiveConfig { coin_map })
