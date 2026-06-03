@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::types::RequestPayer;
 use lz4_flex::frame::FrameDecoder;
 use std::future::Future;
@@ -12,11 +13,19 @@ pub struct ArchiveBuckets {
     pub fills: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ArchiveCredentials {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub session_token: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct S3ArchiveClient {
     cache_dir: Option<PathBuf>,
     buckets: ArchiveBuckets,
     request_payer: String,
+    credentials: Option<ArchiveCredentials>,
     runtime: Arc<ArchiveRuntime>,
     s3: Arc<Mutex<Option<aws_sdk_s3::Client>>>,
 }
@@ -26,11 +35,13 @@ impl S3ArchiveClient {
         cache_dir: Option<PathBuf>,
         buckets: ArchiveBuckets,
         request_payer: impl Into<String>,
+        credentials: Option<ArchiveCredentials>,
     ) -> Self {
         Self {
             cache_dir,
             buckets,
             request_payer: request_payer.into(),
+            credentials,
             runtime: Arc::new(ArchiveRuntime::new()),
             s3: Arc::new(Mutex::new(None)),
         }
@@ -99,7 +110,8 @@ impl S3ArchiveClient {
                         return Ok(None);
                     }
                     return Err(anyhow::anyhow!(
-                        "failed to download s3://{bucket_name}/{key_name}: {error}"
+                        "{}",
+                        hyperliquid_s3_error_message(&bucket_name, &key_name, &text)
                     ));
                 }
             };
@@ -124,10 +136,21 @@ impl S3ArchiveClient {
             return Ok(client.clone());
         }
 
+        let credentials = self.credentials.clone();
         let config = self
             .runtime
-            .block_on(async {
-                aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await
+            .block_on(async move {
+                let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+                if let Some(credentials) = credentials {
+                    loader = loader.credentials_provider(Credentials::new(
+                        credentials.access_key_id,
+                        credentials.secret_access_key,
+                        credentials.session_token,
+                        None,
+                        "rlean-hyperliquid-plugin-config",
+                    ));
+                }
+                loader.load().await
             })
             .context("failed to load AWS SDK config for Hyperliquid archive")?;
         let client = aws_sdk_s3::Client::new(&config);
@@ -181,6 +204,25 @@ impl Drop for ArchiveRuntime {
     }
 }
 
+fn hyperliquid_s3_error_message(bucket: &str, key: &str, error: &str) -> String {
+    let credential_hint = "Hyperliquid archive S3 access uses requester-pays buckets and needs valid AWS credentials. Set them with `rlean config set hyperliquid.aws_access_key_id <access-key-id>` and `rlean config set hyperliquid.aws_secret_access_key <secret-access-key>`, or export AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY before running rlean.";
+    let lowered = error.to_ascii_lowercase();
+
+    if lowered.contains("dispatch failure")
+        || lowered.contains("credentials")
+        || lowered.contains("forbidden")
+        || lowered.contains("accessdenied")
+        || lowered.contains("access denied")
+        || lowered.contains("signature")
+    {
+        return format!(
+            "failed to download Hyperliquid archive s3://{bucket}/{key}. {credential_hint} Underlying AWS SDK error: {error}"
+        );
+    }
+
+    format!("failed to download Hyperliquid archive s3://{bucket}/{key}: {error}")
+}
+
 fn decode_lz4_text(bytes: &[u8]) -> Result<String> {
     let mut decoder = FrameDecoder::new(bytes);
     let mut text = String::new();
@@ -198,12 +240,26 @@ pub(crate) fn encode_lz4_text(text: &str) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::ArchiveRuntime;
+    use super::{hyperliquid_s3_error_message, ArchiveRuntime};
 
     #[tokio::test]
     async fn archive_runtime_runs_inside_existing_tokio_runtime() {
         let runtime = ArchiveRuntime::new();
         let value = runtime.block_on(async { 42 }).unwrap();
         assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn s3_dispatch_failure_mentions_rlean_credential_config() {
+        let message = hyperliquid_s3_error_message(
+            "hl-mainnet-node-data",
+            "node_fills_by_block/hourly/20250101/0.lz4",
+            "dispatch failure",
+        );
+        assert!(message.contains("rlean config set hyperliquid.aws_access_key_id"));
+        assert!(message.contains("AWS_ACCESS_KEY_ID"));
+        assert!(
+            message.contains("s3://hl-mainnet-node-data/node_fills_by_block/hourly/20250101/0.lz4")
+        );
     }
 }

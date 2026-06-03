@@ -8,7 +8,7 @@
 pub mod archive;
 pub mod history_provider;
 
-pub use archive::{ArchiveBuckets, S3ArchiveClient};
+pub use archive::{ArchiveBuckets, ArchiveCredentials, S3ArchiveClient};
 pub use history_provider::{HyperliquidArchiveConfig, HyperliquidHistoryProvider};
 
 use lean_data_providers::IHistoryProvider;
@@ -70,6 +70,7 @@ pub unsafe extern "C" fn rlean_create_history_provider(
         .map(str::to_string)
         .or_else(|| std::env::var("HYPERLIQUID_REQUEST_PAYER").ok())
         .unwrap_or_else(|| "requester".to_string());
+    let credentials = parse_archive_credentials(&config);
 
     let coin_map = parse_coin_map(&config["coin_map"]);
 
@@ -80,6 +81,7 @@ pub unsafe extern "C" fn rlean_create_history_provider(
             fills: fills_bucket,
         },
         request_payer,
+        credentials,
     );
     let provider = Arc::new(HyperliquidHistoryProvider::new(
         &data_root,
@@ -88,6 +90,32 @@ pub unsafe extern "C" fn rlean_create_history_provider(
     ));
     let boxed: Box<Arc<dyn IHistoryProvider>> = Box::new(provider);
     Box::into_raw(boxed) as *mut ()
+}
+
+fn parse_archive_credentials(config: &serde_json::Value) -> Option<ArchiveCredentials> {
+    let access_key_id = config_string(config, "aws_access_key_id")
+        .or_else(|| config_string(config, "AWS_ACCESS_KEY_ID"))
+        .or_else(|| std::env::var("AWS_ACCESS_KEY_ID").ok())?;
+    let secret_access_key = config_string(config, "aws_secret_access_key")
+        .or_else(|| config_string(config, "AWS_SECRET_ACCESS_KEY"))
+        .or_else(|| std::env::var("AWS_SECRET_ACCESS_KEY").ok())?;
+    let session_token = config_string(config, "aws_session_token")
+        .or_else(|| config_string(config, "AWS_SESSION_TOKEN"))
+        .or_else(|| std::env::var("AWS_SESSION_TOKEN").ok());
+
+    Some(ArchiveCredentials {
+        access_key_id,
+        secret_access_key,
+        session_token,
+    })
+}
+
+fn config_string(config: &serde_json::Value, key: &str) -> Option<String> {
+    config[key]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn parse_coin_map(value: &serde_json::Value) -> HashMap<String, String> {
