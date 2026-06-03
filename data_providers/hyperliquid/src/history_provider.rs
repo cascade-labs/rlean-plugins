@@ -93,6 +93,9 @@ impl HyperliquidHistoryProvider {
         if key.starts_with('@') {
             return Ok(key);
         }
+        if let Some(mapped) = default_archive_coin_alias(&key) {
+            return Ok(mapped.to_string());
+        }
         Ok(strip_quote_suffix(&key))
     }
 
@@ -341,6 +344,14 @@ fn strip_quote_suffix(symbol: &str) -> String {
         }
     }
     symbol.to_string()
+}
+
+fn default_archive_coin_alias(symbol: &str) -> Option<&'static str> {
+    match symbol {
+        // Hyperliquid HIP-3 USA500USD is archived under the SPX coin name.
+        "USA500" | "USA500USD" | "USA500USDC" | "USA500USDT" => Some("SPX"),
+        _ => None,
+    }
 }
 
 fn hours_in_range(start: DateTime, end: DateTime) -> Vec<chrono::DateTime<Utc>> {
@@ -829,5 +840,14 @@ mod tests {
             .unwrap();
         assert_eq!(ticks.iter().filter(|tick| tick.is_trade()).count(), 1);
         assert_eq!(ticks.iter().filter(|tick| tick.is_quote()).count(), 1);
+    }
+
+    #[test]
+    fn resolves_usa500usd_to_spx_archive_coin_alias() {
+        let temp = TempDir::new().unwrap();
+        let provider = provider(&temp, HashMap::new());
+        let symbol = Symbol::create_crypto_future("USA500USD", &Market::hyperliquid());
+
+        assert_eq!(provider.archive_coin(&symbol).unwrap(), "SPX");
     }
 }
