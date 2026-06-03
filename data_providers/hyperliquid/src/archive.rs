@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::types::RequestPayer;
 use lz4_flex::frame::FrameDecoder;
+use std::collections::HashMap;
 use std::future::Future;
 use std::io::Read;
 use std::path::PathBuf;
@@ -9,6 +10,12 @@ use std::sync::{mpsc, Arc, Mutex};
 
 #[derive(Debug, Clone)]
 pub struct ArchiveBuckets {
+    pub market: String,
+    pub fills: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArchiveRegions {
     pub market: String,
     pub fills: String,
 }
@@ -25,10 +32,10 @@ pub struct S3ArchiveClient {
     cache_dir: Option<PathBuf>,
     buckets: ArchiveBuckets,
     request_payer: String,
-    region: String,
+    regions: ArchiveRegions,
     credentials: Option<ArchiveCredentials>,
     runtime: Arc<ArchiveRuntime>,
-    s3: Arc<Mutex<Option<aws_sdk_s3::Client>>>,
+    s3: Arc<Mutex<HashMap<String, aws_sdk_s3::Client>>>,
 }
 
 impl S3ArchiveClient {
@@ -36,17 +43,17 @@ impl S3ArchiveClient {
         cache_dir: Option<PathBuf>,
         buckets: ArchiveBuckets,
         request_payer: impl Into<String>,
-        region: impl Into<String>,
+        regions: ArchiveRegions,
         credentials: Option<ArchiveCredentials>,
     ) -> Self {
         Self {
             cache_dir,
             buckets,
             request_payer: request_payer.into(),
-            region: region.into(),
+            regions,
             credentials,
             runtime: Arc::new(ArchiveRuntime::new()),
-            s3: Arc::new(Mutex::new(None)),
+            s3: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -55,14 +62,16 @@ impl S3ArchiveClient {
     }
 
     pub async fn market_text(&self, key: &str) -> Result<Option<String>> {
-        self.object_text(&self.buckets.market, key).await
+        self.object_text(&self.buckets.market, &self.regions.market, key)
+            .await
     }
 
     pub async fn fills_text(&self, key: &str) -> Result<Option<String>> {
-        self.object_text(&self.buckets.fills, key).await
+        self.object_text(&self.buckets.fills, &self.regions.fills, key)
+            .await
     }
 
-    async fn object_text(&self, bucket: &str, key: &str) -> Result<Option<String>> {
+    async fn object_text(&self, bucket: &str, region: &str, key: &str) -> Result<Option<String>> {
         let bytes = if let Some(path) = self.cache_path(bucket, key).filter(|path| path.exists()) {
             std::fs::read(&path).with_context(|| {
                 format!(
@@ -71,7 +80,7 @@ impl S3ArchiveClient {
                 )
             })?
         } else {
-            let Some(bytes) = self.download_object(bucket, key).await? else {
+            let Some(bytes) = self.download_object(bucket, region, key).await? else {
                 return Ok(None);
             };
             bytes
@@ -88,8 +97,13 @@ impl S3ArchiveClient {
             .map(|cache_dir| cache_dir.join(bucket).join(key))
     }
 
-    async fn download_object(&self, bucket: &str, key: &str) -> Result<Option<Vec<u8>>> {
-        let client = self.s3_client()?;
+    async fn download_object(
+        &self,
+        bucket: &str,
+        region: &str,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let client = self.s3_client(region)?;
         let bucket_name = bucket.to_string();
         let key_name = key.to_string();
 
@@ -130,22 +144,22 @@ impl S3ArchiveClient {
         })?
     }
 
-    fn s3_client(&self) -> Result<aws_sdk_s3::Client> {
+    fn s3_client(&self, region: &str) -> Result<aws_sdk_s3::Client> {
         let mut guard = self
             .s3
             .lock()
             .map_err(|_| anyhow::anyhow!("Hyperliquid S3 client lock poisoned"))?;
-        if let Some(client) = guard.as_ref() {
+        if let Some(client) = guard.get(region) {
             return Ok(client.clone());
         }
 
         let credentials = self.credentials.clone();
-        let region = self.region.clone();
+        let region_name = region.to_string();
         let config = self
             .runtime
             .block_on(async move {
                 let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
-                    .region(Region::new(region));
+                    .region(Region::new(region_name.clone()));
                 if let Some(credentials) = credentials {
                     loader = loader.credentials_provider(Credentials::new(
                         credentials.access_key_id,
@@ -159,7 +173,7 @@ impl S3ArchiveClient {
             })
             .context("failed to load AWS SDK config for Hyperliquid archive")?;
         let client = aws_sdk_s3::Client::new(&config);
-        *guard = Some(client.clone());
+        guard.insert(region.to_string(), client.clone());
         Ok(client)
     }
 }
@@ -215,8 +229,9 @@ fn hyperliquid_s3_error_message(bucket: &str, key: &str, error: &str) -> String 
 
     if lowered.contains("permanentredirect") || lowered.contains("x-amz-bucket-region") {
         let region = s3_bucket_region_from_error(error).unwrap_or("ap-northeast-1");
+        let config_key = s3_region_config_key(bucket);
         return format!(
-            "failed to download Hyperliquid archive s3://{bucket}/{key}. S3 reported a bucket-region mismatch. Set `rlean config set hyperliquid.aws_region {region}`. Underlying AWS SDK error: {error}"
+            "failed to download Hyperliquid archive s3://{bucket}/{key}. S3 reported a bucket-region mismatch. Set `rlean config set hyperliquid.{config_key} {region}`. Underlying AWS SDK error: {error}"
         );
     }
 
@@ -238,6 +253,14 @@ fn hyperliquid_s3_error_message(bucket: &str, key: &str, error: &str) -> String 
     }
 
     format!("failed to download Hyperliquid archive s3://{bucket}/{key}: {error}")
+}
+
+fn s3_region_config_key(bucket: &str) -> &'static str {
+    if bucket == "hl-mainnet-node-data" {
+        "fills_region"
+    } else {
+        "market_region"
+    }
 }
 
 fn s3_bucket_region_from_error(error: &str) -> Option<&str> {
@@ -265,7 +288,10 @@ pub(crate) fn encode_lz4_text(text: &str) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{hyperliquid_s3_error_message, s3_bucket_region_from_error, ArchiveRuntime};
+    use super::{
+        hyperliquid_s3_error_message, s3_bucket_region_from_error, s3_region_config_key,
+        ArchiveRuntime,
+    };
 
     #[tokio::test]
     async fn archive_runtime_runs_inside_existing_tokio_runtime() {
@@ -296,7 +322,9 @@ mod tests {
             "node_fills_by_block/hourly/20250101/0.lz4",
             error,
         );
-        assert!(message.contains("rlean config set hyperliquid.aws_region ap-northeast-1"));
+        assert!(message.contains("rlean config set hyperliquid.fills_region ap-northeast-1"));
         assert_eq!(s3_bucket_region_from_error(error), Some("ap-northeast-1"));
+        assert_eq!(s3_region_config_key("hyperliquid-archive"), "market_region");
+        assert_eq!(s3_region_config_key("hl-mainnet-node-data"), "fills_region");
     }
 }

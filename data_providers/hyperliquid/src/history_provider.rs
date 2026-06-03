@@ -709,7 +709,7 @@ fn sort_and_dedupe_quote_bars(bars: &mut Vec<QuoteBar>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive::{encode_lz4_text, ArchiveBuckets};
+    use crate::archive::{encode_lz4_text, ArchiveBuckets, ArchiveRegions};
     use tempfile::TempDir;
 
     fn provider(temp: &TempDir, coin_map: HashMap<String, String>) -> HyperliquidHistoryProvider {
@@ -721,7 +721,10 @@ mod tests {
                 fills: "hl-mainnet-node-data".to_string(),
             },
             "requester",
-            "ap-northeast-1",
+            ArchiveRegions {
+                market: "us-east-1".to_string(),
+                fills: "ap-northeast-1".to_string(),
+            },
             None,
         );
         HyperliquidHistoryProvider::new(&data_root, archive, HyperliquidArchiveConfig { coin_map })
