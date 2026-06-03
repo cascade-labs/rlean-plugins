@@ -7,11 +7,13 @@
 
 pub mod archive;
 pub mod history_provider;
+pub mod universe_source;
 
 pub use archive::{ArchiveBuckets, ArchiveCredentials, ArchiveRegions, S3ArchiveClient};
 pub use history_provider::{HyperliquidArchiveConfig, HyperliquidHistoryProvider};
+pub use universe_source::HyperliquidUniverseDataSource;
 
-use lean_data_providers::IHistoryProvider;
+use lean_data_providers::{ICustomDataSource, IHistoryProvider};
 use lean_plugin::{rlean_plugin, PluginKind};
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -167,5 +169,24 @@ fn normalise_symbol_key(value: &str) -> String {
 pub unsafe extern "C" fn rlean_destroy_history_provider(ptr: *mut ()) {
     if !ptr.is_null() {
         drop(unsafe { Box::from_raw(ptr as *mut Arc<dyn IHistoryProvider>) });
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rlean_custom_data_factory() -> *mut () {
+    let source: Box<dyn ICustomDataSource> = Box::new(HyperliquidUniverseDataSource::new());
+    Box::into_raw(Box::new(source)) as *mut ()
+}
+
+/// Free a custom data source returned by `rlean_custom_data_factory`.
+///
+/// # Safety
+///
+/// `ptr` must have been returned by `rlean_custom_data_factory` and must not
+/// have been freed already.
+#[no_mangle]
+pub unsafe extern "C" fn rlean_destroy_custom_data_source(ptr: *mut ()) {
+    if !ptr.is_null() {
+        drop(unsafe { Box::from_raw(ptr as *mut Box<dyn ICustomDataSource>) });
     }
 }

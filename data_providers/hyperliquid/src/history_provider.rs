@@ -39,14 +39,14 @@ pub struct HyperliquidArchiveConfig {
 }
 
 #[derive(Clone)]
-struct HyperliquidInfoClient {
+pub(crate) struct HyperliquidInfoClient {
     endpoint: String,
     runtime: Arc<ArchiveRuntime>,
     next_request_at: Arc<Mutex<Instant>>,
 }
 
 impl HyperliquidInfoClient {
-    fn new(endpoint: impl Into<String>) -> Self {
+    pub(crate) fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
             runtime: Arc::new(ArchiveRuntime::new()),
@@ -138,6 +138,18 @@ impl HyperliquidInfoClient {
             "startTime": start_ms,
             "endTime": end_ms,
         }))
+    }
+
+    pub(crate) fn meta_and_asset_ctxs(&self, dex: Option<&str>) -> Result<Value> {
+        let mut payload = json!({ "type": "metaAndAssetCtxs" });
+        if let Some(dex) = dex.map(str::trim).filter(|dex| !dex.is_empty()) {
+            payload["dex"] = json!(dex);
+        }
+        self.post(payload)
+    }
+
+    pub(crate) fn spot_meta_and_asset_ctxs(&self) -> Result<Value> {
+        self.post(json!({ "type": "spotMetaAndAssetCtxs" }))
     }
 }
 
@@ -315,6 +327,13 @@ impl HyperliquidHistoryProvider {
         let key = symbol.value.trim().to_ascii_uppercase();
         if let Some(mapped) = self.config.coin_map.get(&key) {
             return Ok(mapped.clone());
+        }
+        if let Some((dex, coin)) = key.split_once(':') {
+            let coin = strip_quote_suffix(coin);
+            let coin = default_archive_coin_alias(&coin)
+                .map(str::to_string)
+                .unwrap_or(coin);
+            return Ok(format!("{}:{coin}", dex.to_ascii_lowercase()));
         }
         if key.starts_with('@') {
             return Ok(key);
@@ -855,6 +874,14 @@ fn default_archive_coin_alias(symbol: &str) -> Option<&'static str> {
     match symbol {
         // Hyperliquid HIP-3 USA500USD is archived under the SPX coin name.
         "USA500" | "USA500USD" | "USA500USDC" | "USA500USDT" => Some("SPX"),
+        // Hyperliquid coin names are case-sensitive for kilo-denominated listings.
+        "KPEPE" => Some("kPEPE"),
+        "KSHIB" => Some("kSHIB"),
+        "KBONK" => Some("kBONK"),
+        "KLUNC" => Some("kLUNC"),
+        "KFLOKI" => Some("kFLOKI"),
+        "KDOGS" => Some("kDOGS"),
+        "KNEIRO" => Some("kNEIRO"),
         _ => None,
     }
 }
@@ -910,7 +937,7 @@ fn fills_key(hour: chrono::DateTime<Utc>) -> String {
     )
 }
 
-fn asset_contexts_key(date: NaiveDate) -> String {
+pub(crate) fn asset_contexts_key(date: NaiveDate) -> String {
     format!("asset_ctxs/{}.csv.lz4", date.format("%Y%m%d"))
 }
 
@@ -1670,5 +1697,14 @@ mod tests {
         let symbol = Symbol::create_crypto_future("USA500USD", &Market::hyperliquid());
 
         assert_eq!(provider.archive_coin(&symbol).unwrap(), "SPX");
+    }
+
+    #[test]
+    fn resolves_hip3_archive_coin_with_lowercase_dex_prefix() {
+        let temp = TempDir::new().unwrap();
+        let provider = provider(&temp, HashMap::new());
+        let symbol = Symbol::create_crypto_future("XYZ:KPEPE", &Market::hyperliquid());
+
+        assert_eq!(provider.archive_coin(&symbol).unwrap(), "xyz:kPEPE");
     }
 }
