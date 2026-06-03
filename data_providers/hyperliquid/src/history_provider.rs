@@ -7,12 +7,17 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc};
 use lean_core::{
-    DateTime, Market, NanosecondTimestamp, Resolution, SecurityType, Symbol, TickType,
+    DateTime, Market, NanosecondTimestamp, Resolution, SecurityType, Symbol, TickType, TimeSpan,
 };
-use lean_data::{MarginInterestRate, QuoteBar, Tick, TradeBar, TradeBarData};
-use lean_data_providers::{DataType, HistoryRequest, IHistoryProvider};
+use lean_data::{
+    Bar, MarginInterestRate, PerpetualContext, QuoteBar, Tick, TradeBar, TradeBarData,
+};
+use lean_data_providers::{
+    DataType, HistoryBatchRequest, HistoryRequest, IHistoryProvider, MarketDataBatch,
+};
 use lean_storage::{ParquetReader, ParquetWriter, PathResolver, QueryParams, WriterConfig};
 use rust_decimal::Decimal;
+use serde::Deserialize;
 use serde_json::json;
 use serde_json::Value;
 use tracing::info;
@@ -256,6 +261,55 @@ impl HyperliquidHistoryProvider {
         Ok(())
     }
 
+    async fn ensure_perpetual_contexts(
+        &self,
+        symbols: &[Symbol],
+        start: DateTime,
+        end: DateTime,
+        quote_resolution: Resolution,
+    ) -> Result<()> {
+        if quote_resolution == Resolution::Tick || quote_resolution == Resolution::Second {
+            return Err(anyhow::anyhow!(
+                "NotImplemented: Hyperliquid asset_ctxs supports minute, hour, and daily quote bars"
+            ));
+        }
+
+        let mut symbols_by_coin: HashMap<String, Vec<Symbol>> = HashMap::new();
+        for symbol in symbols {
+            validate_hyperliquid_symbol(symbol)?;
+            if symbol.security_type() != SecurityType::CryptoFuture {
+                continue;
+            }
+            let coin = self.archive_coin(symbol)?;
+            symbols_by_coin
+                .entry(archive_coin_key(&coin))
+                .or_default()
+                .push(symbol.clone());
+        }
+        if symbols_by_coin.is_empty() {
+            return Ok(());
+        }
+
+        for date in dates_in_range(start, end) {
+            let key = asset_contexts_key(date);
+            let Some(text) = self.archive.market_text(&key).await? else {
+                continue;
+            };
+            let parsed = parse_asset_context_archive(&text, &symbols_by_coin, start, end)
+                .with_context(|| format!("failed to parse Hyperliquid asset contexts {key}"))?;
+            self.write_perpetual_contexts_by_day(&parsed.contexts)?;
+            self.write_quote_bars_by_day(Resolution::Minute, &parsed.quote_bars)?;
+            self.write_open_interest_ticks_by_day(&parsed.open_interest_ticks)?;
+
+            if quote_resolution != Resolution::Minute {
+                let aggregated = aggregate_quote_bars(&parsed.quote_bars, quote_resolution)?;
+                self.write_quote_bars_by_day(quote_resolution, &aggregated)?;
+            }
+        }
+
+        Ok(())
+    }
+
     fn archive_coin(&self, symbol: &Symbol) -> Result<String> {
         validate_hyperliquid_symbol(symbol)?;
         let key = symbol.value.trim().to_ascii_uppercase();
@@ -311,6 +365,51 @@ impl HyperliquidHistoryProvider {
         }
         rates.sort_by_key(|rate| rate.time.0);
         Ok(rates)
+    }
+
+    fn read_quote_bars(
+        &self,
+        symbol: &Symbol,
+        resolution: Resolution,
+        start: DateTime,
+        end: DateTime,
+    ) -> Result<Vec<QuoteBar>> {
+        let mut bars = Vec::new();
+        let params = QueryParams::new()
+            .with_time_range(start, end)
+            .with_symbols(vec![symbol.id.sid]);
+        for date in dates_in_range(start, end) {
+            let path =
+                self.resolver
+                    .market_data_partition(symbol, resolution, TickType::Quote, date);
+            bars.extend(
+                self.reader
+                    .read_quote_bar_partition(&path, symbol, &params)?,
+            );
+        }
+        bars.sort_by_key(|bar| bar.time.0);
+        Ok(bars)
+    }
+
+    fn read_perpetual_contexts(
+        &self,
+        symbol: &Symbol,
+        start: DateTime,
+        end: DateTime,
+    ) -> Result<Vec<PerpetualContext>> {
+        let mut contexts = Vec::new();
+        let params = QueryParams::new()
+            .with_time_range(start, end)
+            .with_symbols(vec![symbol.id.sid]);
+        for date in dates_in_range(start, end) {
+            let path = self.resolver.perpetual_context_partition(symbol, date);
+            contexts.extend(
+                self.reader
+                    .read_perpetual_context_partition(&path, symbol, &params)?,
+            );
+        }
+        contexts.sort_by_key(|context| context.time.0);
+        Ok(contexts)
     }
 
     fn read_existing_ticks_for_day(
@@ -397,6 +496,79 @@ impl HyperliquidHistoryProvider {
         Ok(())
     }
 
+    fn write_quote_bars_by_day(&self, resolution: Resolution, bars: &[QuoteBar]) -> Result<()> {
+        if bars.is_empty() {
+            return Ok(());
+        }
+        let mut by_date: BTreeMap<NaiveDate, Vec<QuoteBar>> = BTreeMap::new();
+        for bar in bars {
+            by_date
+                .entry(bar.time.date_utc())
+                .or_default()
+                .push(bar.clone());
+        }
+        for (date, mut bars) in by_date {
+            sort_and_dedupe_quote_bars(&mut bars);
+            let path = self.resolver.market_data_partition(
+                &bars[0].symbol,
+                resolution,
+                TickType::Quote,
+                date,
+            );
+            self.writer.merge_quote_bar_partition(&bars, &path)?;
+            info!(
+                "Hyperliquid: cached {} quote bars to {}",
+                bars.len(),
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
+    fn write_open_interest_ticks_by_day(&self, ticks: &[Tick]) -> Result<()> {
+        if ticks.is_empty() {
+            return Ok(());
+        }
+        let mut by_symbol: HashMap<u64, Vec<Tick>> = HashMap::new();
+        for tick in ticks {
+            by_symbol
+                .entry(tick.symbol.id.sid)
+                .or_default()
+                .push(tick.clone());
+        }
+        for ticks in by_symbol.values() {
+            self.write_ticks_by_day(&ticks[0].symbol, TickType::OpenInterest, ticks)?;
+        }
+        Ok(())
+    }
+
+    fn write_perpetual_contexts_by_day(&self, contexts: &[PerpetualContext]) -> Result<()> {
+        if contexts.is_empty() {
+            return Ok(());
+        }
+        let mut by_date: BTreeMap<NaiveDate, Vec<PerpetualContext>> = BTreeMap::new();
+        for context in contexts {
+            by_date
+                .entry(context.time.date_utc())
+                .or_default()
+                .push(context.clone());
+        }
+        for (date, mut contexts) in by_date {
+            sort_and_dedupe_perpetual_contexts(&mut contexts);
+            let path = self
+                .resolver
+                .perpetual_context_partition(&contexts[0].symbol, date);
+            self.writer
+                .merge_perpetual_context_partition(&contexts, &path)?;
+            info!(
+                "Hyperliquid: cached {} perpetual context rows to {}",
+                contexts.len(),
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
     fn write_margin_interest_rates_by_day(&self, rates: &[MarginInterestRate]) -> Result<()> {
         if rates.is_empty() {
             return Ok(());
@@ -471,10 +643,25 @@ impl IHistoryProvider for HyperliquidHistoryProvider {
                 "NotImplemented: Hyperliquid quote bars require a bar resolution"
             ));
         }
+        if request.resolution == Resolution::Second {
+            return Err(anyhow::anyhow!(
+                "NotImplemented: Hyperliquid asset_ctxs does not provide second quote bars"
+            ));
+        }
 
-        Err(anyhow::anyhow!(
-            "NotImplemented: Hyperliquid Info API does not provide historical quote bars. Use trade bars for candleSnapshot history or tick resolution for S3 l2Book quote data."
-        ))
+        self.ensure_perpetual_contexts(
+            std::slice::from_ref(&request.symbol),
+            request.start,
+            request.end,
+            request.resolution,
+        )
+        .await?;
+        self.read_quote_bars(
+            &request.symbol,
+            request.resolution,
+            request.start,
+            request.end,
+        )
     }
 
     async fn get_ticks(&self, request: &HistoryRequest) -> Result<Vec<Tick>> {
@@ -523,6 +710,114 @@ impl IHistoryProvider for HyperliquidHistoryProvider {
         self.ensure_margin_interest_rates(&request.symbol, request.start, request.end)
             .await?;
         self.read_margin_interest_rates(&request.symbol, request.start, request.end)
+    }
+
+    async fn get_perpetual_contexts(
+        &self,
+        request: &HistoryRequest,
+    ) -> Result<Vec<PerpetualContext>> {
+        if request.data_type != DataType::PerpetualContext {
+            return Err(anyhow::anyhow!(
+                "NotImplemented: Hyperliquid expected PerpetualContext request, got {:?}",
+                request.data_type
+            ));
+        }
+        validate_hyperliquid_symbol(&request.symbol)?;
+        if request.symbol.security_type() != SecurityType::CryptoFuture {
+            return Err(anyhow::anyhow!(
+                "NotImplemented: Hyperliquid perpetual contexts require CryptoFuture symbols"
+            ));
+        }
+        if request.resolution != Resolution::Minute {
+            return Err(anyhow::anyhow!(
+                "NotImplemented: Hyperliquid asset_ctxs is minute-resolution context data"
+            ));
+        }
+
+        self.ensure_perpetual_contexts(
+            std::slice::from_ref(&request.symbol),
+            request.start,
+            request.end,
+            Resolution::Minute,
+        )
+        .await?;
+        self.read_perpetual_contexts(&request.symbol, request.start, request.end)
+    }
+
+    async fn get_history_batch(&self, request: &HistoryBatchRequest) -> Result<MarketDataBatch> {
+        match request.data_type {
+            DataType::PerpetualContext => {
+                if request.resolution != Resolution::Minute {
+                    return Err(anyhow::anyhow!(
+                        "NotImplemented: Hyperliquid asset_ctxs is minute-resolution context data"
+                    ));
+                }
+                self.ensure_perpetual_contexts(
+                    &request.symbols,
+                    request.start,
+                    request.end,
+                    Resolution::Minute,
+                )
+                .await?;
+                let mut batch = MarketDataBatch::default();
+                for symbol in &request.symbols {
+                    batch
+                        .perpetual_contexts
+                        .extend(self.read_perpetual_contexts(
+                            symbol,
+                            request.start,
+                            request.end,
+                        )?);
+                }
+                Ok(batch)
+            }
+            DataType::QuoteBar => {
+                self.ensure_perpetual_contexts(
+                    &request.symbols,
+                    request.start,
+                    request.end,
+                    request.resolution,
+                )
+                .await?;
+                let mut batch = MarketDataBatch::default();
+                for symbol in &request.symbols {
+                    batch.quote_bars.extend(self.read_quote_bars(
+                        symbol,
+                        request.resolution,
+                        request.start,
+                        request.end,
+                    )?);
+                }
+                Ok(batch)
+            }
+            _ => {
+                let mut batch = MarketDataBatch::default();
+                for symbol in &request.symbols {
+                    let single = HistoryRequest {
+                        symbol: symbol.clone(),
+                        resolution: request.resolution,
+                        start: request.start,
+                        end: request.end,
+                        data_type: request.data_type,
+                    };
+                    match request.data_type {
+                        DataType::TradeBar | DataType::FactorFile | DataType::MapFile => {
+                            batch.trade_bars.extend(self.get_history(&single).await?);
+                        }
+                        DataType::Tick | DataType::OpenInterest => {
+                            batch.ticks.extend(self.get_ticks(&single).await?);
+                        }
+                        DataType::MarginInterestRate => {
+                            batch
+                                .margin_interest_rates
+                                .extend(self.get_margin_interest_rates(&single).await?);
+                        }
+                        DataType::QuoteBar | DataType::PerpetualContext => unreachable!(),
+                    }
+                }
+                Ok(batch)
+            }
+        }
     }
 
     fn earliest_date(&self) -> Option<NaiveDate> {
@@ -612,6 +907,191 @@ fn fills_key(hour: chrono::DateTime<Utc>) -> String {
         "node_fills_by_block/hourly/{}/{}.lz4",
         hour.format("%Y%m%d"),
         hour.hour()
+    )
+}
+
+fn asset_contexts_key(date: NaiveDate) -> String {
+    format!("asset_ctxs/{}.csv.lz4", date.format("%Y%m%d"))
+}
+
+fn archive_coin_key(coin: &str) -> String {
+    coin.trim().to_ascii_uppercase()
+}
+
+#[derive(Debug, Default)]
+struct AssetContextDownload {
+    contexts: Vec<PerpetualContext>,
+    quote_bars: Vec<QuoteBar>,
+    open_interest_ticks: Vec<Tick>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AssetContextCsvRow {
+    time: String,
+    coin: String,
+    funding: String,
+    open_interest: String,
+    prev_day_px: String,
+    day_ntl_vlm: String,
+    premium: String,
+    oracle_px: String,
+    mark_px: String,
+    mid_px: String,
+    impact_bid_px: String,
+    impact_ask_px: String,
+}
+
+fn parse_asset_context_archive(
+    text: &str,
+    symbols_by_coin: &HashMap<String, Vec<Symbol>>,
+    start: DateTime,
+    end: DateTime,
+) -> Result<AssetContextDownload> {
+    let mut download = AssetContextDownload::default();
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(text.as_bytes());
+
+    for row in reader.deserialize::<AssetContextCsvRow>() {
+        let row = row.context("failed to parse Hyperliquid asset_ctxs CSV row")?;
+        let Some(symbols) = symbols_by_coin.get(&archive_coin_key(&row.coin)) else {
+            continue;
+        };
+        let time = parse_timestamp(&Value::String(row.time.clone())).with_context(|| {
+            format!(
+                "failed to parse Hyperliquid asset_ctxs timestamp {}",
+                row.time
+            )
+        })?;
+        if time < start || time > end {
+            continue;
+        }
+
+        let funding = parse_decimal_str(&row.funding, "funding")?;
+        let open_interest = parse_decimal_str(&row.open_interest, "open_interest")?;
+        let prev_day_px = parse_decimal_str(&row.prev_day_px, "prev_day_px")?;
+        let day_ntl_vlm = parse_decimal_str(&row.day_ntl_vlm, "day_ntl_vlm")?;
+        let premium = parse_decimal_str(&row.premium, "premium")?;
+        let oracle_px = parse_decimal_str(&row.oracle_px, "oracle_px")?;
+        let mark_px = parse_decimal_str(&row.mark_px, "mark_px")?;
+        let mid_px = parse_decimal_str(&row.mid_px, "mid_px")?;
+        let impact_bid_px = parse_decimal_str(&row.impact_bid_px, "impact_bid_px")?;
+        let impact_ask_px = parse_decimal_str(&row.impact_ask_px, "impact_ask_px")?;
+
+        for symbol in symbols {
+            let context = PerpetualContext::new(
+                symbol.clone(),
+                time,
+                TimeSpan::ONE_MINUTE,
+                funding,
+                open_interest,
+                prev_day_px,
+                day_ntl_vlm,
+                premium,
+                oracle_px,
+                mark_px,
+                mid_px,
+                impact_bid_px,
+                impact_ask_px,
+            );
+            if let Some(quote_bar) = quote_bar_from_perpetual_context(&context) {
+                download.quote_bars.push(quote_bar);
+            }
+            download.open_interest_ticks.push(Tick::open_interest(
+                symbol.clone(),
+                time,
+                open_interest,
+            ));
+            download.contexts.push(context);
+        }
+    }
+
+    sort_and_dedupe_perpetual_contexts(&mut download.contexts);
+    sort_and_dedupe_quote_bars(&mut download.quote_bars);
+    sort_and_dedupe_ticks(&mut download.open_interest_ticks);
+    Ok(download)
+}
+
+fn parse_decimal_str(raw: &str, field: &str) -> Result<Decimal> {
+    raw.trim().parse::<Decimal>().with_context(|| {
+        format!("failed to parse Hyperliquid asset_ctxs decimal field {field}={raw:?}")
+    })
+}
+
+fn quote_bar_from_perpetual_context(context: &PerpetualContext) -> Option<QuoteBar> {
+    if context.impact_bid_px <= Decimal::ZERO
+        || context.impact_ask_px <= Decimal::ZERO
+        || context.impact_ask_px < context.impact_bid_px
+    {
+        return None;
+    }
+
+    Some(QuoteBar::new(
+        context.symbol.clone(),
+        context.time,
+        TimeSpan::ONE_MINUTE,
+        Some(Bar::from_price(context.impact_bid_px)),
+        Some(Bar::from_price(context.impact_ask_px)),
+        Decimal::ZERO,
+        Decimal::ZERO,
+    ))
+}
+
+fn aggregate_quote_bars(bars: &[QuoteBar], resolution: Resolution) -> Result<Vec<QuoteBar>> {
+    if resolution == Resolution::Minute {
+        return Ok(bars.to_vec());
+    }
+    let period = resolution
+        .to_time_span()
+        .with_context(|| format!("resolution {resolution:?} cannot produce quote bars"))?;
+    let mut aggregates: BTreeMap<(u64, i64), QuoteBar> = BTreeMap::new();
+
+    let mut sorted = bars.to_vec();
+    sorted.sort_by_key(|bar| (bar.symbol.id.sid, bar.time.0));
+    for bar in sorted {
+        let bucket_time = quote_bar_bucket_time(bar.time, resolution)?;
+        let key = (bar.symbol.id.sid, bucket_time.0);
+        match aggregates.get_mut(&key) {
+            Some(existing) => {
+                existing.merge(&bar);
+                existing.end_time = bucket_time + period;
+                existing.period = period;
+            }
+            None => {
+                let mut aggregate = bar.clone();
+                aggregate.time = bucket_time;
+                aggregate.end_time = bucket_time + period;
+                aggregate.period = period;
+                aggregates.insert(key, aggregate);
+            }
+        }
+    }
+
+    let mut output = aggregates.into_values().collect::<Vec<_>>();
+    sort_and_dedupe_quote_bars(&mut output);
+    Ok(output)
+}
+
+fn quote_bar_bucket_time(time: DateTime, resolution: Resolution) -> Result<DateTime> {
+    match resolution {
+        Resolution::Minute => Ok(NanosecondTimestamp(
+            time.0.div_euclid(TimeSpan::ONE_MINUTE.nanos) * TimeSpan::ONE_MINUTE.nanos,
+        )),
+        Resolution::Hour => Ok(NanosecondTimestamp(
+            time.0.div_euclid(TimeSpan::ONE_HOUR.nanos) * TimeSpan::ONE_HOUR.nanos,
+        )),
+        Resolution::Daily => Ok(date_to_datetime(time.date_utc(), 0, 0, 0)),
+        Resolution::Tick | Resolution::Second => Err(anyhow::anyhow!(
+            "NotImplemented: Hyperliquid asset_ctxs does not support {resolution:?} quote bars"
+        )),
+    }
+}
+
+fn date_to_datetime(date: NaiveDate, hour: u32, minute: u32, second: u32) -> DateTime {
+    DateTime::from(
+        date.and_hms_opt(hour, minute, second)
+            .expect("valid UTC wall-clock time")
+            .and_utc(),
     )
 }
 
@@ -797,6 +1277,9 @@ fn parse_timestamp(value: &Value) -> Option<DateTime> {
     if let Ok(naive) = NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f") {
         return Some(Utc.from_utc_datetime(&naive).into());
     }
+    if let Ok(naive) = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f") {
+        return Some(Utc.from_utc_datetime(&naive).into());
+    }
     None
 }
 
@@ -952,9 +1435,19 @@ fn sort_and_dedupe_trade_bars(bars: &mut Vec<TradeBar>) {
     bars.dedup_by_key(|bar| (bar.symbol.id.sid, bar.time.0));
 }
 
+fn sort_and_dedupe_quote_bars(bars: &mut Vec<QuoteBar>) {
+    bars.sort_by_key(|bar| (bar.symbol.id.sid, bar.time.0));
+    bars.dedup_by_key(|bar| (bar.symbol.id.sid, bar.time.0));
+}
+
 fn sort_and_dedupe_margin_interest_rates(rates: &mut Vec<MarginInterestRate>) {
     rates.sort_by_key(|rate| (rate.symbol.id.sid, rate.time.0));
     rates.dedup_by_key(|rate| (rate.symbol.id.sid, rate.time.0));
+}
+
+fn sort_and_dedupe_perpetual_contexts(contexts: &mut Vec<PerpetualContext>) {
+    contexts.sort_by_key(|context| (context.symbol.id.sid, context.time.0));
+    contexts.dedup_by_key(|context| (context.symbol.id.sid, context.time.0));
 }
 
 #[cfg(test)]
@@ -1024,6 +1517,14 @@ mod tests {
             r#"{"block_time":"2025-10-24T20:00:00.021156698","events":[["0x1",{"coin":"APT","px":"3.277","sz":"7.0","side":"B","time":1761336000021,"tid":42}],["0x2",{"coin":"APT","px":"3.277","sz":"7.0","side":"A","time":1761336000021,"tid":42}]]}
 "#,
         );
+        write_cached_archive(
+            &temp,
+            "hyperliquid-archive",
+            "asset_ctxs/20251024.csv.lz4",
+            "time,coin,funding,open_interest,prev_day_px,day_ntl_vlm,premium,oracle_px,mark_px,mid_px,impact_bid_px,impact_ask_px\n\
+2025-10-24 20:00:00.000,APT,0.0000125,123456.7,3.20,456789.0,0.0002,3.2765,3.2767,3.2768,3.2760,3.2770\n\
+2025-10-24 20:01:00.000,BTC,0.000002,1.0,100.0,1.0,0.0,100.0,100.0,100.0,99.9,100.1\n",
+        );
         let ticks = provider
             .get_ticks(&request(symbol.clone(), DataType::Tick, Resolution::Tick))
             .await
@@ -1038,8 +1539,29 @@ mod tests {
                 Resolution::Minute,
             ))
             .await
-            .unwrap_err();
-        assert!(quote_bars.to_string().contains("NotImplemented"));
+            .unwrap();
+        assert_eq!(quote_bars.len(), 1);
+        assert_eq!(
+            quote_bars[0].bid.as_ref().unwrap().close,
+            Decimal::new(32760, 4)
+        );
+        assert_eq!(
+            quote_bars[0].ask.as_ref().unwrap().close,
+            Decimal::new(32770, 4)
+        );
+
+        let contexts = provider
+            .get_perpetual_contexts(&request(
+                symbol.clone(),
+                DataType::PerpetualContext,
+                Resolution::Minute,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].funding, Decimal::new(125, 7));
+        assert_eq!(contexts[0].open_interest, Decimal::new(1_234_567, 1));
+        assert_eq!(contexts[0].mark_px, Decimal::new(32_767, 4));
     }
 
     #[test]
