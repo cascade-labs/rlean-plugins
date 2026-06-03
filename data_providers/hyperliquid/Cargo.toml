@@ -23,6 +23,7 @@ chrono       = { workspace = true }
 tracing      = { workspace = true }
 async-trait  = { workspace = true }
 rust_decimal = { workspace = true }
+reqwest      = { workspace = true }
 aws-config   = "1"
 aws-sdk-s3   = "1"
 lz4_flex     = { version = "0.11", features = ["frame"] }

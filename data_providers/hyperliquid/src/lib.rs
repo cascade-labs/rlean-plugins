@@ -81,6 +81,8 @@ pub unsafe extern "C" fn rlean_create_history_provider(
     let credentials = parse_archive_credentials(&config);
 
     let coin_map = parse_coin_map(&config["coin_map"]);
+    let info_url =
+        config_string(&config, "info_url").or_else(|| std::env::var("HYPERLIQUID_INFO_URL").ok());
 
     let archive = S3ArchiveClient::new(
         cache_dir,
@@ -95,7 +97,7 @@ pub unsafe extern "C" fn rlean_create_history_provider(
     let provider = Arc::new(HyperliquidHistoryProvider::new(
         &data_root,
         archive,
-        HyperliquidArchiveConfig { coin_map },
+        HyperliquidArchiveConfig { coin_map, info_url },
     ));
     let boxed: Box<Arc<dyn IHistoryProvider>> = Box::new(provider);
     Box::into_raw(boxed) as *mut ()

@@ -178,12 +178,12 @@ impl S3ArchiveClient {
     }
 }
 
-struct ArchiveRuntime {
+pub(crate) struct ArchiveRuntime {
     inner: Option<tokio::runtime::Runtime>,
 }
 
 impl ArchiveRuntime {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: Some(
                 tokio::runtime::Builder::new_multi_thread()
@@ -195,7 +195,7 @@ impl ArchiveRuntime {
         }
     }
 
-    fn block_on<F>(&self, future: F) -> Result<F::Output>
+    pub(crate) fn block_on<F>(&self, future: F) -> Result<F::Output>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,

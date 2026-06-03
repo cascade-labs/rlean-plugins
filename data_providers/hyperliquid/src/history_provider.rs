@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -7,24 +9,136 @@ use chrono::{NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc};
 use lean_core::{
     DateTime, Market, NanosecondTimestamp, Resolution, SecurityType, Symbol, TickType,
 };
-use lean_data::{Bar, QuoteBar, Tick, TradeBar, TradeBarData};
+use lean_data::{MarginInterestRate, QuoteBar, Tick, TradeBar, TradeBarData};
 use lean_data_providers::{DataType, HistoryRequest, IHistoryProvider};
 use lean_storage::{ParquetReader, ParquetWriter, PathResolver, QueryParams, WriterConfig};
 use rust_decimal::Decimal;
+use serde_json::json;
 use serde_json::Value;
 use tracing::info;
 
-use crate::archive::S3ArchiveClient;
+use crate::archive::{ArchiveRuntime, S3ArchiveClient};
 
 const HOUR_NANOS: i64 = 3_600_000_000_000;
+const DEFAULT_INFO_URL: &str = "https://api.hyperliquid.xyz/info";
+const MAX_CANDLES_PER_REQUEST: i64 = 5_000;
+const FUNDING_CHUNK_HOURS: i64 = 500;
+const INFO_API_MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(500);
+const INFO_API_MAX_RETRIES: usize = 6;
+const INFO_API_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Default)]
 pub struct HyperliquidArchiveConfig {
     pub coin_map: HashMap<String, String>,
+    pub info_url: Option<String>,
+}
+
+#[derive(Clone)]
+struct HyperliquidInfoClient {
+    endpoint: String,
+    runtime: Arc<ArchiveRuntime>,
+    next_request_at: Arc<Mutex<Instant>>,
+}
+
+impl HyperliquidInfoClient {
+    fn new(endpoint: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            runtime: Arc::new(ArchiveRuntime::new()),
+            next_request_at: Arc::new(Mutex::new(Instant::now())),
+        }
+    }
+
+    fn post(&self, payload: Value) -> Result<Value> {
+        for attempt in 0..=INFO_API_MAX_RETRIES {
+            self.wait_for_request_slot()?;
+            let endpoint = self.endpoint.clone();
+            let payload = payload.clone();
+            let result = self.runtime.block_on(async move {
+                let response = reqwest::Client::new()
+                    .post(&endpoint)
+                    .json(&payload)
+                    .send()
+                    .await
+                    .with_context(|| format!("failed to call Hyperliquid Info API {endpoint}"))?;
+                let status = response.status();
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    return Err(anyhow::anyhow!(
+                        "Hyperliquid Info API rate limited request with HTTP 429 for {payload}"
+                    ));
+                }
+                let response = response.error_for_status().with_context(|| {
+                    format!("Hyperliquid Info API returned an error for {payload}")
+                })?;
+                response
+                    .json::<Value>()
+                    .await
+                    .with_context(|| "failed to parse Hyperliquid Info API JSON response")
+            })?;
+
+            match result {
+                Ok(value) => return Ok(value),
+                Err(error)
+                    if attempt < INFO_API_MAX_RETRIES && error.to_string().contains("HTTP 429") =>
+                {
+                    let multiplier = 1u32 << attempt.min(5);
+                    std::thread::sleep(INFO_API_RETRY_BASE_DELAY * multiplier);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        unreachable!("bounded retry loop always returns on final attempt")
+    }
+
+    fn wait_for_request_slot(&self) -> Result<()> {
+        let wait = {
+            let mut next = self
+                .next_request_at
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Hyperliquid Info API rate limiter lock poisoned"))?;
+            let now = Instant::now();
+            let scheduled = (*next).max(now);
+            *next = scheduled + INFO_API_MIN_REQUEST_INTERVAL;
+            scheduled.saturating_duration_since(now)
+        };
+        if !wait.is_zero() {
+            std::thread::sleep(wait);
+        }
+        Ok(())
+    }
+
+    fn candle_snapshot(
+        &self,
+        coin: &str,
+        interval: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Value> {
+        self.post(json!({
+            "type": "candleSnapshot",
+            "req": {
+                "coin": coin,
+                "interval": interval,
+                "startTime": start_ms,
+                "endTime": end_ms,
+            }
+        }))
+    }
+
+    fn funding_history(&self, coin: &str, start_ms: i64, end_ms: i64) -> Result<Value> {
+        self.post(json!({
+            "type": "fundingHistory",
+            "coin": coin,
+            "startTime": start_ms,
+            "endTime": end_ms,
+        }))
+    }
 }
 
 pub struct HyperliquidHistoryProvider {
     archive: S3ArchiveClient,
+    info: HyperliquidInfoClient,
     config: HyperliquidArchiveConfig,
     resolver: PathResolver,
     reader: ParquetReader,
@@ -37,13 +151,51 @@ impl HyperliquidHistoryProvider {
         archive: S3ArchiveClient,
         config: HyperliquidArchiveConfig,
     ) -> Self {
+        let info_url = config
+            .info_url
+            .clone()
+            .unwrap_or_else(|| DEFAULT_INFO_URL.to_string());
         Self {
             archive,
+            info: HyperliquidInfoClient::new(info_url),
             config,
             resolver: PathResolver::new(data_root),
             reader: ParquetReader::new(),
             writer: ParquetWriter::new(WriterConfig::default()),
         }
+    }
+
+    async fn fetch_trade_bars_from_info(
+        &self,
+        symbol: &Symbol,
+        resolution: Resolution,
+        start: DateTime,
+        end: DateTime,
+    ) -> Result<Vec<TradeBar>> {
+        let coin = self.archive_coin(symbol)?;
+        let (interval, interval_ms) = info_interval(resolution)?;
+        let mut bars_by_time = BTreeMap::new();
+        let mut current = start.as_millis();
+        let end_ms = end.as_millis();
+
+        while current <= end_ms {
+            let chunk_end = end_ms.min(current + interval_ms * MAX_CANDLES_PER_REQUEST - 1);
+            let response = self
+                .info
+                .candle_snapshot(&coin, interval, current, chunk_end)?;
+            let bars = parse_candle_snapshot(&response, symbol, resolution, start, end)?;
+            let last_bar_ms = bars.iter().map(|bar| bar.time.as_millis()).max();
+            for bar in bars {
+                bars_by_time.insert(bar.time.0, bar);
+            }
+
+            current = match last_bar_ms {
+                Some(last) if last >= current => last + interval_ms,
+                _ => chunk_end + 1,
+            };
+        }
+
+        Ok(bars_by_time.into_values().collect())
     }
 
     async fn ensure_trade_ticks(
@@ -84,6 +236,26 @@ impl HyperliquidHistoryProvider {
         Ok(())
     }
 
+    async fn ensure_margin_interest_rates(
+        &self,
+        symbol: &Symbol,
+        start: DateTime,
+        end: DateTime,
+    ) -> Result<()> {
+        let coin = self.archive_coin(symbol)?;
+        let mut rates = Vec::new();
+        let mut current = start.as_millis();
+        let end_ms = end.as_millis();
+        while current <= end_ms {
+            let chunk_end = end_ms.min(current + FUNDING_CHUNK_HOURS * 3_600_000 - 1);
+            let response = self.info.funding_history(&coin, current, chunk_end)?;
+            rates.extend(parse_funding_history(&response, &coin, symbol, start, end)?);
+            current = chunk_end + 1;
+        }
+        self.write_margin_interest_rates_by_day(&rates)?;
+        Ok(())
+    }
+
     fn archive_coin(&self, symbol: &Symbol) -> Result<String> {
         validate_hyperliquid_symbol(symbol)?;
         let key = symbol.value.trim().to_ascii_uppercase();
@@ -118,6 +290,27 @@ impl HyperliquidHistoryProvider {
         }
         ticks.sort_by_key(|tick| tick.time.0);
         Ok(ticks)
+    }
+
+    fn read_margin_interest_rates(
+        &self,
+        symbol: &Symbol,
+        start: DateTime,
+        end: DateTime,
+    ) -> Result<Vec<MarginInterestRate>> {
+        let mut rates = Vec::new();
+        let params = QueryParams::new()
+            .with_time_range(start, end)
+            .with_symbols(vec![symbol.id.sid]);
+        for date in dates_in_range(start, end) {
+            let path = self.resolver.margin_interest_partition(symbol, date);
+            rates.extend(
+                self.reader
+                    .read_margin_interest_rate_partition(&path, symbol, &params)?,
+            );
+        }
+        rates.sort_by_key(|rate| rate.time.0);
+        Ok(rates)
     }
 
     fn read_existing_ticks_for_day(
@@ -204,36 +397,27 @@ impl HyperliquidHistoryProvider {
         Ok(())
     }
 
-    fn write_quote_bars_by_day(
-        &self,
-        symbol: &Symbol,
-        resolution: Resolution,
-        bars: &[QuoteBar],
-    ) -> Result<()> {
-        if bars.is_empty() {
+    fn write_margin_interest_rates_by_day(&self, rates: &[MarginInterestRate]) -> Result<()> {
+        if rates.is_empty() {
             return Ok(());
         }
-        let mut by_date: BTreeMap<NaiveDate, Vec<QuoteBar>> = BTreeMap::new();
-        for bar in bars {
+        let mut by_date: BTreeMap<NaiveDate, Vec<MarginInterestRate>> = BTreeMap::new();
+        for rate in rates {
             by_date
-                .entry(bar.time.date_utc())
+                .entry(rate.time.date_utc())
                 .or_default()
-                .push(bar.clone());
+                .push(rate.clone());
         }
-        for (date, mut bars) in by_date {
-            let path =
-                self.resolver
-                    .market_data_partition(symbol, resolution, TickType::Quote, date);
-            let params = QueryParams::new().with_symbols(vec![symbol.id.sid]);
-            bars.extend(
-                self.reader
-                    .read_quote_bar_partition(&path, symbol, &params)?,
-            );
-            sort_and_dedupe_quote_bars(&mut bars);
-            self.writer.merge_quote_bar_partition(&bars, &path)?;
+        for (date, mut rates) in by_date {
+            sort_and_dedupe_margin_interest_rates(&mut rates);
+            let path = self
+                .resolver
+                .margin_interest_partition(&rates[0].symbol, date);
+            self.writer
+                .merge_margin_interest_rate_partition(&rates, &path)?;
             info!(
-                "Hyperliquid: cached {} quote bars to {}",
-                bars.len(),
+                "Hyperliquid: cached {} funding rates to {}",
+                rates.len(),
                 path.display()
             );
         }
@@ -256,12 +440,20 @@ impl IHistoryProvider for HyperliquidHistoryProvider {
                 "NotImplemented: Hyperliquid trade bars require a bar resolution"
             ));
         }
+        if request.resolution == Resolution::Second {
+            return Err(anyhow::anyhow!(
+                "NotImplemented: Hyperliquid Info API does not provide second trade bars"
+            ));
+        }
 
-        self.ensure_trade_ticks(&request.symbol, request.start, request.end)
+        let bars = self
+            .fetch_trade_bars_from_info(
+                &request.symbol,
+                request.resolution,
+                request.start,
+                request.end,
+            )
             .await?;
-        let ticks =
-            self.read_ticks(&request.symbol, TickType::Trade, request.start, request.end)?;
-        let bars = aggregate_trade_bars(&request.symbol, request.resolution, &ticks)?;
         self.write_trade_bars_by_day(&request.symbol, request.resolution, &bars)?;
         Ok(bars)
     }
@@ -280,13 +472,9 @@ impl IHistoryProvider for HyperliquidHistoryProvider {
             ));
         }
 
-        self.ensure_quote_ticks(&request.symbol, request.start, request.end)
-            .await?;
-        let ticks =
-            self.read_ticks(&request.symbol, TickType::Quote, request.start, request.end)?;
-        let bars = aggregate_quote_bars(&request.symbol, request.resolution, &ticks)?;
-        self.write_quote_bars_by_day(&request.symbol, request.resolution, &bars)?;
-        Ok(bars)
+        Err(anyhow::anyhow!(
+            "NotImplemented: Hyperliquid Info API does not provide historical quote bars. Use trade bars for candleSnapshot history or tick resolution for S3 l2Book quote data."
+        ))
     }
 
     async fn get_ticks(&self, request: &HistoryRequest) -> Result<Vec<Tick>> {
@@ -313,6 +501,28 @@ impl IHistoryProvider for HyperliquidHistoryProvider {
         )?);
         ticks.sort_by_key(|tick| tick.time.0);
         Ok(ticks)
+    }
+
+    async fn get_margin_interest_rates(
+        &self,
+        request: &HistoryRequest,
+    ) -> Result<Vec<MarginInterestRate>> {
+        if request.data_type != DataType::MarginInterestRate {
+            return Err(anyhow::anyhow!(
+                "NotImplemented: Hyperliquid expected MarginInterestRate request, got {:?}",
+                request.data_type
+            ));
+        }
+        validate_hyperliquid_symbol(&request.symbol)?;
+        if request.symbol.security_type() != SecurityType::CryptoFuture {
+            return Err(anyhow::anyhow!(
+                "NotImplemented: Hyperliquid funding rates require CryptoFuture symbols"
+            ));
+        }
+
+        self.ensure_margin_interest_rates(&request.symbol, request.start, request.end)
+            .await?;
+        self.read_margin_interest_rates(&request.symbol, request.start, request.end)
     }
 
     fn earliest_date(&self) -> Option<NaiveDate> {
@@ -590,83 +800,113 @@ fn parse_timestamp(value: &Value) -> Option<DateTime> {
     None
 }
 
-fn aggregate_trade_bars(
+fn info_interval(resolution: Resolution) -> Result<(&'static str, i64)> {
+    match resolution {
+        Resolution::Minute => Ok(("1m", 60_000)),
+        Resolution::Hour => Ok(("1h", 3_600_000)),
+        Resolution::Daily => Ok(("1d", 86_400_000)),
+        Resolution::Tick | Resolution::Second => Err(anyhow::anyhow!(
+            "NotImplemented: Hyperliquid Info API does not support {resolution:?} trade bars"
+        )),
+    }
+}
+
+fn parse_candle_snapshot(
+    value: &Value,
     symbol: &Symbol,
     resolution: Resolution,
-    ticks: &[Tick],
+    start: DateTime,
+    end: DateTime,
 ) -> Result<Vec<TradeBar>> {
     let period = resolution
         .to_time_span()
         .with_context(|| format!("resolution {resolution:?} cannot produce trade bars"))?;
-    let mut bars: BTreeMap<i64, TradeBar> = BTreeMap::new();
-    let mut sorted = ticks.to_vec();
-    sorted.sort_by_key(|tick| tick.time.0);
+    let Some(rows) = value.as_array() else {
+        return Err(anyhow::anyhow!(
+            "Hyperliquid candleSnapshot response was not an array: {value}"
+        ));
+    };
 
-    for tick in sorted.iter().filter(|tick| tick.is_trade()) {
-        let bucket = bucket_start(tick.time, resolution);
-        bars.entry(bucket.0)
-            .and_modify(|bar| bar.update(tick.value, tick.quantity))
-            .or_insert_with(|| {
-                TradeBar::new(
-                    symbol.clone(),
-                    bucket,
-                    period,
-                    TradeBarData::new(
-                        tick.value,
-                        tick.value,
-                        tick.value,
-                        tick.value,
-                        tick.quantity,
-                    ),
-                )
-            });
+    let mut bars = Vec::new();
+    for row in rows {
+        let Some(time) = row.get("t").and_then(parse_timestamp) else {
+            continue;
+        };
+        if time < start || time > end {
+            continue;
+        }
+        let Some(open) = decimal_field(row, "o") else {
+            continue;
+        };
+        let Some(high) = decimal_field(row, "h") else {
+            continue;
+        };
+        let Some(low) = decimal_field(row, "l") else {
+            continue;
+        };
+        let Some(close) = decimal_field(row, "c") else {
+            continue;
+        };
+        let Some(volume) = decimal_field(row, "v") else {
+            continue;
+        };
+        if open <= Decimal::ZERO
+            || high <= Decimal::ZERO
+            || low <= Decimal::ZERO
+            || close <= Decimal::ZERO
+        {
+            continue;
+        }
+
+        bars.push(TradeBar::new(
+            symbol.clone(),
+            time,
+            period,
+            TradeBarData::new(open, high, low, close, volume),
+        ));
     }
-
-    Ok(bars.into_values().collect())
+    sort_and_dedupe_trade_bars(&mut bars);
+    Ok(bars)
 }
 
-fn aggregate_quote_bars(
+fn parse_funding_history(
+    value: &Value,
+    coin: &str,
     symbol: &Symbol,
-    resolution: Resolution,
-    ticks: &[Tick],
-) -> Result<Vec<QuoteBar>> {
-    let period = resolution
-        .to_time_span()
-        .with_context(|| format!("resolution {resolution:?} cannot produce quote bars"))?;
-    let mut bars: BTreeMap<i64, QuoteBar> = BTreeMap::new();
-    let mut sorted = ticks.to_vec();
-    sorted.sort_by_key(|tick| tick.time.0);
+    start: DateTime,
+    end: DateTime,
+) -> Result<Vec<MarginInterestRate>> {
+    let Some(rows) = value.as_array() else {
+        return Err(anyhow::anyhow!(
+            "Hyperliquid fundingHistory response was not an array: {value}"
+        ));
+    };
 
-    for tick in sorted.iter().filter(|tick| tick.is_quote()) {
-        let bucket = bucket_start(tick.time, resolution);
-        bars.entry(bucket.0)
-            .and_modify(|bar| {
-                bar.update(tick.bid_price, tick.ask_price, tick.bid_size, tick.ask_size)
-            })
-            .or_insert_with(|| {
-                QuoteBar::new(
-                    symbol.clone(),
-                    bucket,
-                    period,
-                    Some(Bar::from_price(tick.bid_price)),
-                    Some(Bar::from_price(tick.ask_price)),
-                    tick.bid_size,
-                    tick.ask_size,
-                )
-            });
+    let mut rates = Vec::new();
+    for row in rows {
+        if let Some(row_coin) = row.get("coin").and_then(Value::as_str) {
+            if !row_coin.eq_ignore_ascii_case(coin) {
+                continue;
+            }
+        }
+        let Some(raw_time) = row.get("time").and_then(parse_timestamp) else {
+            continue;
+        };
+        let time = NanosecondTimestamp(raw_time.0.div_euclid(HOUR_NANOS) * HOUR_NANOS);
+        if time < start || time > end {
+            continue;
+        }
+        let Some(rate) = row
+            .get("fundingRate")
+            .and_then(parse_decimal)
+            .or_else(|| decimal_field(row, "funding_rate"))
+        else {
+            continue;
+        };
+        rates.push(MarginInterestRate::new(symbol.clone(), time, rate));
     }
-
-    Ok(bars.into_values().collect())
-}
-
-fn bucket_start(time: DateTime, resolution: Resolution) -> DateTime {
-    if resolution == Resolution::Daily {
-        return time.date_utc().and_hms_opt(0, 0, 0).unwrap().into();
-    }
-    let nanos = resolution
-        .to_nanos()
-        .expect("non-tick resolution has fixed duration") as i64;
-    NanosecondTimestamp(time.0.div_euclid(nanos) * nanos)
+    sort_and_dedupe_margin_interest_rates(&mut rates);
+    Ok(rates)
 }
 
 fn sort_and_dedupe_ticks(ticks: &mut Vec<Tick>) {
@@ -712,9 +952,9 @@ fn sort_and_dedupe_trade_bars(bars: &mut Vec<TradeBar>) {
     bars.dedup_by_key(|bar| (bar.symbol.id.sid, bar.time.0));
 }
 
-fn sort_and_dedupe_quote_bars(bars: &mut Vec<QuoteBar>) {
-    bars.sort_by_key(|bar| (bar.symbol.id.sid, bar.time.0));
-    bars.dedup_by_key(|bar| (bar.symbol.id.sid, bar.time.0));
+fn sort_and_dedupe_margin_interest_rates(rates: &mut Vec<MarginInterestRate>) {
+    rates.sort_by_key(|rate| (rate.symbol.id.sid, rate.time.0));
+    rates.dedup_by_key(|rate| (rate.symbol.id.sid, rate.time.0));
 }
 
 #[cfg(test)]
@@ -738,7 +978,14 @@ mod tests {
             },
             None,
         );
-        HyperliquidHistoryProvider::new(&data_root, archive, HyperliquidArchiveConfig { coin_map })
+        HyperliquidHistoryProvider::new(
+            &data_root,
+            archive,
+            HyperliquidArchiveConfig {
+                coin_map,
+                info_url: None,
+            },
+        )
     }
 
     fn write_cached_archive(temp: &TempDir, bucket: &str, key: &str, text: &str) {
@@ -758,7 +1005,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generates_ticks_and_bars_from_cached_archives() {
+    async fn generates_ticks_from_cached_archives() {
         let temp = TempDir::new().unwrap();
         let provider = provider(&temp, HashMap::new());
         let symbol = Symbol::create_crypto_future("APT", &Market::hyperliquid());
@@ -777,7 +1024,6 @@ mod tests {
             r#"{"block_time":"2025-10-24T20:00:00.021156698","events":[["0x1",{"coin":"APT","px":"3.277","sz":"7.0","side":"B","time":1761336000021,"tid":42}],["0x2",{"coin":"APT","px":"3.277","sz":"7.0","side":"A","time":1761336000021,"tid":42}]]}
 "#,
         );
-
         let ticks = provider
             .get_ticks(&request(symbol.clone(), DataType::Tick, Resolution::Tick))
             .await
@@ -785,30 +1031,83 @@ mod tests {
         assert_eq!(ticks.iter().filter(|tick| tick.is_trade()).count(), 1);
         assert_eq!(ticks.iter().filter(|tick| tick.is_quote()).count(), 2);
 
-        let trade_bars = provider
-            .get_history(&request(
+        let quote_bars = provider
+            .get_quote_bars(&request(
                 symbol.clone(),
-                DataType::TradeBar,
+                DataType::QuoteBar,
                 Resolution::Minute,
             ))
             .await
-            .unwrap();
-        assert_eq!(trade_bars.len(), 1);
-        assert_eq!(trade_bars[0].volume, Decimal::from(7));
+            .unwrap_err();
+        assert!(quote_bars.to_string().contains("NotImplemented"));
+    }
 
-        let quote_bars = provider
-            .get_quote_bars(&request(symbol, DataType::QuoteBar, Resolution::Minute))
-            .await
-            .unwrap();
-        assert_eq!(quote_bars.len(), 1);
-        assert_eq!(
-            quote_bars[0].bid.as_ref().unwrap().open.to_string(),
-            "3.276"
-        );
-        assert_eq!(
-            quote_bars[0].ask.as_ref().unwrap().close.to_string(),
-            "3.281"
-        );
+    #[test]
+    fn parses_candle_snapshot_trade_bars() {
+        let symbol = Symbol::create_crypto_future("BTC", &Market::hyperliquid());
+        let response = serde_json::json!([
+            {
+                "t": 1777420800000_i64,
+                "T": 1777420859999_i64,
+                "s": "BTC",
+                "i": "1m",
+                "o": "100.0",
+                "h": "101.0",
+                "l": "99.5",
+                "c": "100.5",
+                "v": "42.25",
+                "n": 17
+            }
+        ]);
+
+        let bars = parse_candle_snapshot(
+            &response,
+            &symbol,
+            Resolution::Minute,
+            DateTime::from_millis(1_777_420_800_000),
+            DateTime::from_millis(1_777_420_860_000),
+        )
+        .unwrap();
+
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].open.to_string(), "100.0");
+        assert_eq!(bars[0].high.to_string(), "101.0");
+        assert_eq!(bars[0].low.to_string(), "99.5");
+        assert_eq!(bars[0].close.to_string(), "100.5");
+        assert_eq!(bars[0].volume.to_string(), "42.25");
+    }
+
+    #[test]
+    fn parses_funding_history_and_normalizes_to_hour() {
+        let symbol = Symbol::create_crypto_future("USA500USD", &Market::hyperliquid());
+        let response = serde_json::json!([
+            {
+                "coin": "SPX",
+                "fundingRate": "0.0000125",
+                "premium": "0.0001",
+                "time": 1777420800003_i64
+            },
+            {
+                "coin": "BTC",
+                "fundingRate": "0.000002",
+                "premium": "0.0001",
+                "time": 1777420800003_i64
+            }
+        ]);
+
+        let rates = parse_funding_history(
+            &response,
+            "SPX",
+            &symbol,
+            DateTime::from_millis(1_777_420_800_000),
+            DateTime::from_millis(1_777_424_400_000),
+        )
+        .unwrap();
+
+        assert_eq!(rates.len(), 1);
+        assert_eq!(rates[0].symbol.value, "USA500USD");
+        assert_eq!(rates[0].time, DateTime::from_millis(1_777_420_800_000));
+        assert_eq!(rates[0].interest_rate.to_string(), "0.0000125");
     }
 
     #[tokio::test]
