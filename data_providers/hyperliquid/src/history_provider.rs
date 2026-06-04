@@ -27,7 +27,6 @@ use crate::archive::{ArchiveRuntime, S3ArchiveClient};
 const HOUR_NANOS: i64 = 3_600_000_000_000;
 const DEFAULT_INFO_URL: &str = "https://api.hyperliquid.xyz/info";
 const MAX_CANDLES_PER_REQUEST: i64 = 5_000;
-const FUNDING_CHUNK_HOURS: i64 = 500;
 const INFO_API_MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(500);
 const INFO_API_MAX_RETRIES: usize = 6;
 const INFO_API_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
@@ -128,15 +127,6 @@ impl HyperliquidInfoClient {
                 "startTime": start_ms,
                 "endTime": end_ms,
             }
-        }))
-    }
-
-    fn funding_history(&self, coin: &str, start_ms: i64, end_ms: i64) -> Result<Value> {
-        self.post(json!({
-            "type": "fundingHistory",
-            "coin": coin,
-            "startTime": start_ms,
-            "endTime": end_ms,
         }))
     }
 
@@ -253,26 +243,6 @@ impl HyperliquidHistoryProvider {
         Ok(())
     }
 
-    async fn ensure_margin_interest_rates(
-        &self,
-        symbol: &Symbol,
-        start: DateTime,
-        end: DateTime,
-    ) -> Result<()> {
-        let coin = self.archive_coin(symbol)?;
-        let mut rates = Vec::new();
-        let mut current = start.as_millis();
-        let end_ms = end.as_millis();
-        while current <= end_ms {
-            let chunk_end = end_ms.min(current + FUNDING_CHUNK_HOURS * 3_600_000 - 1);
-            let response = self.info.funding_history(&coin, current, chunk_end)?;
-            rates.extend(parse_funding_history(&response, &coin, symbol, start, end)?);
-            current = chunk_end + 1;
-        }
-        self.write_margin_interest_rates_by_day(&rates)?;
-        Ok(())
-    }
-
     async fn ensure_perpetual_contexts(
         &self,
         symbols: &[Symbol],
@@ -310,6 +280,7 @@ impl HyperliquidHistoryProvider {
             let parsed = parse_asset_context_archive(&text, &symbols_by_coin, start, end)
                 .with_context(|| format!("failed to parse Hyperliquid asset contexts {key}"))?;
             self.write_perpetual_contexts_by_day(&parsed.contexts)?;
+            self.write_margin_interest_rates_by_day(&parsed.margin_interest_rates)?;
             self.write_quote_bars_by_day(Resolution::Minute, &parsed.quote_bars)?;
             self.write_open_interest_ticks_by_day(&parsed.open_interest_ticks)?;
 
@@ -726,8 +697,13 @@ impl IHistoryProvider for HyperliquidHistoryProvider {
             ));
         }
 
-        self.ensure_margin_interest_rates(&request.symbol, request.start, request.end)
-            .await?;
+        self.ensure_perpetual_contexts(
+            std::slice::from_ref(&request.symbol),
+            request.start,
+            request.end,
+            Resolution::Minute,
+        )
+        .await?;
         self.read_margin_interest_rates(&request.symbol, request.start, request.end)
     }
 
@@ -948,6 +924,7 @@ fn archive_coin_key(coin: &str) -> String {
 #[derive(Debug, Default)]
 struct AssetContextDownload {
     contexts: Vec<PerpetualContext>,
+    margin_interest_rates: Vec<MarginInterestRate>,
     quote_bars: Vec<QuoteBar>,
     open_interest_ticks: Vec<Tick>,
 }
@@ -1024,6 +1001,11 @@ fn parse_asset_context_archive(
             if let Some(quote_bar) = quote_bar_from_perpetual_context(&context) {
                 download.quote_bars.push(quote_bar);
             }
+            download.margin_interest_rates.push(MarginInterestRate::new(
+                symbol.clone(),
+                time,
+                funding,
+            ));
             download.open_interest_ticks.push(Tick::open_interest(
                 symbol.clone(),
                 time,
@@ -1379,46 +1361,6 @@ fn parse_candle_snapshot(
     Ok(bars)
 }
 
-fn parse_funding_history(
-    value: &Value,
-    coin: &str,
-    symbol: &Symbol,
-    start: DateTime,
-    end: DateTime,
-) -> Result<Vec<MarginInterestRate>> {
-    let Some(rows) = value.as_array() else {
-        return Err(anyhow::anyhow!(
-            "Hyperliquid fundingHistory response was not an array: {value}"
-        ));
-    };
-
-    let mut rates = Vec::new();
-    for row in rows {
-        if let Some(row_coin) = row.get("coin").and_then(Value::as_str) {
-            if !row_coin.eq_ignore_ascii_case(coin) {
-                continue;
-            }
-        }
-        let Some(raw_time) = row.get("time").and_then(parse_timestamp) else {
-            continue;
-        };
-        let time = NanosecondTimestamp(raw_time.0.div_euclid(HOUR_NANOS) * HOUR_NANOS);
-        if time < start || time > end {
-            continue;
-        }
-        let Some(rate) = row
-            .get("fundingRate")
-            .and_then(parse_decimal)
-            .or_else(|| decimal_field(row, "funding_rate"))
-        else {
-            continue;
-        };
-        rates.push(MarginInterestRate::new(symbol.clone(), time, rate));
-    }
-    sort_and_dedupe_margin_interest_rates(&mut rates);
-    Ok(rates)
-}
-
 fn sort_and_dedupe_ticks(ticks: &mut Vec<Tick>) {
     ticks.sort_by(|a, b| {
         (
@@ -1589,6 +1531,19 @@ mod tests {
         assert_eq!(contexts[0].funding, Decimal::new(125, 7));
         assert_eq!(contexts[0].open_interest, Decimal::new(1_234_567, 1));
         assert_eq!(contexts[0].mark_px, Decimal::new(32_767, 4));
+
+        let rates = provider
+            .get_margin_interest_rates(&request(
+                symbol.clone(),
+                DataType::MarginInterestRate,
+                Resolution::Hour,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rates.len(), 1);
+        assert_eq!(rates[0].symbol.value, "APT");
+        assert_eq!(rates[0].time, DateTime::from_millis(1_761_336_000_000));
+        assert_eq!(rates[0].interest_rate, Decimal::new(125, 7));
     }
 
     #[test]
@@ -1624,39 +1579,6 @@ mod tests {
         assert_eq!(bars[0].low.to_string(), "99.5");
         assert_eq!(bars[0].close.to_string(), "100.5");
         assert_eq!(bars[0].volume.to_string(), "42.25");
-    }
-
-    #[test]
-    fn parses_funding_history_and_normalizes_to_hour() {
-        let symbol = Symbol::create_crypto_future("USA500USD", &Market::hyperliquid());
-        let response = serde_json::json!([
-            {
-                "coin": "SPX",
-                "fundingRate": "0.0000125",
-                "premium": "0.0001",
-                "time": 1777420800003_i64
-            },
-            {
-                "coin": "BTC",
-                "fundingRate": "0.000002",
-                "premium": "0.0001",
-                "time": 1777420800003_i64
-            }
-        ]);
-
-        let rates = parse_funding_history(
-            &response,
-            "SPX",
-            &symbol,
-            DateTime::from_millis(1_777_420_800_000),
-            DateTime::from_millis(1_777_424_400_000),
-        )
-        .unwrap();
-
-        assert_eq!(rates.len(), 1);
-        assert_eq!(rates[0].symbol.value, "USA500USD");
-        assert_eq!(rates[0].time, DateTime::from_millis(1_777_420_800_000));
-        assert_eq!(rates[0].interest_rate.to_string(), "0.0000125");
     }
 
     #[tokio::test]
