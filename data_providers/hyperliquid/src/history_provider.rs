@@ -27,7 +27,8 @@ use crate::archive::{ArchiveRuntime, S3ArchiveClient};
 const HOUR_NANOS: i64 = 3_600_000_000_000;
 const DEFAULT_INFO_URL: &str = "https://api.hyperliquid.xyz/info";
 const MAX_CANDLES_PER_REQUEST: i64 = 5_000;
-const INFO_API_MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(500);
+const MAX_FUNDING_ROWS_PER_REQUEST: usize = 500;
+const INFO_API_MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(100);
 const INFO_API_MAX_RETRIES: usize = 6;
 const INFO_API_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 
@@ -112,7 +113,7 @@ impl HyperliquidInfoClient {
         Ok(())
     }
 
-    fn candle_snapshot(
+    pub(crate) fn candle_snapshot(
         &self,
         coin: &str,
         interval: &str,
@@ -127,6 +128,15 @@ impl HyperliquidInfoClient {
                 "startTime": start_ms,
                 "endTime": end_ms,
             }
+        }))
+    }
+
+    pub(crate) fn funding_history(&self, coin: &str, start_ms: i64, end_ms: i64) -> Result<Value> {
+        self.post(json!({
+            "type": "fundingHistory",
+            "coin": coin,
+            "startTime": start_ms,
+            "endTime": end_ms,
         }))
     }
 
@@ -205,6 +215,68 @@ impl HyperliquidHistoryProvider {
         Ok(bars_by_time.into_values().collect())
     }
 
+    async fn fetch_trade_bars_from_fills(
+        &self,
+        symbols: &[Symbol],
+        resolution: Resolution,
+        start: DateTime,
+        end: DateTime,
+    ) -> Result<Vec<TradeBar>> {
+        if resolution != Resolution::Minute {
+            return Err(anyhow::anyhow!(
+                "NotImplemented: Hyperliquid fill aggregation currently produces minute trade bars"
+            ));
+        }
+        let symbols_by_coin = self.symbols_by_archive_coin(symbols)?;
+        if symbols_by_coin.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut ticks = Vec::new();
+        for hour in hours_in_range(start, end) {
+            let key = fills_key(hour);
+            let Some(text) = self.archive.fills_text(&key).await? else {
+                continue;
+            };
+            ticks.extend(parse_fill_archive_for_symbols(&text, &symbols_by_coin)?);
+        }
+        ticks.retain(|tick| tick.time >= start && tick.time <= end);
+        sort_and_dedupe_ticks(&mut ticks);
+        aggregate_trade_ticks(&ticks, resolution)
+    }
+
+    async fn fetch_margin_interest_rates_from_info(
+        &self,
+        symbol: &Symbol,
+        start: DateTime,
+        end: DateTime,
+    ) -> Result<Vec<MarginInterestRate>> {
+        let coin = self.archive_coin(symbol)?;
+        let mut rates_by_time = BTreeMap::new();
+        let mut current = start.as_millis();
+        let end_ms = end.as_millis();
+
+        while current <= end_ms {
+            let response = self.info.funding_history(&coin, current, end_ms)?;
+            let rates = parse_funding_history(&response, symbol, start, end)?;
+            let last_rate_ms = rates.iter().map(|rate| rate.time.as_millis()).max();
+            let count = rates.len();
+            for rate in rates {
+                rates_by_time.insert(rate.time.0, rate);
+            }
+
+            current = match last_rate_ms {
+                Some(last) if last >= current => last + 1,
+                _ => break,
+            };
+            if count < MAX_FUNDING_ROWS_PER_REQUEST {
+                break;
+            }
+        }
+
+        Ok(rates_by_time.into_values().collect())
+    }
+
     async fn ensure_trade_ticks(
         &self,
         symbol: &Symbol,
@@ -243,6 +315,22 @@ impl HyperliquidHistoryProvider {
         Ok(())
     }
 
+    fn symbols_by_archive_coin(&self, symbols: &[Symbol]) -> Result<HashMap<String, Vec<Symbol>>> {
+        let mut symbols_by_coin: HashMap<String, Vec<Symbol>> = HashMap::new();
+        for symbol in symbols {
+            validate_hyperliquid_symbol(symbol)?;
+            let coin = self.archive_coin(symbol)?;
+            let entry = symbols_by_coin.entry(archive_coin_key(&coin)).or_default();
+            if !entry
+                .iter()
+                .any(|existing| existing.id.sid == symbol.id.sid)
+            {
+                entry.push(symbol.clone());
+            }
+        }
+        Ok(symbols_by_coin)
+    }
+
     async fn ensure_perpetual_contexts(
         &self,
         symbols: &[Symbol],
@@ -260,6 +348,9 @@ impl HyperliquidHistoryProvider {
         for symbol in symbols {
             validate_hyperliquid_symbol(symbol)?;
             if symbol.security_type() != SecurityType::CryptoFuture {
+                continue;
+            }
+            if is_hip3_symbol(symbol) {
                 continue;
             }
             let coin = self.archive_coin(symbol)?;
@@ -301,7 +392,7 @@ impl HyperliquidHistoryProvider {
         }
         if let Some((dex, coin)) = key.split_once(':') {
             let coin = strip_quote_suffix(coin);
-            let coin = default_archive_coin_alias(&coin)
+            let coin = default_archive_coin_alias_for_dex(dex, &coin)
                 .map(str::to_string)
                 .unwrap_or(coin);
             return Ok(format!("{}:{coin}", dex.to_ascii_lowercase()));
@@ -486,6 +577,39 @@ impl HyperliquidHistoryProvider {
         Ok(())
     }
 
+    fn write_trade_bars_multi_by_day(
+        &self,
+        resolution: Resolution,
+        bars: &[TradeBar],
+    ) -> Result<()> {
+        if bars.is_empty() {
+            return Ok(());
+        }
+        let mut by_date: BTreeMap<NaiveDate, Vec<TradeBar>> = BTreeMap::new();
+        for bar in bars {
+            by_date
+                .entry(bar.time.date_utc())
+                .or_default()
+                .push(bar.clone());
+        }
+        for (date, mut bars) in by_date {
+            sort_and_dedupe_trade_bars(&mut bars);
+            let path = self.resolver.market_data_partition(
+                &bars[0].symbol,
+                resolution,
+                TickType::Trade,
+                date,
+            );
+            self.writer.merge_trade_bar_partition(&bars, &path)?;
+            info!(
+                "Hyperliquid: cached {} trade bars to {}",
+                bars.len(),
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
     fn write_quote_bars_by_day(&self, resolution: Resolution, bars: &[QuoteBar]) -> Result<()> {
         if bars.is_empty() {
             return Ok(());
@@ -608,14 +732,23 @@ impl IHistoryProvider for HyperliquidHistoryProvider {
             ));
         }
 
-        let bars = self
-            .fetch_trade_bars_from_info(
+        let bars = if request.resolution == Resolution::Minute {
+            self.fetch_trade_bars_from_fills(
+                std::slice::from_ref(&request.symbol),
+                request.resolution,
+                request.start,
+                request.end,
+            )
+            .await?
+        } else {
+            self.fetch_trade_bars_from_info(
                 &request.symbol,
                 request.resolution,
                 request.start,
                 request.end,
             )
-            .await?;
+            .await?
+        };
         self.write_trade_bars_by_day(&request.symbol, request.resolution, &bars)?;
         Ok(bars)
     }
@@ -637,6 +770,9 @@ impl IHistoryProvider for HyperliquidHistoryProvider {
             return Err(anyhow::anyhow!(
                 "NotImplemented: Hyperliquid asset_ctxs does not provide second quote bars"
             ));
+        }
+        if is_hip3_symbol(&request.symbol) {
+            return Ok(Vec::new());
         }
 
         self.ensure_perpetual_contexts(
@@ -697,6 +833,15 @@ impl IHistoryProvider for HyperliquidHistoryProvider {
             ));
         }
 
+        if is_hip3_symbol(&request.symbol) {
+            let fetch_end = funding_history_cache_end(request.end);
+            let rates = self
+                .fetch_margin_interest_rates_from_info(&request.symbol, request.start, fetch_end)
+                .await?;
+            self.write_margin_interest_rates_by_day(&rates)?;
+            return self.read_margin_interest_rates(&request.symbol, request.start, request.end);
+        }
+
         self.ensure_perpetual_contexts(
             std::slice::from_ref(&request.symbol),
             request.start,
@@ -741,6 +886,21 @@ impl IHistoryProvider for HyperliquidHistoryProvider {
 
     async fn get_history_batch(&self, request: &HistoryBatchRequest) -> Result<MarketDataBatch> {
         match request.data_type {
+            DataType::TradeBar if request.resolution == Resolution::Minute => {
+                let bars = self
+                    .fetch_trade_bars_from_fills(
+                        &request.symbols,
+                        request.resolution,
+                        request.start,
+                        request.end,
+                    )
+                    .await?;
+                self.write_trade_bars_multi_by_day(request.resolution, &bars)?;
+                Ok(MarketDataBatch {
+                    trade_bars: bars,
+                    ..MarketDataBatch::default()
+                })
+            }
             DataType::PerpetualContext => {
                 if request.resolution != Resolution::Minute {
                     return Err(anyhow::anyhow!(
@@ -837,6 +997,19 @@ fn validate_hyperliquid_symbol(symbol: &Symbol) -> Result<()> {
     Ok(())
 }
 
+fn is_hip3_symbol(symbol: &Symbol) -> bool {
+    symbol.security_type() == SecurityType::CryptoFuture && symbol.value.trim().contains(':')
+}
+
+fn funding_history_cache_end(request_end: DateTime) -> DateTime {
+    let now = DateTime::from(Utc::now());
+    if now > request_end {
+        now
+    } else {
+        request_end
+    }
+}
+
 fn strip_quote_suffix(symbol: &str) -> String {
     for suffix in ["-PERP", "PERP", "USDC", "USDT", "USD"] {
         if symbol.ends_with(suffix) && symbol.len() > suffix.len() {
@@ -848,8 +1021,9 @@ fn strip_quote_suffix(symbol: &str) -> String {
 
 fn default_archive_coin_alias(symbol: &str) -> Option<&'static str> {
     match symbol {
-        // Hyperliquid HIP-3 USA500USD is archived under the SPX coin name.
-        "USA500" | "USA500USD" | "USA500USDC" | "USA500USDT" => Some("SPX"),
+        // trading.xyz's S&P 500 proxy is a HIP-3 market, not the core SPX perp.
+        "USA500" | "USA500USD" | "USA500USDC" | "USA500USDT" | "SP500" | "SP500USD"
+        | "SP500USDC" | "SP500USDT" => Some("xyz:SP500"),
         // Hyperliquid coin names are case-sensitive for kilo-denominated listings.
         "KPEPE" => Some("kPEPE"),
         "KSHIB" => Some("kSHIB"),
@@ -859,6 +1033,13 @@ fn default_archive_coin_alias(symbol: &str) -> Option<&'static str> {
         "KDOGS" => Some("kDOGS"),
         "KNEIRO" => Some("kNEIRO"),
         _ => None,
+    }
+}
+
+fn default_archive_coin_alias_for_dex(dex: &str, symbol: &str) -> Option<&'static str> {
+    match (dex.to_ascii_lowercase().as_str(), symbol) {
+        ("xyz", "USA500" | "USA500USD" | "USA500USDC" | "USA500USDT") => Some("SP500"),
+        _ => default_archive_coin_alias(symbol).filter(|mapped| !mapped.contains(':')),
     }
 }
 
@@ -905,7 +1086,7 @@ fn l2_book_key(hour: chrono::DateTime<Utc>, coin: &str) -> String {
     )
 }
 
-fn fills_key(hour: chrono::DateTime<Utc>) -> String {
+pub(crate) fn fills_key(hour: chrono::DateTime<Utc>) -> String {
     format!(
         "node_fills_by_block/hourly/{}/{}.lz4",
         hour.format("%Y%m%d"),
@@ -917,7 +1098,7 @@ pub(crate) fn asset_contexts_key(date: NaiveDate) -> String {
     format!("asset_ctxs/{}.csv.lz4", date.format("%Y%m%d"))
 }
 
-fn archive_coin_key(coin: &str) -> String {
+pub(crate) fn archive_coin_key(coin: &str) -> String {
     coin.trim().to_ascii_uppercase()
 }
 
@@ -1116,6 +1297,15 @@ fn parse_l2_book_archive(text: &str, coin: &str, symbol: &Symbol) -> Result<Vec<
 }
 
 fn parse_fill_archive(text: &str, coin: &str, symbol: &Symbol) -> Result<Vec<Tick>> {
+    let mut symbols_by_coin = HashMap::new();
+    symbols_by_coin.insert(archive_coin_key(coin), vec![symbol.clone()]);
+    parse_fill_archive_for_symbols(text, &symbols_by_coin)
+}
+
+fn parse_fill_archive_for_symbols(
+    text: &str,
+    symbols_by_coin: &HashMap<String, Vec<Symbol>>,
+) -> Result<Vec<Tick>> {
     let mut ticks = Vec::new();
     let mut seen_trades = HashSet::new();
     for record in parse_archive_records(text)? {
@@ -1131,9 +1321,9 @@ fn parse_fill_archive(text: &str, coin: &str, symbol: &Symbol) -> Result<Vec<Tic
             let Some(fill_coin) = fill.get("coin").and_then(Value::as_str) else {
                 continue;
             };
-            if !fill_coin.eq_ignore_ascii_case(coin) {
+            let Some(symbols) = symbols_by_coin.get(&archive_coin_key(fill_coin)) else {
                 continue;
-            }
+            };
             let Some(price) = decimal_field(fill, "px") else {
                 continue;
             };
@@ -1154,17 +1344,19 @@ fn parse_fill_archive(text: &str, coin: &str, symbol: &Symbol) -> Result<Vec<Tic
                 .get("tid")
                 .map(|tid| format!("tid:{tid}"))
                 .unwrap_or_else(|| format!("{}:{}:{}:{}", time.0, fill_coin, price, size));
-            if !seen_trades.insert(key) {
-                continue;
+            for symbol in symbols {
+                if !seen_trades.insert(format!("{}:{key}", symbol.id.sid)) {
+                    continue;
+                }
+                ticks.push(Tick::trade(symbol.clone(), time, price, size));
             }
-            ticks.push(Tick::trade(symbol.clone(), time, price, size));
         }
     }
     sort_and_dedupe_ticks(&mut ticks);
     Ok(ticks)
 }
 
-fn parse_archive_records(text: &str) -> Result<Vec<Value>> {
+pub(crate) fn parse_archive_records(text: &str) -> Result<Vec<Value>> {
     let mut records = Vec::new();
     let mut parse_errors = Vec::new();
     for line in text.lines() {
@@ -1269,7 +1461,7 @@ fn parse_decimal(value: &Value) -> Option<Decimal> {
     }
 }
 
-fn parse_timestamp(value: &Value) -> Option<DateTime> {
+pub(crate) fn parse_timestamp(value: &Value) -> Option<DateTime> {
     if let Some(raw) = value.as_i64() {
         if raw.abs() > 10_000_000_000_000 {
             return Some(NanosecondTimestamp(raw));
@@ -1359,6 +1551,93 @@ fn parse_candle_snapshot(
     }
     sort_and_dedupe_trade_bars(&mut bars);
     Ok(bars)
+}
+
+fn parse_funding_history(
+    value: &Value,
+    symbol: &Symbol,
+    start: DateTime,
+    end: DateTime,
+) -> Result<Vec<MarginInterestRate>> {
+    let Some(rows) = value.as_array() else {
+        return Err(anyhow::anyhow!(
+            "Hyperliquid fundingHistory response was not an array: {value}"
+        ));
+    };
+
+    let mut rates = Vec::new();
+    for row in rows {
+        let Some(time) = row.get("time").and_then(parse_timestamp) else {
+            continue;
+        };
+        if time < start || time > end {
+            continue;
+        }
+        let Some(rate) =
+            decimal_field(row, "fundingRate").or_else(|| decimal_field(row, "funding"))
+        else {
+            continue;
+        };
+        rates.push(MarginInterestRate::new(symbol.clone(), time, rate));
+    }
+    sort_and_dedupe_margin_interest_rates(&mut rates);
+    Ok(rates)
+}
+
+fn aggregate_trade_ticks(ticks: &[Tick], resolution: Resolution) -> Result<Vec<TradeBar>> {
+    let period = resolution
+        .to_time_span()
+        .with_context(|| format!("resolution {resolution:?} cannot produce trade bars"))?;
+    let mut aggregates: BTreeMap<(u64, i64), TradeBar> = BTreeMap::new();
+
+    let mut sorted = ticks.to_vec();
+    sorted.sort_by_key(|tick| (tick.symbol.id.sid, tick.time.0));
+    for tick in sorted {
+        if !tick.is_trade() || tick.value <= Decimal::ZERO || tick.quantity <= Decimal::ZERO {
+            continue;
+        }
+        let bucket_time = trade_bar_bucket_time(tick.time, resolution)?;
+        let key = (tick.symbol.id.sid, bucket_time.0);
+        match aggregates.get_mut(&key) {
+            Some(existing) => existing.update(tick.value, tick.quantity),
+            None => {
+                aggregates.insert(
+                    key,
+                    TradeBar::new(
+                        tick.symbol.clone(),
+                        bucket_time,
+                        period,
+                        TradeBarData::new(
+                            tick.value,
+                            tick.value,
+                            tick.value,
+                            tick.value,
+                            tick.quantity,
+                        ),
+                    ),
+                );
+            }
+        }
+    }
+
+    let mut output = aggregates.into_values().collect::<Vec<_>>();
+    sort_and_dedupe_trade_bars(&mut output);
+    Ok(output)
+}
+
+fn trade_bar_bucket_time(time: DateTime, resolution: Resolution) -> Result<DateTime> {
+    match resolution {
+        Resolution::Minute => Ok(NanosecondTimestamp(
+            time.0.div_euclid(TimeSpan::ONE_MINUTE.nanos) * TimeSpan::ONE_MINUTE.nanos,
+        )),
+        Resolution::Hour => Ok(NanosecondTimestamp(
+            time.0.div_euclid(TimeSpan::ONE_HOUR.nanos) * TimeSpan::ONE_HOUR.nanos,
+        )),
+        Resolution::Daily => Ok(date_to_datetime(time.date_utc(), 0, 0, 0)),
+        Resolution::Tick | Resolution::Second => Err(anyhow::anyhow!(
+            "NotImplemented: Hyperliquid fills do not support {resolution:?} trade bars"
+        )),
+    }
 }
 
 fn sort_and_dedupe_ticks(ticks: &mut Vec<Tick>) {
@@ -1544,6 +1823,19 @@ mod tests {
         assert_eq!(rates[0].symbol.value, "APT");
         assert_eq!(rates[0].time, DateTime::from_millis(1_761_336_000_000));
         assert_eq!(rates[0].interest_rate, Decimal::new(125, 7));
+
+        let trade_bars = provider
+            .get_history(&request(
+                symbol.clone(),
+                DataType::TradeBar,
+                Resolution::Minute,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(trade_bars.len(), 1);
+        assert_eq!(trade_bars[0].open, Decimal::new(3277, 3));
+        assert_eq!(trade_bars[0].close, Decimal::new(3277, 3));
+        assert_eq!(trade_bars[0].volume, Decimal::new(70, 1));
     }
 
     #[test]
@@ -1613,12 +1905,12 @@ mod tests {
     }
 
     #[test]
-    fn resolves_usa500usd_to_spx_archive_coin_alias() {
+    fn resolves_usa500usd_to_hip3_sp500_archive_coin_alias() {
         let temp = TempDir::new().unwrap();
         let provider = provider(&temp, HashMap::new());
         let symbol = Symbol::create_crypto_future("USA500USD", &Market::hyperliquid());
 
-        assert_eq!(provider.archive_coin(&symbol).unwrap(), "SPX");
+        assert_eq!(provider.archive_coin(&symbol).unwrap(), "xyz:SP500");
     }
 
     #[test]
@@ -1628,5 +1920,30 @@ mod tests {
         let symbol = Symbol::create_crypto_future("XYZ:KPEPE", &Market::hyperliquid());
 
         assert_eq!(provider.archive_coin(&symbol).unwrap(), "xyz:kPEPE");
+
+        let sp500 = Symbol::create_crypto_future("XYZ:USA500USD", &Market::hyperliquid());
+        assert_eq!(provider.archive_coin(&sp500).unwrap(), "xyz:SP500");
+    }
+
+    #[test]
+    fn parses_funding_history_margin_interest_rates() {
+        let symbol = Symbol::create_crypto_future("XYZ:TSLA", &Market::hyperliquid());
+        let response = serde_json::json!([
+            { "coin": "xyz:TSLA", "fundingRate": "-0.0000125", "premium": "0.0", "time": 1764547200000_i64 },
+            { "coin": "xyz:TSLA", "fundingRate": "0.000003", "premium": "0.0", "time": 1764550800000_i64 }
+        ]);
+
+        let rates = parse_funding_history(
+            &response,
+            &symbol,
+            DateTime::from_millis(1_764_547_200_000),
+            DateTime::from_millis(1_764_550_800_000),
+        )
+        .unwrap();
+
+        assert_eq!(rates.len(), 2);
+        assert_eq!(rates[0].symbol.value, "XYZ:TSLA");
+        assert_eq!(rates[0].interest_rate, Decimal::new(-125, 7));
+        assert_eq!(rates[1].interest_rate, Decimal::new(3, 6));
     }
 }
