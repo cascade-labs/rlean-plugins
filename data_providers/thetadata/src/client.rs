@@ -145,6 +145,29 @@ impl ThetaDataClient {
             .join("data.parquet")
     }
 
+    fn read_cached_option_eod_bars_for_root(
+        &self,
+        parquet_path: &Path,
+        root: &str,
+    ) -> Result<Option<Vec<OptionEodBar>>> {
+        if !parquet_path.exists() {
+            return Ok(None);
+        }
+
+        let cached = self
+            .parquet_reader
+            .read_option_eod_bars(&[parquet_path.to_path_buf()])?
+            .into_iter()
+            .filter(|bar| bar.underlying.eq_ignore_ascii_case(root))
+            .collect::<Vec<_>>();
+
+        if cached.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(cached))
+        }
+    }
+
     /// Create a new client.
     ///
     /// - `base_url`: ThetaData endpoint.  Pass `None` to use the env var
@@ -659,18 +682,13 @@ impl ThetaDataClient {
     ) -> Result<Vec<V3OptionEod>> {
         let parquet_path = self.option_eod_partition_path(date);
 
-        // ── Cache hit: one syscall, open file, read all rows ─────────────────
-        if parquet_path.exists() {
+        // A date partition can contain other underlyings. It is only a cache hit
+        // when the requested root is present in that partition.
+        if let Some(cached) = self.read_cached_option_eod_bars_for_root(&parquet_path, root)? {
             debug!(
                 "ThetaData: cache hit for {root} on {date} at {}",
                 parquet_path.display()
             );
-            let cached = self
-                .parquet_reader
-                .read_option_eod_bars(&[parquet_path])?
-                .into_iter()
-                .filter(|bar| bar.underlying.eq_ignore_ascii_case(root))
-                .collect();
             return Ok(option_eod_bars_to_v3(cached));
         }
 
@@ -727,17 +745,14 @@ impl ThetaDataClient {
     ) -> Result<Vec<OptionEodBar>> {
         let parquet_path = self.option_eod_partition_path(date);
 
-        if parquet_path.exists() {
+        // A date partition can contain other underlyings. It is only a cache hit
+        // when the requested root is present in that partition.
+        if let Some(cached) = self.read_cached_option_eod_bars_for_root(&parquet_path, root)? {
             debug!(
                 "ThetaData: cache hit for {root} on {date} at {}",
                 parquet_path.display()
             );
-            return Ok(self
-                .parquet_reader
-                .read_option_eod_bars(&[parquet_path])?
-                .into_iter()
-                .filter(|bar| bar.underlying.eq_ignore_ascii_case(root))
-                .collect());
+            return Ok(cached);
         }
 
         // Cache miss — fetch from API, write to disk, return as OptionEodBar.
@@ -2075,6 +2090,56 @@ mod tests {
         assert_eq!(rows[0].volume, 1000);
         assert_eq!(rows[0].right, "P");
         assert_eq!(rows[0].date, date);
+    }
+
+    #[test]
+    fn test_option_eod_partition_is_not_cache_hit_for_missing_root() {
+        use lean_storage::{OptionEodBar, ParquetWriter, WriterConfig};
+        use rust_decimal::Decimal;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tmp dir");
+        let root = tmp.path();
+        let date = NaiveDate::from_ymd_opt(2021, 4, 19).unwrap();
+        let expiration = NaiveDate::from_ymd_opt(2021, 4, 30).unwrap();
+        let path = test_eod_path(root, "SPY", date);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let bar = OptionEodBar {
+            date,
+            symbol_value: "SPY 210430P00480000".to_string(),
+            underlying: "SPY".to_string(),
+            expiration,
+            strike: Decimal::from(480),
+            right: "P".to_string(),
+            open: Decimal::from(2),
+            high: Decimal::from(2),
+            low: Decimal::from(2),
+            close: Decimal::from(2),
+            volume: 100,
+            bid: Decimal::from(2),
+            ask: Decimal::from(2),
+            bid_size: 1,
+            ask_size: 1,
+        };
+        ParquetWriter::new(WriterConfig::default())
+            .write_option_eod_bars(&[bar], &path)
+            .expect("write");
+
+        let client =
+            ThetaDataClient::new(None, Some("http://127.0.0.1:9".to_string()), 1.0, 1, root);
+        assert!(client
+            .read_cached_option_eod_bars_for_root(&path, "QQQ")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            client
+                .read_cached_option_eod_bars_for_root(&path, "SPY")
+                .unwrap()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

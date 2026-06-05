@@ -190,6 +190,7 @@ fn parquet_source(path: PathBuf) -> CustomParquetSource {
         time_column: None,
         time_format: None,
         time_zone: None,
+        end_time_offset_nanos: None,
         symbol_column: None,
         value_column: Some("close".to_string()),
     }
@@ -234,7 +235,7 @@ fn populate_vx30_parquet_cache(data_dir: &Path) -> Result<(), String> {
 
     let mut settlements: BTreeMap<NaiveDate, Vec<(i64, f64)>> = BTreeMap::new();
     for (idx, (expiry, url)) in urls.iter().enumerate() {
-        let text = fetch_text(&url).map_err(|error| {
+        let text = fetch_text(url).map_err(|error| {
             format!("VX contract fetch failed expiry={expiry} url={url}: {error}")
         })?;
         if idx > 0 && idx % 50 == 0 {
@@ -388,7 +389,7 @@ fn parse_vx_contract_row(line: &str, expiry: NaiveDate) -> Option<VxContractRow>
     })
 }
 
-fn interpolate_vx30(curve: &mut Vec<(i64, f64)>) -> Option<f64> {
+fn interpolate_vx30(curve: &mut [(i64, f64)]) -> Option<f64> {
     curve.sort_by_key(|(dte, _)| *dte);
     let mut lower = None;
     let mut upper = None;

@@ -861,7 +861,11 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
                     self.writer.merge_tick_partition(&rows, &path)?;
                 }
             }
-            DataType::OpenInterest | DataType::FactorFile | DataType::MapFile => {
+            DataType::OpenInterest
+            | DataType::FactorFile
+            | DataType::MapFile
+            | DataType::MarginInterestRate
+            | DataType::PerpetualContext => {
                 return Err(anyhow::anyhow!(
                     "NotImplemented: ThetaData does not provide batched {:?} data",
                     request.data_type
