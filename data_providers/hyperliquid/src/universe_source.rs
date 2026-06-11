@@ -147,7 +147,11 @@ impl HyperliquidUniverseDataSource {
         let Some(text) = block_on_archive(archive.market_text(&key))? else {
             return Ok(None);
         };
-        let rows = parse_asset_ctx_universe_rows(&text, universe, dex_filter, date, resolution)?;
+        let info = self.info_client(config);
+        let metadata = load_current_perp_metadata(&info, dex_filter)?;
+        let rows = parse_asset_ctx_universe_rows(
+            &text, universe, dex_filter, date, resolution, &metadata,
+        )?;
         Ok(Some(rows))
     }
 
@@ -166,9 +170,17 @@ impl HyperliquidUniverseDataSource {
         }
 
         let info = self.info_client(config);
-        let coins = load_current_hip3_coins(&info, dex)?;
+        let metadata = load_current_perp_metadata(&info, Some(dex))?;
+        let mut coins = metadata
+            .values()
+            .map(|meta| meta.coin.clone())
+            .collect::<Vec<_>>();
+        coins.sort_by_key(|coin| archive_coin_key(coin));
         let mut rows = Vec::new();
         for coin in coins {
+            let metadata = metadata
+                .get(&archive_coin_key(&coin))
+                .with_context(|| format!("missing Hyperliquid metadata for {coin}"))?;
             let candles = self.candle_rows_for_coin(&info, dex, &coin, date)?;
             let day_candles = candles
                 .into_iter()
@@ -178,13 +190,10 @@ impl HyperliquidUniverseDataSource {
                 continue;
             }
             let funding_rows = self.funding_rows_for_coin(&info, dex, &coin, date)?;
-            let funding_by_time = funding_rows
-                .into_iter()
-                .map(|(time, funding)| (time.0, funding))
-                .collect::<HashMap<_, _>>();
 
             match resolution {
                 Resolution::Hour => {
+                    let funding_by_time = funding_rows_by_bucket(funding_rows, Resolution::Hour)?;
                     rows.extend(day_candles.into_iter().map(|candle| {
                         universe_row_from_candle(
                             universe,
@@ -192,23 +201,18 @@ impl HyperliquidUniverseDataSource {
                             &coin,
                             &candle,
                             funding_by_time.get(&candle.time.0).copied(),
+                            metadata,
                         )
                     }));
                 }
                 Resolution::Daily => {
                     if let Some(candle) = aggregate_candles_for_day(&day_candles, date) {
-                        let funding_values = day_candles
-                            .iter()
-                            .filter_map(|candle| funding_by_time.get(&candle.time.0))
-                            .copied()
-                            .collect::<Vec<_>>();
-                        let funding = funding_values
-                            .iter()
-                            .copied()
-                            .reduce(|sum, value| sum + value)
-                            .map(|sum| sum / Decimal::from(funding_values.len() as u64));
+                        let funding_by_time =
+                            funding_rows_by_bucket(funding_rows, Resolution::Daily)?;
+                        let funding_time = date_to_datetime(date, 0, 0, 0);
+                        let funding = funding_by_time.get(&funding_time.0).copied();
                         rows.push(universe_row_from_candle(
-                            universe, dex, &coin, &candle, funding,
+                            universe, dex, &coin, &candle, funding, metadata,
                         ));
                     }
                 }
@@ -230,13 +234,16 @@ impl HyperliquidUniverseDataSource {
     ) -> Result<Vec<CandleCacheRow>> {
         let cache_path = self.candle_cache_path(dex, coin);
         let cached = read_candle_cache(&cache_path)?;
-        if !cached.is_empty() || cache_path.exists() {
+        if candle_cache_covers_date(&cached, date) {
             return Ok(cached);
         }
 
         let start = date_to_datetime(date, 0, 0, 0);
         let end = DateTime::from(Utc::now());
         let mut rows_by_time = BTreeMap::new();
+        for row in cached {
+            rows_by_time.insert(row.time.0, row);
+        }
         let mut current = start.as_millis();
         let end_ms = end.as_millis();
 
@@ -297,13 +304,21 @@ impl HyperliquidUniverseDataSource {
                 .entry(aggregate.coin_key.clone())
                 .or_insert(Decimal::ZERO) += aggregate.notional;
         }
-        let funding_by_coin_time = self.load_hip3_funding_rows(dex, &coins, date, config)?;
+        let info = self.info_client(config);
+        let metadata = load_current_perp_metadata(&info, Some(dex))?;
+        let funding_by_coin_time =
+            self.load_hip3_funding_rows(dex, &coins, date, resolution, config)?;
 
         let mut rows = Vec::with_capacity(aggregates.len());
         for aggregate in aggregates.values() {
+            let funding_time =
+                funding_lookup_bucket_time(NanosecondTimestamp(aggregate.time_ns), resolution)?;
             let funding = funding_by_coin_time
-                .get(&(aggregate.coin_key.clone(), aggregate.time_ns))
+                .get(&(aggregate.coin_key.clone(), funding_time.0))
                 .copied();
+            let metadata = metadata
+                .get(&aggregate.coin_key)
+                .with_context(|| format!("missing Hyperliquid metadata for {}", aggregate.coin))?;
             rows.push(UniverseRow {
                 time_ns: aggregate.time_ns,
                 symbol: aggregate.coin.to_ascii_uppercase(),
@@ -325,9 +340,9 @@ impl HyperliquidUniverseDataSource {
                 mid_px: Some(aggregate.close),
                 impact_bid_px: None,
                 impact_ask_px: None,
-                max_leverage: None,
-                sz_decimals: None,
-                index: None,
+                max_leverage: Some(metadata.max_leverage),
+                sz_decimals: metadata.sz_decimals,
+                index: metadata.index,
                 base: aggregate
                     .coin
                     .split_once(':')
@@ -346,17 +361,21 @@ impl HyperliquidUniverseDataSource {
         dex: &str,
         coins: &HashSet<String>,
         date: NaiveDate,
+        resolution: Resolution,
         config: &CustomDataConfig,
     ) -> Result<HashMap<(String, i64), Decimal>> {
         let info = self.info_client(config);
         let mut funding_by_coin_time = HashMap::new();
+        let funding_resolution = funding_bucket_resolution(resolution)?;
 
         let mut sorted_coins = coins.iter().collect::<Vec<_>>();
         sorted_coins.sort();
         for coin in sorted_coins {
             let rows = self.funding_rows_for_coin(&info, dex, coin, date)?;
-            for (time, funding) in rows.into_iter().filter(|(time, _)| time.date_utc() == date) {
-                funding_by_coin_time.insert((archive_coin_key(coin), time.0), funding);
+            for (time_ns, funding) in funding_rows_by_bucket(rows, funding_resolution)? {
+                if NanosecondTimestamp(time_ns).date_utc() == date {
+                    funding_by_coin_time.insert((archive_coin_key(coin), time_ns), funding);
+                }
             }
         }
         Ok(funding_by_coin_time)
@@ -627,6 +646,7 @@ fn parse_asset_ctx_universe_rows(
     dex_filter: Option<&str>,
     date: NaiveDate,
     resolution: Resolution,
+    metadata: &HashMap<String, PerpMetadata>,
 ) -> Result<Vec<UniverseRow>> {
     if matches!(resolution, Resolution::Tick | Resolution::Second) {
         return Err(anyhow::anyhow!(
@@ -654,6 +674,9 @@ fn parse_asset_ctx_universe_rows(
                 continue;
             }
         }
+        let metadata = metadata
+            .get(&archive_coin_key(&source_coin))
+            .with_context(|| format!("missing Hyperliquid metadata for {source_coin}"))?;
         let symbol = source_coin.to_ascii_uppercase();
         rows.push(UniverseRow {
             time_ns: time.timestamp_nanos_opt().unwrap_or_default(),
@@ -676,9 +699,9 @@ fn parse_asset_ctx_universe_rows(
             mid_px: parse_decimal(&row.mid_px),
             impact_bid_px: parse_decimal(&row.impact_bid_px),
             impact_ask_px: parse_decimal(&row.impact_ask_px),
-            max_leverage: None,
-            sz_decimals: None,
-            index: None,
+            max_leverage: Some(metadata.max_leverage),
+            sz_decimals: metadata.sz_decimals,
+            index: metadata.index,
             base: None,
             quote: Some("USDC".to_string()),
         });
@@ -784,8 +807,19 @@ struct CandleCacheCsvRow {
     volume: String,
 }
 
-fn load_current_hip3_coins(info: &HyperliquidInfoClient, dex: &str) -> Result<Vec<String>> {
-    let response = info.meta_and_asset_ctxs(Some(dex))?;
+#[derive(Debug, Clone)]
+struct PerpMetadata {
+    coin: String,
+    max_leverage: i64,
+    sz_decimals: Option<i64>,
+    index: Option<i64>,
+}
+
+fn load_current_perp_metadata(
+    info: &HyperliquidInfoClient,
+    dex: Option<&str>,
+) -> Result<HashMap<String, PerpMetadata>> {
+    let response = info.meta_and_asset_ctxs(dex)?;
     let array = response
         .as_array()
         .filter(|array| !array.is_empty())
@@ -798,16 +832,33 @@ fn load_current_hip3_coins(info: &HyperliquidInfoClient, dex: &str) -> Result<Ve
         .ok_or_else(|| {
             anyhow::anyhow!("Hyperliquid metaAndAssetCtxs response missing meta.universe")
         })?;
-    let mut coins = universe_rows
-        .iter()
-        .filter_map(|asset| asset.get("name").and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|coin| !coin.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    coins.sort_by_key(|coin| archive_coin_key(coin));
-    coins.dedup_by_key(|coin| archive_coin_key(coin));
-    Ok(coins)
+    let mut metadata = HashMap::new();
+    for (index, asset) in universe_rows.iter().enumerate() {
+        let Some(name) = asset.get("name").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let max_leverage = asset
+            .get("maxLeverage")
+            .and_then(Value::as_i64)
+            .or_else(|| asset.get("max_leverage").and_then(Value::as_i64))
+            .with_context(|| format!("Hyperliquid metadata for {name} missing maxLeverage"))?;
+        metadata.insert(
+            archive_coin_key(name),
+            PerpMetadata {
+                coin: name.to_string(),
+                max_leverage,
+                sz_decimals: asset.get("szDecimals").and_then(Value::as_i64),
+                index: asset
+                    .get("index")
+                    .and_then(Value::as_i64)
+                    .or(Some(index as i64)),
+            },
+        );
+    }
+    Ok(metadata)
 }
 
 fn parse_candle_history_rows(
@@ -898,6 +949,7 @@ fn universe_row_from_candle(
     coin: &str,
     candle: &CandleCacheRow,
     funding: Option<Decimal>,
+    metadata: &PerpMetadata,
 ) -> UniverseRow {
     let notional = candle.close * candle.volume;
     UniverseRow {
@@ -921,9 +973,9 @@ fn universe_row_from_candle(
         mid_px: Some(candle.close),
         impact_bid_px: None,
         impact_ask_px: None,
-        max_leverage: None,
-        sz_decimals: None,
-        index: None,
+        max_leverage: Some(metadata.max_leverage),
+        sz_decimals: metadata.sz_decimals,
+        index: metadata.index,
         base: coin
             .split_once(':')
             .map(|(_, base)| base.to_ascii_uppercase()),
@@ -1075,6 +1127,38 @@ fn parse_funding_history_rows(
     parsed.sort_by_key(|(time, _)| time.0);
     parsed.dedup_by_key(|(time, _)| time.0);
     Ok(parsed)
+}
+
+fn funding_bucket_resolution(resolution: Resolution) -> Result<Resolution> {
+    match resolution {
+        Resolution::Minute | Resolution::Hour => Ok(Resolution::Hour),
+        Resolution::Daily => Ok(Resolution::Daily),
+        Resolution::Tick | Resolution::Second => Err(anyhow::anyhow!(
+            "Hyperliquid funding history cannot be bucketed for {resolution:?} universe rows"
+        )),
+    }
+}
+
+fn funding_lookup_bucket_time(time: DateTime, resolution: Resolution) -> Result<DateTime> {
+    universe_bucket_time(time, funding_bucket_resolution(resolution)?)
+}
+
+fn funding_rows_by_bucket(
+    rows: Vec<(DateTime, Decimal)>,
+    resolution: Resolution,
+) -> Result<HashMap<i64, Decimal>> {
+    let mut buckets: BTreeMap<i64, (Decimal, u64)> = BTreeMap::new();
+    for (time, funding) in rows {
+        let bucket_time = universe_bucket_time(time, resolution)?;
+        let entry = buckets.entry(bucket_time.0).or_insert((Decimal::ZERO, 0));
+        entry.0 += funding;
+        entry.1 += 1;
+    }
+
+    Ok(buckets
+        .into_iter()
+        .map(|(time_ns, (sum, count))| (time_ns, sum / Decimal::from(count)))
+        .collect())
 }
 
 fn decimal_value_field(value: &Value, field: &str) -> Option<Decimal> {
@@ -1242,6 +1326,19 @@ fn funding_cache_covers_date(rows: &[(DateTime, Decimal)], date: NaiveDate) -> b
         return false;
     };
     let Some(last) = rows.last().map(|(time, _)| *time) else {
+        return false;
+    };
+    first <= date_to_datetime(date, 0, 0, 0) && last >= date_to_datetime(date, 23, 0, 0)
+}
+
+fn candle_cache_covers_date(rows: &[CandleCacheRow], date: NaiveDate) -> bool {
+    if rows.iter().any(|row| row.time.date_utc() == date) {
+        return true;
+    }
+    let Some(first) = rows.first().map(|row| row.time) else {
+        return false;
+    };
+    let Some(last) = rows.last().map(|row| row.time) else {
         return false;
     };
     first <= date_to_datetime(date, 0, 0, 0) && last >= date_to_datetime(date, 23, 0, 0)
@@ -1482,12 +1579,22 @@ time,coin,funding,open_interest,prev_day_px,day_ntl_vlm,premium,oracle_px,mark_p
 2026-04-30 00:00:00,xyz:TSLA,-0.0002,200,2,2000,-0.01,2.1,2.2,2.3,2.29,2.31
 2026-04-30 00:01:00,xyz:NVDA,-0.0003,300,3,3000,-0.02,3.1,3.2,3.3,3.29,3.31
 ";
+        let metadata = HashMap::from([(
+            archive_coin_key("xyz:TSLA"),
+            PerpMetadata {
+                coin: "xyz:TSLA".to_string(),
+                max_leverage: 3,
+                sz_decimals: Some(2),
+                index: Some(7),
+            },
+        )]);
         let rows = parse_asset_ctx_universe_rows(
             csv,
             "HIP3_XYZ",
             Some("xyz"),
             NaiveDate::from_ymd_opt(2026, 4, 30).unwrap(),
             Resolution::Hour,
+            &metadata,
         )
         .unwrap();
 
@@ -1497,6 +1604,9 @@ time,coin,funding,open_interest,prev_day_px,day_ntl_vlm,premium,oracle_px,mark_p
         assert_eq!(rows[0].source, "asset_ctxs");
         assert!(rows[0].is_historical);
         assert_eq!(rows[0].funding, Some(Decimal::new(-2, 4)));
+        assert_eq!(rows[0].max_leverage, Some(3));
+        assert_eq!(rows[0].sz_decimals, Some(2));
+        assert_eq!(rows[0].index, Some(7));
     }
 
     #[test]
@@ -1552,6 +1662,52 @@ time,coin,funding,open_interest,prev_day_px,day_ntl_vlm,premium,oracle_px,mark_p
     }
 
     #[test]
+    fn funding_history_rows_bucket_to_hour_for_millisecond_offsets() {
+        let rows = vec![
+            (
+                NanosecondTimestamp(1_777_507_200_026_000_000),
+                Decimal::new(-125, 7),
+            ),
+            (
+                NanosecondTimestamp(1_777_510_800_002_000_000),
+                Decimal::new(3, 6),
+            ),
+        ];
+
+        let by_hour = funding_rows_by_bucket(rows, Resolution::Hour).unwrap();
+
+        assert_eq!(
+            by_hour.get(&1_777_507_200_000_000_000),
+            Some(&Decimal::new(-125, 7))
+        );
+        assert_eq!(
+            by_hour.get(&1_777_510_800_000_000_000),
+            Some(&Decimal::new(3, 6))
+        );
+    }
+
+    #[test]
+    fn funding_history_rows_bucket_to_daily_average() {
+        let rows = vec![
+            (
+                NanosecondTimestamp(1_777_507_200_026_000_000),
+                Decimal::new(10, 4),
+            ),
+            (
+                NanosecondTimestamp(1_777_510_800_002_000_000),
+                Decimal::new(30, 4),
+            ),
+        ];
+
+        let by_day = funding_rows_by_bucket(rows, Resolution::Daily).unwrap();
+
+        assert_eq!(
+            by_day.get(&1_777_507_200_000_000_000),
+            Some(&Decimal::new(20, 4))
+        );
+    }
+
+    #[test]
     fn funding_cache_round_trips_and_covers_dates() {
         let temp = tempfile::TempDir::new().unwrap();
         let path = temp.path().join("xyz_TSLA.csv");
@@ -1599,6 +1755,12 @@ time,coin,funding,open_interest,prev_day_px,day_ntl_vlm,premium,oracle_px,mark_p
         )
         .unwrap();
         assert_eq!(rows.len(), 1);
+        let metadata = PerpMetadata {
+            coin: "xyz:TSLA".to_string(),
+            max_leverage: 3,
+            sz_decimals: Some(2),
+            index: Some(7),
+        };
 
         let universe_row = universe_row_from_candle(
             "HIP3_XYZ",
@@ -1606,6 +1768,7 @@ time,coin,funding,open_interest,prev_day_px,day_ntl_vlm,premium,oracle_px,mark_p
             "xyz:TSLA",
             &rows[0],
             Some(Decimal::new(-125, 7)),
+            &metadata,
         );
         assert_eq!(universe_row.symbol, "XYZ:TSLA");
         assert_eq!(universe_row.source, "info_api_candle");
@@ -1613,12 +1776,25 @@ time,coin,funding,open_interest,prev_day_px,day_ntl_vlm,premium,oracle_px,mark_p
         assert_eq!(universe_row.value, Some(Decimal::new(2550, 1)));
         assert_eq!(universe_row.day_ntl_vlm, Some(Decimal::new(25500, 1)));
         assert_eq!(universe_row.funding, Some(Decimal::new(-125, 7)));
+        assert_eq!(universe_row.max_leverage, Some(3));
 
         let temp = tempfile::TempDir::new().unwrap();
         let path = temp.path().join("xyz_TSLA_candles.csv");
         write_candle_cache(&path, &rows).unwrap();
         let cached = read_candle_cache(&path).unwrap();
         assert_eq!(cached, rows);
+        assert!(candle_cache_covers_date(
+            &cached,
+            NaiveDate::from_ymd_opt(2026, 4, 30).unwrap()
+        ));
+        assert!(!candle_cache_covers_date(
+            &cached,
+            NaiveDate::from_ymd_opt(2026, 5, 1).unwrap()
+        ));
+        assert!(!candle_cache_covers_date(
+            &[],
+            NaiveDate::from_ymd_opt(2026, 4, 30).unwrap()
+        ));
     }
 
     #[test]
