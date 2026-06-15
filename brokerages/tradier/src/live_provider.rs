@@ -215,6 +215,7 @@ async fn run_tradier_stream(
                 if !stop.load(Ordering::Relaxed) {
                     let error_text = format!("{error:#}");
                     warn!("Tradier live stream disconnected: {error_text}");
+                    eprintln!("rlean-plugin-tradier: live stream disconnected: {error_text}");
                     if is_session_auth_error(&error_text) {
                         fanout_error(&state, error_text);
                         return;
@@ -244,6 +245,7 @@ async fn run_tradier_stream_once(
         .with_context(|| format!("failed to connect Tradier websocket {ws_url}"))?;
     set_connected(state, true);
     info!("Tradier live websocket connected: {ws_url}");
+    eprintln!("rlean-plugin-tradier: live websocket connected");
 
     let mut last_signature = StreamSignature::default();
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
@@ -255,8 +257,9 @@ async fn run_tradier_stream_once(
                 }
                 let signature = stream_signature(state);
                 if signature != last_signature && !signature.symbols.is_empty() {
+                    let symbols = signature.symbols.clone();
                     let payload = json!({
-                        "symbols": signature.symbols,
+                        "symbols": symbols,
                         "filter": MARKET_EVENT_FILTER,
                         "sessionid": session.stream.sessionid,
                         "linebreak": config.linebreak,
@@ -266,6 +269,10 @@ async fn run_tradier_stream_once(
                         .send(Message::Text(payload.to_string()))
                         .await
                         .context("failed to send Tradier subscription payload")?;
+                    eprintln!(
+                        "rlean-plugin-tradier: sent subscription symbols={:?}",
+                        signature.symbols
+                    );
                     last_signature = signature;
                 }
             }
@@ -344,6 +351,8 @@ async fn create_market_session(config: &TradierLiveConfig) -> Result<TradierSess
         .bearer_auth(&config.access_token)
         .header("Accept", "application/json")
         .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Content-Length", "0")
+        .body("")
         .send()
         .await?;
     let status = response.status();
@@ -935,6 +944,7 @@ mod tests {
             assert!(request
                 .to_ascii_lowercase()
                 .contains("authorization: bearer test-token"));
+            assert!(request.to_ascii_lowercase().contains("content-length: 0"));
 
             let body = format!(
                 r#"{{"stream":{{"url":"ws://{ws_addr}/v1/markets/events","sessionid":"mock-session"}}}}"#
