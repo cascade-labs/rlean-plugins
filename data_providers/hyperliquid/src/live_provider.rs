@@ -329,10 +329,11 @@ impl DataQueueHandler for HyperliquidLiveDataProvider {
 
 fn market_stream_key(config: &SubscriptionDataConfig) -> String {
     format!(
-        "{}:{}:{:?}",
+        "{}:{}:{:?}:{:?}",
         config.symbol.market().as_str(),
         config.symbol.value,
-        config.resolution
+        config.resolution,
+        config.tick_type
     )
 }
 
@@ -996,6 +997,17 @@ mod tests {
             )),
             "ETH"
         );
+    }
+
+    #[test]
+    fn market_stream_key_keeps_trade_and_quote_streams_separate() {
+        let symbol = hyperliquid_symbol();
+        let trade =
+            SubscriptionDataConfig::new_crypto_future(symbol.clone(), Resolution::Minute);
+        let mut quote = SubscriptionDataConfig::new_crypto_future(symbol, Resolution::Minute);
+        quote.tick_type = TickType::Quote;
+
+        assert_ne!(market_stream_key(&trade), market_stream_key(&quote));
     }
 
     fn l2_message() -> Message {
