@@ -561,6 +561,7 @@ fn message_to_live_items(
             if let Some(quote_bar) = order_book_to_quote_bar(&order_book, resolution) {
                 quote.push(LiveDataItem::QuoteBar(quote_bar));
             }
+            quote.push(LiveDataItem::OrderBook(order_book));
             RoutedLiveItems {
                 trade: Vec::new(),
                 quote,
@@ -1040,8 +1041,15 @@ mod tests {
         let routed = message_to_live_items(&hyperliquid_symbol(), Resolution::Hour, l2_message());
 
         assert!(routed.trade.is_empty());
-        assert_eq!(routed.quote.len(), 1);
-        assert!(matches!(routed.quote[0], LiveDataItem::QuoteBar(_)));
+        assert_eq!(routed.quote.len(), 2);
+        assert!(routed
+            .quote
+            .iter()
+            .any(|item| matches!(item, LiveDataItem::QuoteBar(_))));
+        assert!(routed
+            .quote
+            .iter()
+            .any(|item| matches!(item, LiveDataItem::OrderBook(_))));
 
         let quote_bar = routed
             .quote
@@ -1053,6 +1061,24 @@ mod tests {
             .unwrap();
         assert_eq!(quote_bar.mid_close(), dec!(100.10));
         assert_eq!(quote_bar.period, TimeSpan::from_hours(1));
+    }
+
+    #[test]
+    fn l2_book_routes_full_order_book_to_quote_subscriptions() {
+        let routed = message_to_live_items(&hyperliquid_symbol(), Resolution::Minute, l2_message());
+
+        let order_book = routed
+            .quote
+            .iter()
+            .find_map(|item| match item {
+                LiveDataItem::OrderBook(book) => Some(book),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(order_book.best_bid().unwrap().price, dec!(100.00));
+        assert_eq!(order_book.best_bid().unwrap().size, dec!(5.0));
+        assert_eq!(order_book.best_ask().unwrap().price, dec!(100.20));
+        assert_eq!(order_book.best_ask().unwrap().size, dec!(4.0));
     }
 
     #[test]
@@ -1089,6 +1115,10 @@ mod tests {
         assert!(matches!(
             quote_receiver.try_recv().unwrap().unwrap(),
             LiveDataItem::QuoteBar(_)
+        ));
+        assert!(matches!(
+            quote_receiver.try_recv().unwrap().unwrap(),
+            LiveDataItem::OrderBook(_)
         ));
         assert!(quote_receiver.try_recv().is_err());
     }
