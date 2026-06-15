@@ -97,6 +97,8 @@ pub struct TradierOrder {
     pub duration: TradierOrderDuration,
     #[serde(default)]
     pub price: f64,
+    #[serde(default, alias = "stop")]
+    pub stop_price: f64,
     #[serde(default)]
     pub avg_fill_price: f64,
     #[serde(default)]

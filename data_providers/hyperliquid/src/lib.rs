@@ -6,12 +6,20 @@
 //! raw ticks.
 
 pub mod archive;
+pub mod brokerage;
 pub mod history_provider;
+pub mod live_provider;
+pub mod universe_source;
 
-pub use archive::{ArchiveBuckets, S3ArchiveClient};
+pub use archive::{ArchiveBuckets, ArchiveCredentials, ArchiveRegions, S3ArchiveClient};
+pub use brokerage::{HyperliquidBrokerage, HyperliquidBrokerageConfig};
 pub use history_provider::{HyperliquidArchiveConfig, HyperliquidHistoryProvider};
+pub use live_provider::{HyperliquidLiveConfig, HyperliquidLiveDataProvider};
+pub use universe_source::HyperliquidUniverseDataSource;
 
-use lean_data_providers::IHistoryProvider;
+use lean_brokerages::Brokerage;
+use lean_data::DataQueueHandler;
+use lean_data_providers::{ICustomDataSource, IHistoryProvider};
 use lean_plugin::{rlean_plugin, PluginKind};
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -70,8 +78,19 @@ pub unsafe extern "C" fn rlean_create_history_provider(
         .map(str::to_string)
         .or_else(|| std::env::var("HYPERLIQUID_REQUEST_PAYER").ok())
         .unwrap_or_else(|| "requester".to_string());
+    let regions = ArchiveRegions {
+        market: config_string(&config, "market_region")
+            .or_else(|| std::env::var("HYPERLIQUID_MARKET_REGION").ok())
+            .unwrap_or_else(default_market_region),
+        fills: config_string(&config, "fills_region")
+            .or_else(|| std::env::var("HYPERLIQUID_FILLS_REGION").ok())
+            .unwrap_or_else(default_fills_region),
+    };
+    let credentials = parse_archive_credentials(&config);
 
     let coin_map = parse_coin_map(&config["coin_map"]);
+    let info_url =
+        config_string(&config, "info_url").or_else(|| std::env::var("HYPERLIQUID_INFO_URL").ok());
 
     let archive = S3ArchiveClient::new(
         cache_dir,
@@ -80,14 +99,98 @@ pub unsafe extern "C" fn rlean_create_history_provider(
             fills: fills_bucket,
         },
         request_payer,
+        regions,
+        credentials,
     );
     let provider = Arc::new(HyperliquidHistoryProvider::new(
         &data_root,
         archive,
-        HyperliquidArchiveConfig { coin_map },
+        HyperliquidArchiveConfig { coin_map, info_url },
     ));
     let boxed: Box<Arc<dyn IHistoryProvider>> = Box::new(provider);
     Box::into_raw(boxed) as *mut ()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rlean_create_live_data_provider(
+    config_json: *const std::os::raw::c_char,
+) -> *mut () {
+    let json = unsafe { CStr::from_ptr(config_json) }
+        .to_str()
+        .unwrap_or("{}");
+    let config: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+    let provider: Box<dyn DataQueueHandler> = Box::new(HyperliquidLiveDataProvider::new(
+        HyperliquidLiveConfig::from_json(&config),
+    ));
+    Box::into_raw(Box::new(provider)) as *mut ()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rlean_destroy_live_data_provider(ptr: *mut ()) {
+    if !ptr.is_null() {
+        drop(unsafe { Box::from_raw(ptr as *mut Box<dyn DataQueueHandler>) });
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rlean_create_brokerage(
+    config_json: *const std::os::raw::c_char,
+) -> *mut () {
+    let json = unsafe { CStr::from_ptr(config_json) }
+        .to_str()
+        .unwrap_or("{}");
+    let config: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+    let brokerage = match HyperliquidBrokerage::new(HyperliquidBrokerageConfig::from_json(&config))
+    {
+        Ok(brokerage) => brokerage,
+        Err(error) => {
+            eprintln!("rlean-plugin-hyperliquid: failed to create brokerage: {error}");
+            return std::ptr::null_mut();
+        }
+    };
+    let brokerage: Box<dyn Brokerage> = Box::new(brokerage);
+    Box::into_raw(Box::new(brokerage)) as *mut ()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rlean_destroy_brokerage(ptr: *mut ()) {
+    if !ptr.is_null() {
+        drop(unsafe { Box::from_raw(ptr as *mut Box<dyn Brokerage>) });
+    }
+}
+
+fn parse_archive_credentials(config: &serde_json::Value) -> Option<ArchiveCredentials> {
+    let access_key_id = config_string(config, "aws_access_key_id")
+        .or_else(|| config_string(config, "AWS_ACCESS_KEY_ID"))
+        .or_else(|| std::env::var("AWS_ACCESS_KEY_ID").ok())?;
+    let secret_access_key = config_string(config, "aws_secret_access_key")
+        .or_else(|| config_string(config, "AWS_SECRET_ACCESS_KEY"))
+        .or_else(|| std::env::var("AWS_SECRET_ACCESS_KEY").ok())?;
+    let session_token = config_string(config, "aws_session_token")
+        .or_else(|| config_string(config, "AWS_SESSION_TOKEN"))
+        .or_else(|| std::env::var("AWS_SESSION_TOKEN").ok());
+
+    Some(ArchiveCredentials {
+        access_key_id,
+        secret_access_key,
+        session_token,
+    })
+}
+
+fn config_string(config: &serde_json::Value, key: &str) -> Option<String> {
+    config[key]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn default_market_region() -> String {
+    "us-east-1".to_string()
+}
+
+fn default_fills_region() -> String {
+    "ap-northeast-1".to_string()
 }
 
 fn parse_coin_map(value: &serde_json::Value) -> HashMap<String, String> {
@@ -120,5 +223,24 @@ fn normalise_symbol_key(value: &str) -> String {
 pub unsafe extern "C" fn rlean_destroy_history_provider(ptr: *mut ()) {
     if !ptr.is_null() {
         drop(unsafe { Box::from_raw(ptr as *mut Arc<dyn IHistoryProvider>) });
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rlean_custom_data_factory() -> *mut () {
+    let source: Box<dyn ICustomDataSource> = Box::new(HyperliquidUniverseDataSource::new());
+    Box::into_raw(Box::new(source)) as *mut ()
+}
+
+/// Free a custom data source returned by `rlean_custom_data_factory`.
+///
+/// # Safety
+///
+/// `ptr` must have been returned by `rlean_custom_data_factory` and must not
+/// have been freed already.
+#[no_mangle]
+pub unsafe extern "C" fn rlean_destroy_custom_data_source(ptr: *mut ()) {
+    if !ptr.is_null() {
+        drop(unsafe { Box::from_raw(ptr as *mut Box<dyn ICustomDataSource>) });
     }
 }

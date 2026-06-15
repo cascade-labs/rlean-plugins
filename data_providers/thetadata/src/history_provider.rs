@@ -23,7 +23,7 @@ use lean_core::{
 };
 use lean_data::{Bar as LeanBar, IHistoricalDataProvider, QuoteBar, Tick, TradeBar, TradeBarData};
 use lean_data_providers::TickStream;
-use lean_storage::{OptionUniverseRow, ParquetReader, ParquetWriter, PathResolver, WriterConfig};
+use lean_storage::{OptionUniverseRow, ParquetWriter, PathResolver, WriterConfig};
 
 use crate::client::ThetaDataClient;
 use crate::models::{
@@ -412,6 +412,45 @@ impl ThetaDataHistoryProvider {
             .collect())
     }
 
+    async fn fetch_option_trade_bars_for_contracts(
+        &self,
+        ticker: &str,
+        resolution: Resolution,
+        date: NaiveDate,
+        contracts: &[OptionUniverseRow],
+    ) -> anyhow::Result<Vec<TradeBar>> {
+        if contracts.is_empty() {
+            return Ok(vec![]);
+        }
+        let interval = resolution_to_interval(resolution).ok_or_else(|| {
+            anyhow::anyhow!("ThetaData option trade bars require minute/second/hour resolution")
+        })?;
+        let period = resolution_to_period(resolution)
+            .ok_or_else(|| anyhow::anyhow!("ThetaData option trade bars require bar resolution"))?;
+        let underlying = Symbol::create_equity(ticker, &Market::usa());
+        let allowed = allowed_option_symbol_values(&underlying, contracts);
+        let request_contracts = option_request_contracts(contracts);
+
+        info!(
+            "ThetaData filtered option trade fetch {ticker} {date}: {} contracts",
+            allowed.len()
+        );
+        let rows = self
+            .client
+            .get_option_ohlc_chain_for_contracts_for_date(
+                ticker,
+                date,
+                interval,
+                &request_contracts,
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| option_ohlc_to_trade_bar(&underlying, row, period))
+            .filter(|bar| allowed.contains(bar.symbol.value.as_str()))
+            .collect())
+    }
+
     async fn fetch_option_quote_bars(
         &self,
         ticker: &str,
@@ -541,7 +580,7 @@ impl ThetaDataHistoryProvider {
 
     fn write_option_universe_to_disk(
         &self,
-        ticker: &str,
+        _ticker: &str,
         date: NaiveDate,
         rows: &[OptionUniverseRow],
     ) -> Result<()> {
@@ -549,15 +588,8 @@ impl ThetaDataHistoryProvider {
             return Ok(());
         }
         let path = self.resolver.option_universe_partition(date);
-        let mut merged = if path.exists() {
-            ParquetReader::new().read_option_universe(std::slice::from_ref(&path))?
-        } else {
-            Vec::new()
-        };
-        merged.retain(|row| !row.underlying.eq_ignore_ascii_case(ticker));
-        merged.extend_from_slice(rows);
         self.writer
-            .write_option_universe(&merged, &path)
+            .merge_option_universe_partition(rows, &path)
             .map_err(Into::into)
     }
 
@@ -861,7 +893,11 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
                     self.writer.merge_tick_partition(&rows, &path)?;
                 }
             }
-            DataType::OpenInterest | DataType::FactorFile | DataType::MapFile => {
+            DataType::OpenInterest
+            | DataType::FactorFile
+            | DataType::MapFile
+            | DataType::MarginInterestRate
+            | DataType::PerpetualContext => {
                 return Err(anyhow::anyhow!(
                     "NotImplemented: ThetaData does not provide batched {:?} data",
                     request.data_type
@@ -1036,14 +1072,9 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
         date: chrono::NaiveDate,
         contracts: &[OptionUniverseRow],
     ) -> anyhow::Result<Vec<TradeBar>> {
-        let underlying = Symbol::create_equity(ticker, &Market::usa());
-        let allowed = allowed_option_symbol_values(&underlying, contracts);
-        let mut bars = self
-            .fetch_option_trade_bars(ticker, resolution, date)
+        let bars = self
+            .fetch_option_trade_bars_for_contracts(ticker, resolution, date, contracts)
             .await?;
-        if !allowed.is_empty() {
-            bars.retain(|bar| allowed.contains(bar.symbol.value.as_str()));
-        }
         self.write_option_trade_bars_to_disk(ticker, resolution, date, &bars)?;
         Ok(bars)
     }

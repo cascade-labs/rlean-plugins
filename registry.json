@@ -77,7 +77,7 @@
       "name": "tradier",
       "version": "0.1.0",
       "kind": "brokerage",
-      "description": "Tradier brokerage model (commission-free equities, 2x leverage)",
+      "description": "Tradier brokerage and live equity/option market data",
       "git_url": "https://github.com/cascade-labs/rlean-plugins",
       "subdir": "brokerages/tradier"
     },
