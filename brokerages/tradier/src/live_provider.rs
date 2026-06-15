@@ -238,11 +238,7 @@ async fn run_tradier_stream_once(
     }
 
     let session = create_market_session(config).await?;
-    let ws_url = if session.stream.url.trim().is_empty() {
-        DEFAULT_MARKET_WS_URL.to_string()
-    } else {
-        session.stream.url
-    };
+    let ws_url = tradier_websocket_url(&session.stream.url);
     let (mut socket, _) = tokio_tungstenite::connect_async(&ws_url)
         .await
         .with_context(|| format!("failed to connect Tradier websocket {ws_url}"))?;
@@ -677,6 +673,20 @@ fn tradier_wire_symbol(symbol: &Symbol) -> String {
     }
 }
 
+fn tradier_websocket_url(session_url: &str) -> String {
+    let session_url = session_url.trim();
+    if session_url.is_empty() {
+        return DEFAULT_MARKET_WS_URL.to_string();
+    }
+    if let Some(rest) = session_url.strip_prefix("https://") {
+        return format!("wss://{rest}");
+    }
+    if let Some(rest) = session_url.strip_prefix("http://") {
+        return format!("ws://{rest}");
+    }
+    session_url.to_string()
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct FlexibleDecimal(Decimal);
 
@@ -866,6 +876,23 @@ mod tests {
             }
             other => panic!("unexpected item: {other:?}"),
         }
+    }
+
+    #[test]
+    fn tradier_stream_session_url_is_normalized_for_websocket() {
+        assert_eq!(
+            tradier_websocket_url("https://stream.tradier.com/v1/markets/events"),
+            "wss://stream.tradier.com/v1/markets/events"
+        );
+        assert_eq!(
+            tradier_websocket_url("http://127.0.0.1:1234/v1/markets/events"),
+            "ws://127.0.0.1:1234/v1/markets/events"
+        );
+        assert_eq!(
+            tradier_websocket_url("wss://stream.tradier.com/v1/markets/events"),
+            "wss://stream.tradier.com/v1/markets/events"
+        );
+        assert_eq!(tradier_websocket_url(""), DEFAULT_MARKET_WS_URL);
     }
 
     fn spawn_mock_tradier_stream() -> (String, mpsc::Receiver<String>) {
