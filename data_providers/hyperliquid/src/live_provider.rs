@@ -1002,8 +1002,7 @@ mod tests {
     #[test]
     fn market_stream_key_keeps_trade_and_quote_streams_separate() {
         let symbol = hyperliquid_symbol();
-        let trade =
-            SubscriptionDataConfig::new_crypto_future(symbol.clone(), Resolution::Minute);
+        let trade = SubscriptionDataConfig::new_crypto_future(symbol.clone(), Resolution::Minute);
         let mut quote = SubscriptionDataConfig::new_crypto_future(symbol, Resolution::Minute);
         quote.tick_type = TickType::Quote;
 
