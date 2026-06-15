@@ -155,6 +155,10 @@ impl Brokerage for HyperliquidBrokerage {
         self.connected
     }
 
+    fn uses_local_paper_fills(&self) -> bool {
+        self.config.paper_fill_mode
+    }
+
     fn connect(&mut self) -> LeanResult<()> {
         if !self.config.paper_fill_mode {
             return Err(LeanError::Unsupported(
@@ -329,5 +333,17 @@ mod tests {
         let open = brokerage.get_open_orders();
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].status, OrderStatus::Submitted);
+    }
+
+    #[test]
+    fn paper_mode_uses_local_paper_fills() {
+        let brokerage = HyperliquidBrokerage::new(HyperliquidBrokerageConfig {
+            info_url: DEFAULT_INFO_URL.to_string(),
+            wallet_address: None,
+            paper_fill_mode: true,
+        })
+        .unwrap();
+
+        assert!(brokerage.uses_local_paper_fills());
     }
 }
