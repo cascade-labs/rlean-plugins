@@ -14,6 +14,8 @@ lean-data           = { workspace = true }
 lean-storage        = { workspace = true }
 lean-data-providers = { workspace = true }
 lean-plugin         = { workspace = true }
+lean-brokerages     = { workspace = true }
+lean-orders         = { workspace = true }
 
 tokio        = { workspace = true }
 anyhow       = { workspace = true }
@@ -24,10 +26,13 @@ chrono       = { workspace = true }
 tracing      = { workspace = true }
 async-trait  = { workspace = true }
 rust_decimal = { workspace = true }
+rust_decimal_macros = "1"
 reqwest      = { workspace = true }
 aws-config   = "1"
 aws-sdk-s3   = "1"
 lz4_flex     = { version = "0.11", features = ["frame"] }
+hyperliquid_rust_sdk = "0.6"
+crossbeam-channel = "0.5"
 
 [dev-dependencies]
 tempfile = { workspace = true }

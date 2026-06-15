@@ -6,13 +6,19 @@
 //! raw ticks.
 
 pub mod archive;
+pub mod brokerage;
 pub mod history_provider;
+pub mod live_provider;
 pub mod universe_source;
 
 pub use archive::{ArchiveBuckets, ArchiveCredentials, ArchiveRegions, S3ArchiveClient};
+pub use brokerage::{HyperliquidBrokerage, HyperliquidBrokerageConfig};
 pub use history_provider::{HyperliquidArchiveConfig, HyperliquidHistoryProvider};
+pub use live_provider::{HyperliquidLiveConfig, HyperliquidLiveDataProvider};
 pub use universe_source::HyperliquidUniverseDataSource;
 
+use lean_brokerages::Brokerage;
+use lean_data::DataQueueHandler;
 use lean_data_providers::{ICustomDataSource, IHistoryProvider};
 use lean_plugin::{rlean_plugin, PluginKind};
 use std::collections::HashMap;
@@ -103,6 +109,54 @@ pub unsafe extern "C" fn rlean_create_history_provider(
     ));
     let boxed: Box<Arc<dyn IHistoryProvider>> = Box::new(provider);
     Box::into_raw(boxed) as *mut ()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rlean_create_live_data_provider(
+    config_json: *const std::os::raw::c_char,
+) -> *mut () {
+    let json = unsafe { CStr::from_ptr(config_json) }
+        .to_str()
+        .unwrap_or("{}");
+    let config: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+    let provider: Box<dyn DataQueueHandler> = Box::new(HyperliquidLiveDataProvider::new(
+        HyperliquidLiveConfig::from_json(&config),
+    ));
+    Box::into_raw(Box::new(provider)) as *mut ()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rlean_destroy_live_data_provider(ptr: *mut ()) {
+    if !ptr.is_null() {
+        drop(unsafe { Box::from_raw(ptr as *mut Box<dyn DataQueueHandler>) });
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rlean_create_brokerage(
+    config_json: *const std::os::raw::c_char,
+) -> *mut () {
+    let json = unsafe { CStr::from_ptr(config_json) }
+        .to_str()
+        .unwrap_or("{}");
+    let config: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+    let brokerage = match HyperliquidBrokerage::new(HyperliquidBrokerageConfig::from_json(&config))
+    {
+        Ok(brokerage) => brokerage,
+        Err(error) => {
+            eprintln!("rlean-plugin-hyperliquid: failed to create brokerage: {error}");
+            return std::ptr::null_mut();
+        }
+    };
+    let brokerage: Box<dyn Brokerage> = Box::new(brokerage);
+    Box::into_raw(Box::new(brokerage)) as *mut ()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rlean_destroy_brokerage(ptr: *mut ()) {
+    if !ptr.is_null() {
+        drop(unsafe { Box::from_raw(ptr as *mut Box<dyn Brokerage>) });
+    }
 }
 
 fn parse_archive_credentials(config: &serde_json::Value) -> Option<ArchiveCredentials> {

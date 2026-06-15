@@ -162,6 +162,12 @@ pub struct HyperliquidHistoryProvider {
     writer: ParquetWriter,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ImpactQuoteRatio {
+    bid: Decimal,
+    ask: Decimal,
+}
+
 impl HyperliquidHistoryProvider {
     pub fn new(
         data_root: impl AsRef<Path>,
@@ -213,36 +219,6 @@ impl HyperliquidHistoryProvider {
         }
 
         Ok(bars_by_time.into_values().collect())
-    }
-
-    async fn fetch_trade_bars_from_fills(
-        &self,
-        symbols: &[Symbol],
-        resolution: Resolution,
-        start: DateTime,
-        end: DateTime,
-    ) -> Result<Vec<TradeBar>> {
-        if resolution != Resolution::Minute {
-            return Err(anyhow::anyhow!(
-                "NotImplemented: Hyperliquid fill aggregation currently produces minute trade bars"
-            ));
-        }
-        let symbols_by_coin = self.symbols_by_archive_coin(symbols)?;
-        if symbols_by_coin.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut ticks = Vec::new();
-        for hour in hours_in_range(start, end) {
-            let key = fills_key(hour);
-            let Some(text) = self.archive.fills_text(&key).await? else {
-                continue;
-            };
-            ticks.extend(parse_fill_archive_for_symbols(&text, &symbols_by_coin)?);
-        }
-        ticks.retain(|tick| tick.time >= start && tick.time <= end);
-        sort_and_dedupe_ticks(&mut ticks);
-        aggregate_trade_ticks(&ticks, resolution)
     }
 
     async fn fetch_margin_interest_rates_from_info(
@@ -315,22 +291,6 @@ impl HyperliquidHistoryProvider {
         Ok(())
     }
 
-    fn symbols_by_archive_coin(&self, symbols: &[Symbol]) -> Result<HashMap<String, Vec<Symbol>>> {
-        let mut symbols_by_coin: HashMap<String, Vec<Symbol>> = HashMap::new();
-        for symbol in symbols {
-            validate_hyperliquid_symbol(symbol)?;
-            let coin = self.archive_coin(symbol)?;
-            let entry = symbols_by_coin.entry(archive_coin_key(&coin)).or_default();
-            if !entry
-                .iter()
-                .any(|existing| existing.id.sid == symbol.id.sid)
-            {
-                entry.push(symbol.clone());
-            }
-        }
-        Ok(symbols_by_coin)
-    }
-
     async fn ensure_perpetual_contexts(
         &self,
         symbols: &[Symbol],
@@ -348,9 +308,6 @@ impl HyperliquidHistoryProvider {
         for symbol in symbols {
             validate_hyperliquid_symbol(symbol)?;
             if symbol.security_type() != SecurityType::CryptoFuture {
-                continue;
-            }
-            if is_hip3_symbol(symbol) {
                 continue;
             }
             let coin = self.archive_coin(symbol)?;
@@ -472,6 +429,212 @@ impl HyperliquidHistoryProvider {
         Ok(bars)
     }
 
+    fn read_trade_bars(
+        &self,
+        symbol: &Symbol,
+        resolution: Resolution,
+        start: DateTime,
+        end: DateTime,
+    ) -> Result<Vec<TradeBar>> {
+        let mut bars = Vec::new();
+        let params = QueryParams::new()
+            .with_time_range(start, end)
+            .with_symbols(vec![symbol.id.sid]);
+        for date in dates_in_range(start, end) {
+            let path =
+                self.resolver
+                    .market_data_partition(symbol, resolution, TickType::Trade, date);
+            bars.extend(
+                self.reader
+                    .read_trade_bar_partition(&path, symbol, &params)?,
+            );
+        }
+        bars.sort_by_key(|bar| bar.time.0);
+        Ok(bars)
+    }
+
+    async fn read_or_fetch_trade_bars_from_info(
+        &self,
+        symbols: &[Symbol],
+        resolution: Resolution,
+        start: DateTime,
+        end: DateTime,
+    ) -> Result<Vec<TradeBar>> {
+        let mut output = Vec::new();
+        for symbol in symbols {
+            validate_hyperliquid_symbol(symbol)?;
+            let cached = self.read_trade_bars(symbol, resolution, start, end)?;
+            if !cached.is_empty() {
+                output.extend(cached);
+                continue;
+            }
+
+            let fetched = self
+                .fetch_trade_bars_from_info(symbol, resolution, start, end)
+                .await?;
+            self.write_trade_bars_by_day(symbol, resolution, &fetched)?;
+            output.extend(fetched);
+        }
+        sort_and_dedupe_trade_bars(&mut output);
+        Ok(output)
+    }
+
+    async fn ensure_hip3_quote_bars_from_trade_bars(
+        &self,
+        symbols: &[Symbol],
+        resolution: Resolution,
+        start: DateTime,
+        end: DateTime,
+    ) -> Result<()> {
+        let hip3_symbols = symbols
+            .iter()
+            .filter(|symbol| is_hip3_symbol(symbol))
+            .cloned()
+            .collect::<Vec<_>>();
+        if hip3_symbols.is_empty() {
+            return Ok(());
+        }
+
+        let ratios = self.current_impact_quote_ratios(&hip3_symbols)?;
+        if ratios.is_empty() {
+            return Ok(());
+        }
+
+        let mut trade_bars_by_sid: HashMap<u64, Vec<TradeBar>> = HashMap::new();
+        if resolution == Resolution::Minute {
+            let mut missing_symbols = Vec::new();
+            for symbol in &hip3_symbols {
+                let cached = self.read_trade_bars(symbol, resolution, start, end)?;
+                if cached.is_empty() {
+                    missing_symbols.push(symbol.clone());
+                } else {
+                    trade_bars_by_sid.insert(symbol.id.sid, cached);
+                }
+            }
+
+            if !missing_symbols.is_empty() {
+                let bars = self
+                    .read_or_fetch_trade_bars_from_info(&missing_symbols, resolution, start, end)
+                    .await?;
+                for bar in bars {
+                    trade_bars_by_sid
+                        .entry(bar.symbol.id.sid)
+                        .or_default()
+                        .push(bar);
+                }
+            }
+        }
+
+        let mut quote_bars = Vec::new();
+        for symbol in &hip3_symbols {
+            let coin_key = archive_coin_key(&self.archive_coin(symbol)?);
+            let Some(ratio) = ratios.get(&coin_key).copied() else {
+                continue;
+            };
+
+            let trade_bars = if let Some(bars) = trade_bars_by_sid.get(&symbol.id.sid) {
+                bars.clone()
+            } else {
+                let cached = self.read_trade_bars(symbol, resolution, start, end)?;
+                if !cached.is_empty() {
+                    cached
+                } else {
+                    self.read_or_fetch_trade_bars_from_info(
+                        std::slice::from_ref(symbol),
+                        resolution,
+                        start,
+                        end,
+                    )
+                    .await?
+                }
+            };
+
+            quote_bars.extend(
+                trade_bars
+                    .iter()
+                    .filter_map(|bar| quote_bar_from_trade_bar_with_impact_ratio(bar, ratio)),
+            );
+        }
+
+        sort_and_dedupe_quote_bars(&mut quote_bars);
+        self.write_quote_bars_by_day(resolution, &quote_bars)
+    }
+
+    fn current_impact_quote_ratios(
+        &self,
+        symbols: &[Symbol],
+    ) -> Result<HashMap<String, ImpactQuoteRatio>> {
+        let mut requested_by_dex: HashMap<String, HashSet<String>> = HashMap::new();
+        for symbol in symbols {
+            let coin = self.archive_coin(symbol)?;
+            let Some((dex, _)) = coin.split_once(':') else {
+                continue;
+            };
+            requested_by_dex
+                .entry(dex.to_ascii_lowercase())
+                .or_default()
+                .insert(archive_coin_key(&coin));
+        }
+
+        let mut ratios = HashMap::new();
+        for (dex, requested) in requested_by_dex {
+            let response = self.info.meta_and_asset_ctxs(Some(&dex))?;
+            let Some(array) = response.as_array().filter(|array| array.len() >= 2) else {
+                continue;
+            };
+            let Some(universe) = array[0].get("universe").and_then(Value::as_array) else {
+                continue;
+            };
+            let Some(contexts) = array[1].as_array() else {
+                continue;
+            };
+
+            for (index, asset) in universe.iter().enumerate() {
+                let Some(name) = asset.get("name").and_then(Value::as_str).map(str::trim) else {
+                    continue;
+                };
+                let coin_key = archive_coin_key(name);
+                if !requested.contains(&coin_key) {
+                    continue;
+                }
+                let Some(context) = contexts.get(index) else {
+                    continue;
+                };
+                let Some(mid) =
+                    decimal_field(context, "midPx").or_else(|| decimal_field(context, "markPx"))
+                else {
+                    continue;
+                };
+                let Some(impact_pxs) = context.get("impactPxs").and_then(Value::as_array) else {
+                    continue;
+                };
+                let Some(first) = impact_pxs.first().and_then(parse_decimal) else {
+                    continue;
+                };
+                let Some(second) = impact_pxs.get(1).and_then(parse_decimal) else {
+                    continue;
+                };
+                if mid <= Decimal::ZERO || first <= Decimal::ZERO || second <= Decimal::ZERO {
+                    continue;
+                }
+                let bid = first.min(second);
+                let ask = first.max(second);
+                if ask < bid {
+                    continue;
+                }
+                ratios.insert(
+                    coin_key,
+                    ImpactQuoteRatio {
+                        bid: bid / mid,
+                        ask: ask / mid,
+                    },
+                );
+            }
+        }
+
+        Ok(ratios)
+    }
+
     fn read_perpetual_contexts(
         &self,
         symbol: &Symbol,
@@ -567,39 +730,6 @@ impl HyperliquidHistoryProvider {
                     .read_trade_bar_partition(&path, symbol, &params)?,
             );
             sort_and_dedupe_trade_bars(&mut bars);
-            self.writer.merge_trade_bar_partition(&bars, &path)?;
-            info!(
-                "Hyperliquid: cached {} trade bars to {}",
-                bars.len(),
-                path.display()
-            );
-        }
-        Ok(())
-    }
-
-    fn write_trade_bars_multi_by_day(
-        &self,
-        resolution: Resolution,
-        bars: &[TradeBar],
-    ) -> Result<()> {
-        if bars.is_empty() {
-            return Ok(());
-        }
-        let mut by_date: BTreeMap<NaiveDate, Vec<TradeBar>> = BTreeMap::new();
-        for bar in bars {
-            by_date
-                .entry(bar.time.date_utc())
-                .or_default()
-                .push(bar.clone());
-        }
-        for (date, mut bars) in by_date {
-            sort_and_dedupe_trade_bars(&mut bars);
-            let path = self.resolver.market_data_partition(
-                &bars[0].symbol,
-                resolution,
-                TickType::Trade,
-                date,
-            );
             self.writer.merge_trade_bar_partition(&bars, &path)?;
             info!(
                 "Hyperliquid: cached {} trade bars to {}",
@@ -732,24 +862,23 @@ impl IHistoryProvider for HyperliquidHistoryProvider {
             ));
         }
 
-        let bars = if request.resolution == Resolution::Minute {
-            self.fetch_trade_bars_from_fills(
+        let bars = self
+            .read_or_fetch_trade_bars_from_info(
                 std::slice::from_ref(&request.symbol),
                 request.resolution,
                 request.start,
                 request.end,
             )
-            .await?
-        } else {
-            self.fetch_trade_bars_from_info(
-                &request.symbol,
-                request.resolution,
+            .await?;
+        if !bars.is_empty() && request.symbol.security_type() == SecurityType::CryptoFuture {
+            self.ensure_perpetual_contexts(
+                std::slice::from_ref(&request.symbol),
                 request.start,
                 request.end,
+                request.resolution,
             )
-            .await?
-        };
-        self.write_trade_bars_by_day(&request.symbol, request.resolution, &bars)?;
+            .await?;
+        }
         Ok(bars)
     }
 
@@ -771,10 +900,6 @@ impl IHistoryProvider for HyperliquidHistoryProvider {
                 "NotImplemented: Hyperliquid asset_ctxs does not provide second quote bars"
             ));
         }
-        if is_hip3_symbol(&request.symbol) {
-            return Ok(Vec::new());
-        }
-
         self.ensure_perpetual_contexts(
             std::slice::from_ref(&request.symbol),
             request.start,
@@ -782,12 +907,28 @@ impl IHistoryProvider for HyperliquidHistoryProvider {
             request.resolution,
         )
         .await?;
-        self.read_quote_bars(
+        let mut bars = self.read_quote_bars(
             &request.symbol,
             request.resolution,
             request.start,
             request.end,
-        )
+        )?;
+        if bars.is_empty() && is_hip3_symbol(&request.symbol) {
+            self.ensure_hip3_quote_bars_from_trade_bars(
+                std::slice::from_ref(&request.symbol),
+                request.resolution,
+                request.start,
+                request.end,
+            )
+            .await?;
+            bars = self.read_quote_bars(
+                &request.symbol,
+                request.resolution,
+                request.start,
+                request.end,
+            )?;
+        }
+        Ok(bars)
     }
 
     async fn get_ticks(&self, request: &HistoryRequest) -> Result<Vec<Tick>> {
@@ -888,14 +1029,30 @@ impl IHistoryProvider for HyperliquidHistoryProvider {
         match request.data_type {
             DataType::TradeBar if request.resolution == Resolution::Minute => {
                 let bars = self
-                    .fetch_trade_bars_from_fills(
+                    .read_or_fetch_trade_bars_from_info(
                         &request.symbols,
                         request.resolution,
                         request.start,
                         request.end,
                     )
                     .await?;
-                self.write_trade_bars_multi_by_day(request.resolution, &bars)?;
+                if !bars.is_empty() {
+                    let symbols = request
+                        .symbols
+                        .iter()
+                        .filter(|symbol| symbol.security_type() == SecurityType::CryptoFuture)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if !symbols.is_empty() {
+                        self.ensure_perpetual_contexts(
+                            &symbols,
+                            request.start,
+                            request.end,
+                            request.resolution,
+                        )
+                        .await?;
+                    }
+                }
                 Ok(MarketDataBatch {
                     trade_bars: bars,
                     ..MarketDataBatch::default()
@@ -935,13 +1092,35 @@ impl IHistoryProvider for HyperliquidHistoryProvider {
                 )
                 .await?;
                 let mut batch = MarketDataBatch::default();
+                let mut missing_hip3_symbols = Vec::new();
                 for symbol in &request.symbols {
-                    batch.quote_bars.extend(self.read_quote_bars(
+                    let bars = self.read_quote_bars(
                         symbol,
                         request.resolution,
                         request.start,
                         request.end,
-                    )?);
+                    )?;
+                    if bars.is_empty() && is_hip3_symbol(symbol) {
+                        missing_hip3_symbols.push(symbol.clone());
+                    }
+                    batch.quote_bars.extend(bars);
+                }
+                if !missing_hip3_symbols.is_empty() {
+                    self.ensure_hip3_quote_bars_from_trade_bars(
+                        &missing_hip3_symbols,
+                        request.resolution,
+                        request.start,
+                        request.end,
+                    )
+                    .await?;
+                    for symbol in &missing_hip3_symbols {
+                        batch.quote_bars.extend(self.read_quote_bars(
+                            symbol,
+                            request.resolution,
+                            request.start,
+                            request.end,
+                        )?);
+                    }
                 }
                 Ok(batch)
             }
@@ -1222,6 +1401,41 @@ fn quote_bar_from_perpetual_context(context: &PerpetualContext) -> Option<QuoteB
         TimeSpan::ONE_MINUTE,
         Some(Bar::from_price(context.impact_bid_px)),
         Some(Bar::from_price(context.impact_ask_px)),
+        Decimal::ZERO,
+        Decimal::ZERO,
+    ))
+}
+
+fn quote_bar_from_trade_bar_with_impact_ratio(
+    bar: &TradeBar,
+    ratio: ImpactQuoteRatio,
+) -> Option<QuoteBar> {
+    if ratio.bid <= Decimal::ZERO
+        || ratio.ask <= Decimal::ZERO
+        || ratio.ask < ratio.bid
+        || !bar.is_valid()
+    {
+        return None;
+    }
+
+    let bid = Bar::new(
+        bar.open * ratio.bid,
+        bar.high * ratio.bid,
+        bar.low * ratio.bid,
+        bar.close * ratio.bid,
+    );
+    let ask = Bar::new(
+        bar.open * ratio.ask,
+        bar.high * ratio.ask,
+        bar.low * ratio.ask,
+        bar.close * ratio.ask,
+    );
+    Some(QuoteBar::new(
+        bar.symbol.clone(),
+        bar.time,
+        bar.period,
+        Some(bid),
+        Some(ask),
         Decimal::ZERO,
         Decimal::ZERO,
     ))
@@ -1584,62 +1798,6 @@ fn parse_funding_history(
     Ok(rates)
 }
 
-fn aggregate_trade_ticks(ticks: &[Tick], resolution: Resolution) -> Result<Vec<TradeBar>> {
-    let period = resolution
-        .to_time_span()
-        .with_context(|| format!("resolution {resolution:?} cannot produce trade bars"))?;
-    let mut aggregates: BTreeMap<(u64, i64), TradeBar> = BTreeMap::new();
-
-    let mut sorted = ticks.to_vec();
-    sorted.sort_by_key(|tick| (tick.symbol.id.sid, tick.time.0));
-    for tick in sorted {
-        if !tick.is_trade() || tick.value <= Decimal::ZERO || tick.quantity <= Decimal::ZERO {
-            continue;
-        }
-        let bucket_time = trade_bar_bucket_time(tick.time, resolution)?;
-        let key = (tick.symbol.id.sid, bucket_time.0);
-        match aggregates.get_mut(&key) {
-            Some(existing) => existing.update(tick.value, tick.quantity),
-            None => {
-                aggregates.insert(
-                    key,
-                    TradeBar::new(
-                        tick.symbol.clone(),
-                        bucket_time,
-                        period,
-                        TradeBarData::new(
-                            tick.value,
-                            tick.value,
-                            tick.value,
-                            tick.value,
-                            tick.quantity,
-                        ),
-                    ),
-                );
-            }
-        }
-    }
-
-    let mut output = aggregates.into_values().collect::<Vec<_>>();
-    sort_and_dedupe_trade_bars(&mut output);
-    Ok(output)
-}
-
-fn trade_bar_bucket_time(time: DateTime, resolution: Resolution) -> Result<DateTime> {
-    match resolution {
-        Resolution::Minute => Ok(NanosecondTimestamp(
-            time.0.div_euclid(TimeSpan::ONE_MINUTE.nanos) * TimeSpan::ONE_MINUTE.nanos,
-        )),
-        Resolution::Hour => Ok(NanosecondTimestamp(
-            time.0.div_euclid(TimeSpan::ONE_HOUR.nanos) * TimeSpan::ONE_HOUR.nanos,
-        )),
-        Resolution::Daily => Ok(date_to_datetime(time.date_utc(), 0, 0, 0)),
-        Resolution::Tick | Resolution::Second => Err(anyhow::anyhow!(
-            "NotImplemented: Hyperliquid fills do not support {resolution:?} trade bars"
-        )),
-    }
-}
-
 fn sort_and_dedupe_ticks(ticks: &mut Vec<Tick>) {
     ticks.sort_by(|a, b| {
         (
@@ -1824,6 +1982,22 @@ mod tests {
         assert_eq!(rates[0].time, DateTime::from_millis(1_761_336_000_000));
         assert_eq!(rates[0].interest_rate, Decimal::new(125, 7));
 
+        let cached_trade_bar = TradeBar::new(
+            symbol.clone(),
+            DateTime::from_millis(1_761_336_000_000),
+            TimeSpan::ONE_MINUTE,
+            TradeBarData::new(
+                Decimal::new(3277, 3),
+                Decimal::new(3277, 3),
+                Decimal::new(3277, 3),
+                Decimal::new(3277, 3),
+                Decimal::new(70, 1),
+            ),
+        );
+        provider
+            .write_trade_bars_by_day(&symbol, Resolution::Minute, &[cached_trade_bar])
+            .unwrap();
+
         let trade_bars = provider
             .get_history(&request(
                 symbol.clone(),
@@ -1836,6 +2010,108 @@ mod tests {
         assert_eq!(trade_bars[0].open, Decimal::new(3277, 3));
         assert_eq!(trade_bars[0].close, Decimal::new(3277, 3));
         assert_eq!(trade_bars[0].volume, Decimal::new(70, 1));
+    }
+
+    #[tokio::test]
+    async fn hip3_trade_requests_backfill_impact_quote_bars_from_asset_contexts() {
+        let temp = TempDir::new().unwrap();
+        let provider = provider(&temp, HashMap::new());
+        let symbol = Symbol::create_crypto_future("XYZ:TSLA", &Market::hyperliquid());
+        let cached_trade_bar = TradeBar::new(
+            symbol.clone(),
+            DateTime::from_millis(1_761_336_000_000),
+            TimeSpan::ONE_MINUTE,
+            TradeBarData::new(
+                Decimal::new(25225, 2),
+                Decimal::new(25225, 2),
+                Decimal::new(25225, 2),
+                Decimal::new(25225, 2),
+                Decimal::new(20, 1),
+            ),
+        );
+        provider
+            .write_trade_bars_by_day(&symbol, Resolution::Minute, &[cached_trade_bar])
+            .unwrap();
+        write_cached_archive(
+            &temp,
+            "hyperliquid-archive",
+            "asset_ctxs/20251024.csv.lz4",
+            "time,coin,funding,open_interest,prev_day_px,day_ntl_vlm,premium,oracle_px,mark_px,mid_px,impact_bid_px,impact_ask_px\n\
+2025-10-24 20:00:00.000,xyz:TSLA,0.000031,100.0,250.00,10000.0,0.0002,252.00,252.10,252.20,251.80,252.70\n",
+        );
+
+        let trade_bars = provider
+            .get_history(&request(
+                symbol.clone(),
+                DataType::TradeBar,
+                Resolution::Minute,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(trade_bars.len(), 1);
+        assert_eq!(trade_bars[0].symbol.value, "XYZ:TSLA");
+
+        let cached_quote_bars = provider
+            .read_quote_bars(
+                &symbol,
+                Resolution::Minute,
+                DateTime::from_millis(1_761_336_000_000),
+                DateTime::from_millis(1_761_336_060_000),
+            )
+            .unwrap();
+        assert_eq!(cached_quote_bars.len(), 1);
+        assert_eq!(
+            cached_quote_bars[0].bid.as_ref().unwrap().close,
+            Decimal::new(25180, 2)
+        );
+        assert_eq!(
+            cached_quote_bars[0].ask.as_ref().unwrap().close,
+            Decimal::new(25270, 2)
+        );
+
+        let direct_quote_bars = provider
+            .get_quote_bars(&request(
+                symbol.clone(),
+                DataType::QuoteBar,
+                Resolution::Minute,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(direct_quote_bars.len(), 1);
+        assert_eq!(direct_quote_bars[0].symbol.value, "XYZ:TSLA");
+    }
+
+    #[test]
+    fn derives_quote_bar_from_trade_bar_and_impact_ratios() {
+        let symbol = Symbol::create_crypto_future("XYZ:TSLA", &Market::hyperliquid());
+        let bar = TradeBar::new(
+            symbol.clone(),
+            DateTime::from_millis(1_761_336_000_000),
+            TimeSpan::ONE_HOUR,
+            TradeBarData::new(
+                Decimal::new(1000, 1),
+                Decimal::new(1050, 1),
+                Decimal::new(950, 1),
+                Decimal::new(1020, 1),
+                Decimal::new(25, 0),
+            ),
+        );
+        let quote = quote_bar_from_trade_bar_with_impact_ratio(
+            &bar,
+            ImpactQuoteRatio {
+                bid: Decimal::new(999, 3),
+                ask: Decimal::new(1002, 3),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(quote.symbol, symbol);
+        assert_eq!(quote.period, TimeSpan::ONE_HOUR);
+        assert_eq!(quote.bid.as_ref().unwrap().open, Decimal::new(99900, 3));
+        assert_eq!(quote.ask.as_ref().unwrap().open, Decimal::new(100200, 3));
+        assert_eq!(quote.bid.as_ref().unwrap().close, Decimal::new(101898, 3));
+        assert_eq!(quote.ask.as_ref().unwrap().close, Decimal::new(102204, 3));
+        assert!(quote.ask.as_ref().unwrap().close > quote.bid.as_ref().unwrap().close);
     }
 
     #[test]

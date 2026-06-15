@@ -99,7 +99,7 @@ pub struct ThetaDataClient {
     http: Client,
     access_token: Option<String>,
     base_url: String,
-    limiter: RateLimiter,
+    limiter: Arc<RateLimiter>,
     concurrency: Arc<Semaphore>,
     max_concurrent: usize,
     /// Root of the structured data store.
@@ -195,7 +195,7 @@ impl ThetaDataClient {
             http,
             access_token,
             base_url,
-            limiter: RateLimiter::new(requests_per_second),
+            limiter: Arc::new(RateLimiter::new(requests_per_second)),
             concurrency: Arc::new(Semaphore::new(max_concurrent.max(1))),
             max_concurrent: max_concurrent.max(1),
             data_root: data_root.as_ref().to_path_buf(),
@@ -401,6 +401,38 @@ impl ThetaDataClient {
                 Ok(batch) => rows.extend(batch),
                 Err(e) => warn!(
                     "ThetaData: option OHLC fetch failed for {} {}: {}",
+                    root, date, e
+                ),
+            }
+        }
+        Ok(rows)
+    }
+
+    pub async fn get_option_ohlc_chain_for_contracts_for_date(
+        &self,
+        root: &str,
+        date: NaiveDate,
+        interval: &str,
+        contracts: &[(String, String)],
+    ) -> Result<Vec<V3OptionOhlc>> {
+        let request_groups = grouped_option_requests(contracts);
+        if request_groups.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut rows = Vec::new();
+        for (expiration, _strikes) in request_groups {
+            let params = vec![
+                ("symbol", root.to_string()),
+                ("expiration", expiration),
+                ("strike", "*".to_string()),
+                ("start_date", fmt_date(date)),
+                ("end_date", fmt_date(date)),
+                ("interval", interval.to_string()),
+            ];
+            match self.execute("option/history/ohlc", &params).await {
+                Ok(batch) => rows.extend(batch),
+                Err(e) => warn!(
+                    "ThetaData: filtered option OHLC fetch failed for {} {}: {}",
                     root, date, e
                 ),
             }
@@ -747,12 +779,21 @@ impl ThetaDataClient {
 
         // A date partition can contain other underlyings. It is only a cache hit
         // when the requested root is present in that partition.
-        if let Some(cached) = self.read_cached_option_eod_bars_for_root(&parquet_path, root)? {
-            debug!(
-                "ThetaData: cache hit for {root} on {date} at {}",
-                parquet_path.display()
-            );
-            return Ok(cached);
+        match self.read_cached_option_eod_bars_for_root(&parquet_path, root) {
+            Ok(Some(cached)) => {
+                debug!(
+                    "ThetaData: cache hit for {root} on {date} at {}",
+                    parquet_path.display()
+                );
+                return Ok(cached);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(
+                    "ThetaData: ignoring unreadable option EOD cache for {root} {date} at {}: {e}",
+                    parquet_path.display()
+                );
+            }
         }
 
         // Cache miss — fetch from API, write to disk, return as OptionEodBar.
@@ -769,9 +810,19 @@ impl ThetaDataClient {
         let bars = v3_to_option_eod_bars(root, date, &api_rows);
         if !bars.is_empty() {
             let mut merged = if parquet_path.exists() {
-                self.parquet_reader
+                match self
+                    .parquet_reader
                     .read_option_eod_bars(std::slice::from_ref(&parquet_path))
-                    .unwrap_or_default()
+                {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        warn!(
+                            "ThetaData: replacing unreadable option EOD cache for {date} at {}: {e}",
+                            parquet_path.display()
+                        );
+                        Vec::new()
+                    }
+                }
             } else {
                 Vec::new()
             };
@@ -895,11 +946,18 @@ impl ThetaDataClient {
     /// Execute a v3 NDJSON request, parse each line into `T`.
     ///
     /// Implements rate limiting, concurrency limiting, and retry logic.
-    async fn execute<T: DeserializeOwned>(
-        &self,
-        endpoint: &str,
-        params: &[(&str, String)],
-    ) -> Result<Vec<T>> {
+    async fn execute<T>(&self, endpoint: &str, params: &[(&str, String)]) -> Result<Vec<T>>
+    where
+        T: DeserializeOwned + Send + 'static,
+    {
+        enum ExecuteAttempt<T> {
+            Success(Vec<T>),
+            NoData(u16),
+            RateLimited(Duration),
+            HttpError { status: u16, body: String },
+            RequestError(String),
+        }
+
         let mut query = format!(
             "{}{API_VERSION}/{}?format=ndjson",
             self.base_url,
@@ -917,85 +975,116 @@ impl ThetaDataClient {
         let mut gen_retries: u32 = 0;
 
         loop {
-            self.limiter.wait();
             let permit = self
                 .concurrency
                 .clone()
                 .acquire_owned()
                 .await
                 .expect("ThetaData concurrency semaphore closed");
-            let mut req = self.http.get(&query);
-            if let Some(token) = &self.access_token {
-                req = req.bearer_auth(token);
-            }
-            let resp = match req.send() {
-                Ok(r) => {
-                    drop(permit);
-                    r
+            let http = self.http.clone();
+            let access_token = self.access_token.clone();
+            let limiter = Arc::clone(&self.limiter);
+            let query_for_request = query.clone();
+
+            let (tx, rx) = futures::channel::oneshot::channel();
+            std::thread::Builder::new()
+                .name("thetadata-request".to_string())
+                .spawn(move || {
+                    let result = (|| -> Result<ExecuteAttempt<T>> {
+                        let _permit = permit;
+                        limiter.wait();
+                        let mut req = http.get(&query_for_request);
+                        if let Some(token) = &access_token {
+                            req = req.bearer_auth(token);
+                        }
+
+                        let resp = match req.send() {
+                            Ok(r) => r,
+                            Err(e) => return Ok(ExecuteAttempt::RequestError(e.to_string())),
+                        };
+
+                        let status = resp.status().as_u16();
+
+                        // "No data" codes — empty result, not an error.
+                        if matches!(status, 472 | 475 | 572) {
+                            return Ok(ExecuteAttempt::NoData(status));
+                        }
+
+                        // Rate limit — exponential back-off + jitter.
+                        if status == 429 {
+                            let delay = retry_after_delay(&resp).unwrap_or_else(|| {
+                                Duration::from_millis(
+                                    (2u64.pow(rl_retries + 1)) * 1000 + (rand_jitter() as u64),
+                                )
+                            });
+                            return Ok(ExecuteAttempt::RateLimited(delay));
+                        }
+
+                        if !resp.status().is_success() {
+                            let body = resp.text().unwrap_or_default();
+                            return Ok(ExecuteAttempt::HttpError { status, body });
+                        }
+
+                        let mut result = Vec::new();
+                        for line in BufReader::new(resp).lines() {
+                            let line = line?;
+                            let trimmed = line.trim();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            match serde_json::from_str::<T>(trimmed) {
+                                Ok(item) => result.push(item),
+                                Err(e) => debug!("ThetaData: skipping malformed row: {e}"),
+                            }
+                        }
+                        Ok(ExecuteAttempt::Success(result))
+                    })();
+                    let _ = tx.send(result);
+                })?;
+            let attempt = rx
+                .await
+                .map_err(|_| anyhow::anyhow!("ThetaData request worker dropped response"))??;
+
+            match attempt {
+                ExecuteAttempt::Success(result) => return Ok(result),
+                ExecuteAttempt::NoData(status) => {
+                    debug!("ThetaData: no data ({status}) for {endpoint}");
+                    return Ok(Vec::new());
                 }
-                Err(e) if gen_retries < MAX_RETRIES => {
-                    drop(permit);
-                    gen_retries += 1;
-                    warn!("ThetaData: request error (retry {gen_retries}): {e}");
-                    std::thread::sleep(Duration::from_secs(gen_retries as u64));
+                ExecuteAttempt::RateLimited(delay) => {
+                    if rl_retries >= MAX_RATE_LIMIT_RETRIES {
+                        bail!(
+                            "ThetaData: rate limit exceeded after {MAX_RATE_LIMIT_RETRIES} retries"
+                        );
+                    }
+                    rl_retries += 1;
+                    self.limiter.cool_down(delay);
+                    warn!(
+                        "ThetaData: rate limited (429), cooling down shared limiter for {:.1}s",
+                        delay.as_secs_f64()
+                    );
+                    sleep_compat(delay).await?;
                     continue;
                 }
-                Err(e) => {
-                    drop(permit);
-                    bail!("ThetaData: {e}");
+                ExecuteAttempt::RequestError(error) => {
+                    if gen_retries < MAX_RETRIES {
+                        gen_retries += 1;
+                        warn!("ThetaData: request error (retry {gen_retries}): {error}");
+                        sleep_compat(Duration::from_secs(gen_retries as u64)).await?;
+                        continue;
+                    }
+                    bail!("ThetaData: {error}");
                 }
-            };
-
-            let status = resp.status().as_u16();
-
-            // "No data" codes — empty result, not an error.
-            if matches!(status, 472 | 475 | 572) {
-                debug!("ThetaData: no data ({status}) for {endpoint}");
-                return Ok(Vec::new());
-            }
-
-            // Rate limit — exponential back-off + jitter.
-            if status == 429 {
-                if rl_retries >= MAX_RATE_LIMIT_RETRIES {
-                    bail!("ThetaData: rate limit exceeded after {MAX_RATE_LIMIT_RETRIES} retries");
-                }
-                rl_retries += 1;
-                let delay = retry_after_delay(&resp).unwrap_or_else(|| {
-                    Duration::from_millis((2u64.pow(rl_retries)) * 1000 + (rand_jitter() as u64))
-                });
-                self.limiter.cool_down(delay);
-                warn!(
-                    "ThetaData: rate limited (429), cooling down shared limiter for {:.1}s",
-                    delay.as_secs_f64()
-                );
-                std::thread::sleep(delay);
-                continue;
-            }
-
-            if !resp.status().is_success() {
-                let body = resp.text().unwrap_or_default();
-                if gen_retries < MAX_RETRIES {
-                    gen_retries += 1;
-                    warn!("ThetaData: HTTP {status} (retry {gen_retries}): {body}");
-                    std::thread::sleep(Duration::from_secs(gen_retries as u64));
-                    continue;
-                }
-                bail!("ThetaData: HTTP {status} for {endpoint}: {body}");
-            }
-
-            let body = resp.text()?;
-            let mut result = Vec::new();
-            for line in body.lines() {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<T>(trimmed) {
-                    Ok(item) => result.push(item),
-                    Err(e) => debug!("ThetaData: skipping malformed row: {e}"),
+                ExecuteAttempt::HttpError { status, body } => {
+                    if gen_retries < MAX_RETRIES {
+                        gen_retries += 1;
+                        warn!("ThetaData: HTTP {status} (retry {gen_retries}): {body}");
+                        sleep_compat(Duration::from_secs(gen_retries as u64)).await?;
+                        continue;
+                    }
+                    bail!("ThetaData: HTTP {status} for {endpoint}: {body}");
                 }
             }
-            return Ok(result);
         }
     }
 
@@ -1395,6 +1484,19 @@ fn urlencoded(s: &str) -> String {
             c => format!("%{:02X}", c as u32),
         })
         .collect()
+}
+
+async fn sleep_compat(duration: Duration) -> Result<()> {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    std::thread::Builder::new()
+        .name("thetadata-sleep".to_string())
+        .spawn(move || {
+            std::thread::sleep(duration);
+            let _ = tx.send(());
+        })?;
+    rx.await
+        .map_err(|_| anyhow::anyhow!("ThetaData sleep worker dropped response"))?;
+    Ok(())
 }
 
 /// Cheap pseudo-jitter (0–499 ms) without pulling in `rand`.

@@ -70,7 +70,7 @@ impl HyperliquidUniverseDataSource {
         config: &CustomDataConfig,
     ) -> Result<Option<PathBuf>> {
         let path = self.raw_path(ticker, date);
-        if path.exists() {
+        if path.exists() && !raw_file_needs_impact_backfill(&path, ticker, config) {
             return Ok(Some(path));
         }
 
@@ -477,6 +477,30 @@ impl HyperliquidUniverseDataSource {
     }
 }
 
+fn raw_file_needs_impact_backfill(path: &PathBuf, ticker: &str, config: &CustomDataConfig) -> bool {
+    let universe = normalize_universe(
+        config
+            .properties
+            .get("universe")
+            .map(String::as_str)
+            .unwrap_or(ticker),
+    );
+    if !universe.starts_with("HIP3_") {
+        return false;
+    }
+
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    text.lines().skip(1).any(|line| {
+        let Some(row) = UniverseCsvRow::parse(line) else {
+            return false;
+        };
+        row.source == "info_api_candle"
+            && (row.impact_bid_px.trim().is_empty() || row.impact_ask_px.trim().is_empty())
+    })
+}
+
 impl Default for HyperliquidUniverseDataSource {
     fn default() -> Self {
         Self::new()
@@ -813,6 +837,8 @@ struct PerpMetadata {
     max_leverage: i64,
     sz_decimals: Option<i64>,
     index: Option<i64>,
+    impact_bid_ratio: Option<Decimal>,
+    impact_ask_ratio: Option<Decimal>,
 }
 
 fn load_current_perp_metadata(
@@ -832,6 +858,7 @@ fn load_current_perp_metadata(
         .ok_or_else(|| {
             anyhow::anyhow!("Hyperliquid metaAndAssetCtxs response missing meta.universe")
         })?;
+    let contexts = array.get(1).and_then(Value::as_array);
     let mut metadata = HashMap::new();
     for (index, asset) in universe_rows.iter().enumerate() {
         let Some(name) = asset.get("name").and_then(Value::as_str).map(str::trim) else {
@@ -845,6 +872,11 @@ fn load_current_perp_metadata(
             .and_then(Value::as_i64)
             .or_else(|| asset.get("max_leverage").and_then(Value::as_i64))
             .with_context(|| format!("Hyperliquid metadata for {name} missing maxLeverage"))?;
+        let (impact_bid_ratio, impact_ask_ratio) = contexts
+            .and_then(|contexts| contexts.get(index))
+            .and_then(impact_quote_ratios_from_context)
+            .map(|(bid, ask)| (Some(bid), Some(ask)))
+            .unwrap_or((None, None));
         metadata.insert(
             archive_coin_key(name),
             PerpMetadata {
@@ -855,10 +887,29 @@ fn load_current_perp_metadata(
                     .get("index")
                     .and_then(Value::as_i64)
                     .or(Some(index as i64)),
+                impact_bid_ratio,
+                impact_ask_ratio,
             },
         );
     }
     Ok(metadata)
+}
+
+fn impact_quote_ratios_from_context(context: &Value) -> Option<(Decimal, Decimal)> {
+    let mid = decimal_field(context, "midPx").or_else(|| decimal_field(context, "markPx"))?;
+    let impact_pxs = context.get("impactPxs").and_then(Value::as_array)?;
+    let first = impact_pxs.first().and_then(decimal_value)?;
+    let second = impact_pxs.get(1).and_then(decimal_value)?;
+    if mid <= Decimal::ZERO || first <= Decimal::ZERO || second <= Decimal::ZERO {
+        return None;
+    }
+
+    let bid = first.min(second);
+    let ask = first.max(second);
+    if ask < bid {
+        return None;
+    }
+    Some((bid / mid, ask / mid))
 }
 
 fn parse_candle_history_rows(
@@ -971,8 +1022,8 @@ fn universe_row_from_candle(
         oracle_px: None,
         mark_px: Some(candle.close),
         mid_px: Some(candle.close),
-        impact_bid_px: None,
-        impact_ask_px: None,
+        impact_bid_px: metadata.impact_bid_ratio.map(|ratio| candle.close * ratio),
+        impact_ask_px: metadata.impact_ask_ratio.map(|ratio| candle.close * ratio),
         max_leverage: Some(metadata.max_leverage),
         sz_decimals: metadata.sz_decimals,
         index: metadata.index,
@@ -1457,6 +1508,10 @@ fn parse_decimal(raw: &str) -> Option<Decimal> {
 
 fn decimal_field(value: &Value, field: &str) -> Option<Decimal> {
     let value = value.get(field)?;
+    decimal_value(value)
+}
+
+fn decimal_value(value: &Value) -> Option<Decimal> {
     if let Some(raw) = value.as_str() {
         return parse_decimal(raw);
     }
@@ -1586,6 +1641,8 @@ time,coin,funding,open_interest,prev_day_px,day_ntl_vlm,premium,oracle_px,mark_p
                 max_leverage: 3,
                 sz_decimals: Some(2),
                 index: Some(7),
+                impact_bid_ratio: None,
+                impact_ask_ratio: None,
             },
         )]);
         let rows = parse_asset_ctx_universe_rows(
@@ -1760,6 +1817,8 @@ time,coin,funding,open_interest,prev_day_px,day_ntl_vlm,premium,oracle_px,mark_p
             max_leverage: 3,
             sz_decimals: Some(2),
             index: Some(7),
+            impact_bid_ratio: Some(Decimal::new(99, 2)),
+            impact_ask_ratio: Some(Decimal::new(101, 2)),
         };
 
         let universe_row = universe_row_from_candle(
@@ -1777,6 +1836,8 @@ time,coin,funding,open_interest,prev_day_px,day_ntl_vlm,premium,oracle_px,mark_p
         assert_eq!(universe_row.day_ntl_vlm, Some(Decimal::new(25500, 1)));
         assert_eq!(universe_row.funding, Some(Decimal::new(-125, 7)));
         assert_eq!(universe_row.max_leverage, Some(3));
+        assert_eq!(universe_row.impact_bid_px, Some(Decimal::new(25245, 2)));
+        assert_eq!(universe_row.impact_ask_px, Some(Decimal::new(25755, 2)));
 
         let temp = tempfile::TempDir::new().unwrap();
         let path = temp.path().join("xyz_TSLA_candles.csv");
