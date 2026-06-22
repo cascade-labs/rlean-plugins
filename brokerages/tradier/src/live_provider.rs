@@ -17,6 +17,7 @@ use lean_data::{
     LiveDataSubscriptionConfig, LiveNodePacket, QuoteBar, SubscriptionDataConfig, Tick, TradeBar,
     TradeBarData,
 };
+use lean_plugin::ensure_crypto_provider;
 use reqwest::Client;
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
@@ -90,6 +91,8 @@ pub struct TradierLiveDataProvider {
 
 impl TradierLiveDataProvider {
     pub fn new(config: TradierLiveConfig) -> Self {
+        ensure_crypto_provider();
+
         Self {
             config,
             state: Arc::new(Mutex::new(TradierLiveState::default())),
@@ -109,15 +112,40 @@ impl TradierLiveDataProvider {
         self.worker = Some(
             std::thread::Builder::new()
                 .name("tradier-live-market-worker".to_string())
-                .spawn(move || {
-                    let runtime = tokio::runtime::Builder::new_multi_thread()
-                        .worker_threads(2)
-                        .enable_all()
-                        .thread_name("tradier-live-worker")
-                        .build();
-                    match runtime {
-                        Ok(runtime) => runtime.block_on(run_tradier_stream(config, state, stop)),
-                        Err(error) => error!("Tradier live provider failed to start: {error}"),
+                .spawn(move || loop {
+                    ensure_crypto_provider();
+                    let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let runtime = tokio::runtime::Builder::new_multi_thread()
+                            .worker_threads(2)
+                            .enable_all()
+                            .thread_name("tradier-live-worker")
+                            .build();
+                        match runtime {
+                            Ok(runtime) => runtime.block_on(run_tradier_stream(
+                                config.clone(),
+                                state.clone(),
+                                stop.clone(),
+                            )),
+                            Err(error) => {
+                                error!("Tradier live provider failed to start: {error}");
+                            }
+                        }
+                    }));
+
+                    match run_result {
+                        Ok(()) => break,
+                        Err(payload) => {
+                            set_connected(&state, false);
+                            if stop.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let message = panic_message(payload.as_ref());
+                            error!("Tradier live provider worker panicked: {message}; restarting");
+                            eprintln!(
+                                "rlean-plugin-tradier: live worker panicked: {message}; restarting"
+                            );
+                            std::thread::sleep(config.reconnect_delay);
+                        }
                     }
                 })
                 .expect("failed to spawn Tradier live worker"),
@@ -341,6 +369,8 @@ fn set_connected(state: &Arc<Mutex<TradierLiveState>>, connected: bool) {
 }
 
 async fn create_market_session(config: &TradierLiveConfig) -> Result<TradierSessionResponse> {
+    ensure_crypto_provider();
+
     let http = Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -429,6 +459,16 @@ fn fanout_error(state: &Arc<Mutex<TradierLiveState>>, error: String) {
 fn is_session_auth_error(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     error.contains("unauthorized") || error.contains("forbidden")
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "unknown panic payload".to_string()
 }
 
 #[derive(Debug, Deserialize)]

@@ -5,6 +5,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
+use lean_plugin::ensure_crypto_provider;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -63,6 +64,8 @@ pub struct TradierClient {
 impl TradierClient {
     /// Create a live or sandbox client.
     pub fn new(access_token: String, use_sandbox: bool) -> Self {
+        ensure_crypto_provider();
+
         let http = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()

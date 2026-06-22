@@ -11,7 +11,7 @@ pub use live_provider::{TradierLiveConfig, TradierLiveDataProvider};
 
 use lean_brokerages::Brokerage;
 use lean_data::DataQueueHandler;
-use lean_plugin::{rlean_plugin, PluginKind};
+use lean_plugin::{ensure_crypto_provider, rlean_plugin, PluginKind};
 use std::ffi::CStr;
 
 rlean_plugin! {
@@ -24,6 +24,8 @@ rlean_plugin! {
 pub unsafe extern "C" fn rlean_create_brokerage(
     config_json: *const std::os::raw::c_char,
 ) -> *mut () {
+    ensure_crypto_provider();
+
     let json = unsafe { CStr::from_ptr(config_json) }
         .to_str()
         .unwrap_or("{}");
@@ -66,6 +68,8 @@ pub unsafe extern "C" fn rlean_destroy_brokerage(ptr: *mut ()) {
 pub unsafe extern "C" fn rlean_create_live_data_provider(
     config_json: *const std::os::raw::c_char,
 ) -> *mut () {
+    ensure_crypto_provider();
+
     let json = unsafe { CStr::from_ptr(config_json) }
         .to_str()
         .unwrap_or("{}");
