@@ -1,23 +1,61 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use lean_core::{DateTime, Resolution, SecurityType, TimeSpan};
 use lean_data::{TradeBar, TradeBarData};
 use lean_data_providers::{DataType, HistoryRequest, IHistoryProvider};
+use lean_plugin::ensure_crypto_provider;
+use reqwest::blocking::Client;
+use reqwest::StatusCode;
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
+use serde::de::DeserializeOwned;
+use serde_json::Value;
+use std::time::Duration;
 use tracing::debug;
 
-use crate::client::TradierClient;
-use crate::models::TradierQuote;
+use crate::models::{TradierQuote, TradierQuoteContainer};
+
+const LIVE_BASE: &str = "https://api.tradier.com/v1";
+const SANDBOX_BASE: &str = "https://sandbox.tradier.com/v1";
 
 pub struct TradierHistoryProvider {
-    client: TradierClient,
+    http: Client,
+    base_url: String,
+    access_token: String,
 }
 
 impl TradierHistoryProvider {
     pub fn new(access_token: String, use_sandbox: bool) -> Self {
+        ensure_crypto_provider();
+
         Self {
-            client: TradierClient::new(access_token, use_sandbox),
+            http: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("failed to build reqwest blocking client"),
+            base_url: if use_sandbox { SANDBOX_BASE } else { LIVE_BASE }.to_string(),
+            access_token,
         }
+    }
+
+    fn get_quotes(&self, symbols: &[&str]) -> Result<Vec<TradierQuote>> {
+        if symbols.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let csv = symbols.join(",");
+        let url = format!(
+            "{}/markets/quotes?symbols={csv}&greeks=false",
+            self.base_url
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.access_token)
+            .header("Accept", "application/json")
+            .send()?;
+        check_status(resp.status())?;
+        let container: TradierQuoteContainer = resp.json()?;
+        Ok(normalize_quote_list(container))
     }
 }
 
@@ -32,7 +70,7 @@ impl IHistoryProvider for TradierHistoryProvider {
         }
 
         let ticker = request.symbol.value.as_str();
-        let quotes = self.client.get_quotes(&[ticker]).await?;
+        let quotes = self.get_quotes(&[ticker])?;
         let Some(quote) = quotes
             .into_iter()
             .find(|quote| quote.symbol.eq_ignore_ascii_case(ticker))
@@ -46,6 +84,32 @@ impl IHistoryProvider for TradierHistoryProvider {
             return Ok(Vec::new());
         };
         Ok(vec![bar])
+    }
+}
+
+fn check_status(status: StatusCode) -> Result<()> {
+    if status == StatusCode::UNAUTHORIZED {
+        bail!("Tradier: unauthorized (check access token)");
+    }
+    if !status.is_success() {
+        bail!("Tradier HTTP error: {status}");
+    }
+    Ok(())
+}
+
+fn normalize_quote_list(container: TradierQuoteContainer) -> Vec<TradierQuote> {
+    let wrapper = match container.quotes {
+        None => return Vec::new(),
+        Some(w) => w,
+    };
+    parse_single_or_array(wrapper.quote).unwrap_or_default()
+}
+
+fn parse_single_or_array<T: DeserializeOwned>(v: Value) -> Option<Vec<T>> {
+    match &v {
+        Value::Array(_) => serde_json::from_value(v).ok(),
+        Value::Object(_) => serde_json::from_value::<T>(v).ok().map(|x| vec![x]),
+        _ => None,
     }
 }
 
