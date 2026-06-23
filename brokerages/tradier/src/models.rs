@@ -1,5 +1,7 @@
 /// Tradier REST API response types.
+use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize};
+use std::str::FromStr;
 
 // ─── Enums ────────────────────────────────────────────────────────────────────
 
@@ -155,7 +157,8 @@ pub struct TradierOrdersWrapper {
 pub struct TradierPosition {
     pub id: i64,
     pub date_acquired: String,
-    pub quantity: i64,
+    #[serde(deserialize_with = "decimal_from_json_number")]
+    pub quantity: Decimal,
     pub cost_basis: f64,
     pub symbol: String,
 }
@@ -259,9 +262,26 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+fn decimal_from_json_number<'de, D>(deserializer: D) -> Result<Decimal, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Number(number) => Decimal::from_str(&number.to_string())
+            .map_err(|error| serde::de::Error::custom(error.to_string())),
+        serde_json::Value::String(value) => Decimal::from_str(value.trim())
+            .map_err(|error| serde::de::Error::custom(error.to_string())),
+        other => Err(serde::de::Error::custom(format!(
+            "expected numeric decimal, got {other}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
 
     // ── TradierQuote JSON parsing ─────────────────────────────────────────────
 
@@ -776,8 +796,22 @@ mod tests {
         let pos: TradierPosition = serde_json::from_str(json).expect("should parse");
         assert_eq!(pos.id, 42);
         assert_eq!(pos.symbol, "AAPL");
-        assert_eq!(pos.quantity, 200);
+        assert_eq!(pos.quantity, dec!(200));
         assert!((pos.cost_basis - 36_000.00).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_tradier_parse_position_float_quantity() {
+        let json = r#"{
+            "id": 43,
+            "date_acquired": "2026-06-23T00:00:00.000Z",
+            "quantity": 310.0,
+            "cost_basis": 9258.41,
+            "symbol": "AA"
+        }"#;
+        let pos: TradierPosition = serde_json::from_str(json).expect("should parse");
+        assert_eq!(pos.symbol, "AA");
+        assert_eq!(pos.quantity, dec!(310.0));
     }
 
     // ── Client URL construction ───────────────────────────────────────────────

@@ -94,13 +94,13 @@ impl TradierClient {
     pub async fn get_positions(&self, account_id: &str) -> Result<Vec<TradierPosition>> {
         let path = format!("accounts/{account_id}/positions");
         let container: TradierPositionsContainer = self.get_standard(&path).await?;
-        Ok(normalize_position_list(container))
+        normalize_position_list(container)
     }
 
     pub async fn get_orders(&self, account_id: &str) -> Result<Vec<TradierOrder>> {
         let path = format!("accounts/{account_id}/orders");
         let container: TradierOrdersContainer = self.get_standard(&path).await?;
-        Ok(normalize_order_list(container))
+        normalize_order_list(container)
     }
 
     // ─── Order operations ────────────────────────────────────────────────────
@@ -195,7 +195,7 @@ impl TradierClient {
             .await?;
         check_status(&resp)?;
         let container: TradierQuoteContainer = resp.json().await?;
-        Ok(normalize_quote_list(container))
+        normalize_quote_list(container)
     }
 
     // ─── Internal ────────────────────────────────────────────────────────────
@@ -232,34 +232,34 @@ fn check_status(resp: &reqwest::Response) -> Result<()> {
 
 /// Tradier returns a single object when there is one position, and an array
 /// when there are multiple.  Normalize to Vec.
-fn normalize_position_list(container: TradierPositionsContainer) -> Vec<TradierPosition> {
+fn normalize_position_list(container: TradierPositionsContainer) -> Result<Vec<TradierPosition>> {
     let wrapper = match container.positions {
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
         Some(w) => w,
     };
-    parse_single_or_array(wrapper.position).unwrap_or_default()
+    parse_single_or_array(wrapper.position)
 }
 
-fn normalize_order_list(container: TradierOrdersContainer) -> Vec<TradierOrder> {
+fn normalize_order_list(container: TradierOrdersContainer) -> Result<Vec<TradierOrder>> {
     let wrapper = match container.orders {
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
         Some(w) => w,
     };
-    parse_single_or_array(wrapper.order).unwrap_or_default()
+    parse_single_or_array(wrapper.order)
 }
 
-fn normalize_quote_list(container: TradierQuoteContainer) -> Vec<TradierQuote> {
+fn normalize_quote_list(container: TradierQuoteContainer) -> Result<Vec<TradierQuote>> {
     let wrapper = match container.quotes {
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
         Some(w) => w,
     };
-    parse_single_or_array(wrapper.quote).unwrap_or_default()
+    parse_single_or_array(wrapper.quote)
 }
 
-fn parse_single_or_array<T: DeserializeOwned>(v: Value) -> Option<Vec<T>> {
-    match &v {
-        Value::Array(_) => serde_json::from_value(v).ok(),
-        Value::Object(_) => serde_json::from_value::<T>(v).ok().map(|x| vec![x]),
-        _ => None,
+fn parse_single_or_array<T: DeserializeOwned>(v: Value) -> Result<Vec<T>> {
+    match v {
+        Value::Array(_) => Ok(serde_json::from_value(v)?),
+        Value::Object(_) => Ok(vec![serde_json::from_value(v)?]),
+        other => bail!("expected object or array, got {other}"),
     }
 }

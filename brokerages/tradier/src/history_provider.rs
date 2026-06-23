@@ -53,7 +53,7 @@ impl TradierHistoryProvider {
             .send()?;
         check_status(resp.status())?;
         let container: TradierQuoteContainer = resp.json()?;
-        Ok(normalize_quote_list(container))
+        normalize_quote_list(container)
     }
 }
 
@@ -95,19 +95,19 @@ fn check_status(status: StatusCode) -> Result<()> {
     Ok(())
 }
 
-fn normalize_quote_list(container: TradierQuoteContainer) -> Vec<TradierQuote> {
+fn normalize_quote_list(container: TradierQuoteContainer) -> Result<Vec<TradierQuote>> {
     let wrapper = match container.quotes {
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
         Some(w) => w,
     };
-    parse_single_or_array(wrapper.quote).unwrap_or_default()
+    parse_single_or_array(wrapper.quote)
 }
 
-fn parse_single_or_array<T: DeserializeOwned>(v: Value) -> Option<Vec<T>> {
-    match &v {
-        Value::Array(_) => serde_json::from_value(v).ok(),
-        Value::Object(_) => serde_json::from_value::<T>(v).ok().map(|x| vec![x]),
-        _ => None,
+fn parse_single_or_array<T: DeserializeOwned>(v: Value) -> Result<Vec<T>> {
+    match v {
+        Value::Array(_) => Ok(serde_json::from_value(v)?),
+        Value::Object(_) => Ok(vec![serde_json::from_value(v)?]),
+        other => bail!("expected object or array, got {other}"),
     }
 }
 

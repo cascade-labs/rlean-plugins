@@ -12,8 +12,7 @@ use rust_decimal::Decimal;
 use tracing::{error, info, warn};
 
 use lean_core::{
-    DateTime, Market, OptionRight, OptionStyle, Price, Quantity, SecurityType, Symbol,
-    SymbolOptionsExt,
+    DateTime, Market, OptionRight, OptionStyle, Price, SecurityType, Symbol, SymbolOptionsExt,
 };
 use lean_orders::{Order, OrderStatus, OrderType, TimeInForce, UpdateOrderRequest};
 
@@ -47,7 +46,7 @@ impl TradierBrokerage {
     }
 
     /// Retrieve live open positions as (symbol → quantity).
-    pub async fn fetch_positions(&self) -> Result<HashMap<String, i64>> {
+    pub async fn fetch_positions(&self) -> Result<HashMap<String, Decimal>> {
         let positions = self.client.get_positions(&self.account_id).await?;
         Ok(positions
             .into_iter()
@@ -255,8 +254,7 @@ impl Brokerage for TradierBrokerage {
                 .map(|(ticker, qty)| {
                     let symbol = parse_osi_symbol(&ticker)
                         .unwrap_or_else(|| Symbol::create_equity(&ticker, &Market::usa()));
-                    let quantity = Quantity::from(qty);
-                    (symbol, quantity)
+                    (symbol, qty)
                 })
                 .collect(),
             Err(e) => {
@@ -273,7 +271,6 @@ impl Brokerage for TradierBrokerage {
                 .filter_map(|position| {
                     let symbol = parse_osi_symbol(&position.symbol)
                         .unwrap_or_else(|| Symbol::create_equity(&position.symbol, &Market::usa()));
-                    let quantity = Quantity::from(position.quantity);
                     let average_price = average_price_from_cost_basis(
                         position.cost_basis,
                         position.quantity,
@@ -281,7 +278,7 @@ impl Brokerage for TradierBrokerage {
                     );
                     Some(BrokerageHolding {
                         symbol,
-                        quantity,
+                        quantity: position.quantity,
                         average_price,
                     })
                 })
@@ -309,7 +306,7 @@ impl TradierBrokerage {
                     wire.order_symbol(),
                     error
                 );
-                0
+                Decimal::ZERO
             });
         let legs = split_cross_zero_order(order.quantity, current_position);
         let mut tradier_ids = Vec::with_capacity(legs.len());
@@ -401,13 +398,13 @@ impl TradierBrokerage {
         Ok(())
     }
 
-    async fn current_position_quantity(&self, symbol: &str) -> Result<i64> {
+    async fn current_position_quantity(&self, symbol: &str) -> Result<Decimal> {
         let positions = self.client.get_positions(&self.account_id).await?;
         Ok(positions
             .into_iter()
             .find(|position| position.symbol.eq_ignore_ascii_case(symbol))
             .map(|position| position.quantity)
-            .unwrap_or_default())
+            .unwrap_or(Decimal::ZERO))
     }
 }
 
@@ -428,15 +425,15 @@ fn brokerage_contract_multiplier(symbol: &Symbol) -> Decimal {
 
 fn average_price_from_cost_basis(
     cost_basis: f64,
-    quantity: i64,
+    quantity: Decimal,
     contract_multiplier: Decimal,
 ) -> Decimal {
-    if quantity == 0 || contract_multiplier <= Decimal::ZERO {
+    if quantity == Decimal::ZERO || contract_multiplier <= Decimal::ZERO {
         return Decimal::ZERO;
     }
 
     let cost_basis = Decimal::from_f64(cost_basis).unwrap_or(Decimal::ZERO).abs();
-    cost_basis / Decimal::from(quantity.abs()) / contract_multiplier
+    cost_basis / quantity.abs() / contract_multiplier
 }
 
 fn block_on_tradier<F, T>(future: F) -> Result<T>
@@ -601,7 +598,7 @@ fn tradier_order_symbols(symbol: &Symbol) -> Result<TradierOrderSymbols> {
 /// Translate a LEAN order into Tradier API parameters.
 ///
 /// Returns `(side, class, type, duration, price?, stop?)`.
-fn translate_order(order: &Order, current_position: i64) -> Result<TradierOrderParams> {
+fn translate_order(order: &Order, current_position: Decimal) -> Result<TradierOrderParams> {
     validate_order_basics(order, current_position)?;
 
     let is_buy = order.quantity > Decimal::ZERO;
@@ -609,12 +606,12 @@ fn translate_order(order: &Order, current_position: i64) -> Result<TradierOrderP
     let (class, side) = match order.symbol.security_type() {
         SecurityType::Equity => {
             let side = if is_buy {
-                if current_position < 0 {
+                if current_position < Decimal::ZERO {
                     "buy_to_cover"
                 } else {
                     "buy"
                 }
-            } else if current_position <= 0 {
+            } else if current_position <= Decimal::ZERO {
                 "sell_short"
             } else {
                 "sell"
@@ -623,12 +620,12 @@ fn translate_order(order: &Order, current_position: i64) -> Result<TradierOrderP
         }
         SecurityType::Option | SecurityType::IndexOption => {
             let side = if is_buy {
-                if current_position < 0 {
+                if current_position < Decimal::ZERO {
                     "buy_to_close"
                 } else {
                     "buy_to_open"
                 }
-            } else if current_position > 0 {
+            } else if current_position > Decimal::ZERO {
                 "sell_to_close"
             } else {
                 "sell_to_open"
@@ -705,11 +702,11 @@ fn tradier_regular_session(time: DateTime) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct TradierOrderLeg {
     quantity: Decimal,
-    current_position: i64,
+    current_position: Decimal,
 }
 
-fn split_cross_zero_order(quantity: Decimal, current_position: i64) -> Vec<TradierOrderLeg> {
-    let current = Decimal::from(current_position);
+fn split_cross_zero_order(quantity: Decimal, current_position: Decimal) -> Vec<TradierOrderLeg> {
+    let current = current_position;
     let projected = current + quantity;
     if current > Decimal::ZERO && quantity < Decimal::ZERO && projected < Decimal::ZERO {
         vec![
@@ -719,7 +716,7 @@ fn split_cross_zero_order(quantity: Decimal, current_position: i64) -> Vec<Tradi
             },
             TradierOrderLeg {
                 quantity: projected,
-                current_position: 0,
+                current_position: Decimal::ZERO,
             },
         ]
     } else if current < Decimal::ZERO && quantity > Decimal::ZERO && projected > Decimal::ZERO {
@@ -730,7 +727,7 @@ fn split_cross_zero_order(quantity: Decimal, current_position: i64) -> Vec<Tradi
             },
             TradierOrderLeg {
                 quantity: projected,
-                current_position: 0,
+                current_position: Decimal::ZERO,
             },
         ]
     } else {
@@ -741,7 +738,7 @@ fn split_cross_zero_order(quantity: Decimal, current_position: i64) -> Vec<Tradi
     }
 }
 
-fn validate_order_basics(order: &Order, current_position: i64) -> Result<()> {
+fn validate_order_basics(order: &Order, current_position: Decimal) -> Result<()> {
     let abs_quantity = order.quantity.abs();
     if abs_quantity < Decimal::ONE || abs_quantity > Decimal::from(10_000_000u64) {
         anyhow::bail!(
@@ -750,7 +747,7 @@ fn validate_order_basics(order: &Order, current_position: i64) -> Result<()> {
         );
     }
 
-    let projected_position = Decimal::from(current_position) + order.quantity;
+    let projected_position = current_position + order.quantity;
     if projected_position < Decimal::ZERO && order.time_in_force == TimeInForce::GoodTilCanceled {
         anyhow::bail!("Tradier: GTC orders cannot leave a short position");
     }
@@ -883,19 +880,23 @@ mod tests {
     #[test]
     fn equity_order_sides_follow_position() {
         assert_eq!(
-            translate_order(&equity_order(dec!(10)), 0).unwrap().0,
+            translate_order(&equity_order(dec!(10)), dec!(0)).unwrap().0,
             "buy"
         );
         assert_eq!(
-            translate_order(&equity_order(dec!(10)), -5).unwrap().0,
+            translate_order(&equity_order(dec!(10)), dec!(-5))
+                .unwrap()
+                .0,
             "buy_to_cover"
         );
         assert_eq!(
-            translate_order(&equity_order(dec!(-5)), 10).unwrap().0,
+            translate_order(&equity_order(dec!(-5)), dec!(10))
+                .unwrap()
+                .0,
             "sell"
         );
         assert_eq!(
-            translate_order(&equity_order(dec!(-5)), 0).unwrap().0,
+            translate_order(&equity_order(dec!(-5)), dec!(0)).unwrap().0,
             "sell_short"
         );
     }
@@ -903,19 +904,19 @@ mod tests {
     #[test]
     fn option_order_sides_follow_position() {
         assert_eq!(
-            translate_order(&option_order(dec!(1)), 0).unwrap().0,
+            translate_order(&option_order(dec!(1)), dec!(0)).unwrap().0,
             "buy_to_open"
         );
         assert_eq!(
-            translate_order(&option_order(dec!(1)), -2).unwrap().0,
+            translate_order(&option_order(dec!(1)), dec!(-2)).unwrap().0,
             "buy_to_close"
         );
         assert_eq!(
-            translate_order(&option_order(dec!(-1)), 3).unwrap().0,
+            translate_order(&option_order(dec!(-1)), dec!(3)).unwrap().0,
             "sell_to_close"
         );
         assert_eq!(
-            translate_order(&option_order(dec!(-1)), 0).unwrap().0,
+            translate_order(&option_order(dec!(-1)), dec!(0)).unwrap().0,
             "sell_to_open"
         );
     }
@@ -923,28 +924,28 @@ mod tests {
     #[test]
     fn cross_zero_orders_are_split_into_close_and_open_legs() {
         assert_eq!(
-            split_cross_zero_order(dec!(-15), 10),
+            split_cross_zero_order(dec!(-15), dec!(10)),
             vec![
                 TradierOrderLeg {
                     quantity: dec!(-10),
-                    current_position: 10,
+                    current_position: dec!(10),
                 },
                 TradierOrderLeg {
                     quantity: dec!(-5),
-                    current_position: 0,
+                    current_position: dec!(0),
                 },
             ]
         );
         assert_eq!(
-            split_cross_zero_order(dec!(15), -10),
+            split_cross_zero_order(dec!(15), dec!(-10)),
             vec![
                 TradierOrderLeg {
                     quantity: dec!(10),
-                    current_position: -10,
+                    current_position: dec!(-10),
                 },
                 TradierOrderLeg {
                     quantity: dec!(5),
-                    current_position: 0,
+                    current_position: dec!(0),
                 },
             ]
         );
@@ -960,7 +961,7 @@ mod tests {
             "",
         );
 
-        let error = translate_order(&order, 0).unwrap_err().to_string();
+        let error = translate_order(&order, dec!(0)).unwrap_err().to_string();
 
         assert!(error.contains("GTC"));
     }
@@ -1034,11 +1035,11 @@ mod tests {
         );
         pre.time_in_force = TimeInForce::Day;
         pre.properties.outside_regular_trading_hours = true;
-        assert_eq!(translate_order(&pre, 0).unwrap().3, "pre");
+        assert_eq!(translate_order(&pre, dec!(0)).unwrap().3, "pre");
 
         let mut post = pre.clone();
         post.time = ny_time(2026, 1, 16, 17, 0);
-        assert_eq!(translate_order(&post, 0).unwrap().3, "post");
+        assert_eq!(translate_order(&post, dec!(0)).unwrap().3, "post");
     }
 
     #[test]
@@ -1054,7 +1055,7 @@ mod tests {
         order.time_in_force = TimeInForce::Day;
         order.properties.outside_regular_trading_hours = true;
 
-        assert_eq!(translate_order(&order, 0).unwrap().3, "day");
+        assert_eq!(translate_order(&order, dec!(0)).unwrap().3, "day");
     }
 
     #[test]
@@ -1063,7 +1064,7 @@ mod tests {
         order.time = ny_time(2026, 1, 16, 8, 0);
         order.properties.outside_regular_trading_hours = true;
 
-        let error = translate_order(&order, 0).unwrap_err().to_string();
+        let error = translate_order(&order, dec!(0)).unwrap_err().to_string();
 
         assert!(error.contains("equity limit"));
     }
@@ -1107,15 +1108,15 @@ mod tests {
     #[test]
     fn average_price_from_cost_basis_uses_contract_multiplier() {
         assert_eq!(
-            average_price_from_cost_basis(4000.0, 10, Decimal::ONE),
+            average_price_from_cost_basis(4000.0, dec!(10), Decimal::ONE),
             dec!(400)
         );
         assert_eq!(
-            average_price_from_cost_basis(-4000.0, -10, Decimal::ONE),
+            average_price_from_cost_basis(-4000.0, dec!(-10), Decimal::ONE),
             dec!(400)
         );
         assert_eq!(
-            average_price_from_cost_basis(250.0, 2, Decimal::from(100)),
+            average_price_from_cost_basis(250.0, dec!(2), Decimal::from(100)),
             dec!(1.25)
         );
     }
