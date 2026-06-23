@@ -1,23 +1,57 @@
 pub mod brokerage;
 pub mod brokerage_model;
 pub mod client;
+pub mod history_provider;
 pub mod live_provider;
 pub mod models;
 
 pub use brokerage::TradierBrokerage;
 pub use brokerage_model::TradierBrokerageModel;
 pub use client::TradierClient;
+pub use history_provider::TradierHistoryProvider;
 pub use live_provider::{TradierLiveConfig, TradierLiveDataProvider};
 
 use lean_brokerages::Brokerage;
 use lean_data::DataQueueHandler;
+use lean_data_providers::IHistoryProvider;
 use lean_plugin::{ensure_crypto_provider, rlean_plugin, PluginKind};
 use std::ffi::CStr;
+use std::sync::Arc;
 
 rlean_plugin! {
     name    = "tradier",
     version = "0.1.0",
     kind    = PluginKind::Brokerage,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rlean_create_history_provider(
+    config_json: *const std::os::raw::c_char,
+) -> *mut () {
+    ensure_crypto_provider();
+
+    let json = unsafe { CStr::from_ptr(config_json) }
+        .to_str()
+        .unwrap_or("{}");
+    let config: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+
+    let Some(access_token) = tradier_access_token(&config) else {
+        eprintln!("rlean-plugin-tradier: missing access_token.");
+        return std::ptr::null_mut();
+    };
+
+    let provider: Arc<dyn IHistoryProvider> = Arc::new(TradierHistoryProvider::new(
+        access_token,
+        parse_sandbox(&config),
+    ));
+    Box::into_raw(Box::new(provider)) as *mut ()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rlean_destroy_history_provider(ptr: *mut ()) {
+    if !ptr.is_null() {
+        drop(unsafe { Box::from_raw(ptr as *mut Arc<dyn IHistoryProvider>) });
+    }
 }
 
 #[no_mangle]
@@ -31,11 +65,7 @@ pub unsafe extern "C" fn rlean_create_brokerage(
         .unwrap_or("{}");
     let config: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
 
-    let Some(access_token) = config_string(&config, "access_token")
-        .or_else(|| config_string(&config, "tradier_access_token"))
-        .or_else(|| config_string(&config, "tradier-access-token"))
-        .or_else(|| std::env::var("TRADIER_ACCESS_TOKEN").ok())
-    else {
+    let Some(access_token) = tradier_access_token(&config) else {
         eprintln!("rlean-plugin-tradier: missing access_token.");
         return std::ptr::null_mut();
     };
@@ -98,6 +128,13 @@ fn config_string(config: &serde_json::Value, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn tradier_access_token(config: &serde_json::Value) -> Option<String> {
+    config_string(config, "access_token")
+        .or_else(|| config_string(config, "tradier_access_token"))
+        .or_else(|| config_string(config, "tradier-access-token"))
+        .or_else(|| std::env::var("TRADIER_ACCESS_TOKEN").ok())
 }
 
 fn parse_sandbox(config: &serde_json::Value) -> bool {

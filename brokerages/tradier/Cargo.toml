@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 lean-brokerages = { workspace = true }
 lean-data       = { workspace = true }
+lean-data-providers = { workspace = true }
 lean-orders     = { workspace = true }
 lean-core       = { workspace = true }
 lean-plugin     = { workspace = true }
@@ -23,6 +24,7 @@ tokio      = { workspace = true }
 anyhow     = { workspace = true }
 tracing    = { workspace = true }
 chrono     = { workspace = true }
+async-trait = { workspace = true }
 crossbeam-channel = "0.5"
 futures-util = "0.3"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
