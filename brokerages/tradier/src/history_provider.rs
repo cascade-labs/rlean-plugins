@@ -192,6 +192,7 @@ mod tests {
                 high: 8.30,
                 low: 8.00,
                 close: 8.20,
+                ..Default::default()
             },
         )
         .expect("bar");
@@ -215,6 +216,7 @@ mod tests {
                 high: 0.0,
                 low: 0.0,
                 close: 0.0,
+                ..Default::default()
             },
         )
         .expect("bar");
@@ -237,6 +239,7 @@ mod tests {
                 high: 0.0,
                 low: 0.0,
                 close: 0.0,
+                ..Default::default()
             },
         );
 

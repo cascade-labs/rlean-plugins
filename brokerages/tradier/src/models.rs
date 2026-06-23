@@ -233,7 +233,7 @@ pub struct TradierQuotesWrapper {
     pub quote: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct TradierQuote {
     pub symbol: String,
     #[serde(default, deserialize_with = "null_to_default")]
@@ -244,6 +244,18 @@ pub struct TradierQuote {
     pub ask: f64,
     #[serde(default, deserialize_with = "null_to_default")]
     pub volume: i64,
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub last_volume: i64,
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub trade_date: i64,
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub bid_date: i64,
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub ask_date: i64,
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub bidsize: i64,
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub asksize: i64,
     #[serde(default, deserialize_with = "null_to_default")]
     pub open: f64,
     #[serde(default, deserialize_with = "null_to_default")]

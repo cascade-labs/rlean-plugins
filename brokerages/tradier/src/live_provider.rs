@@ -21,17 +21,21 @@ use lean_plugin::ensure_crypto_provider;
 use reqwest::Client;
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::json;
+use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{access_token_from_config, config_string, market_data_environment_from_config};
+use crate::models::{TradierQuote, TradierQuoteContainer};
 
 const DEFAULT_MARKET_WS_URL: &str = "wss://ws.tradier.com/v1/markets/events";
 const MARKET_EVENT_FILTER: [&str; 4] = ["quote", "trade", "timesale", "tradex"];
 const STREAM_SESSION_REFRESH_AFTER: Duration = Duration::from_secs(270);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
+const REST_QUOTE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub struct TradierLiveConfig {
@@ -48,9 +52,6 @@ impl TradierLiveConfig {
         let access_token = access_token_from_config(config).context("missing access_token")?;
 
         let environment = market_data_environment_from_config(config)?;
-        if environment.is_sandbox() {
-            bail!("Tradier paper/sandbox does not support streaming market data");
-        }
         let custom_base_url = config_string(config, "base_url")
             .or_else(|| config_string(config, "tradier_base_url"))
             .or_else(|| config_string(config, "tradier-base-url"));
@@ -116,11 +117,21 @@ impl TradierLiveDataProvider {
                             .thread_name("tradier-live-worker")
                             .build();
                         match runtime {
-                            Ok(runtime) => runtime.block_on(run_tradier_stream(
-                                config.clone(),
-                                state.clone(),
-                                stop.clone(),
-                            )),
+                            Ok(runtime) => {
+                                if config.use_sandbox {
+                                    runtime.block_on(run_tradier_rest_quotes(
+                                        config.clone(),
+                                        state.clone(),
+                                        stop.clone(),
+                                    ))
+                                } else {
+                                    runtime.block_on(run_tradier_stream(
+                                        config.clone(),
+                                        state.clone(),
+                                        stop.clone(),
+                                    ))
+                                }
+                            }
                             Err(error) => {
                                 error!("Tradier live provider failed to start: {error}");
                             }
@@ -360,6 +371,162 @@ async fn wait_for_subscribers(state: &Arc<Mutex<TradierLiveState>>, stop: &Arc<A
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+async fn run_tradier_rest_quotes(
+    config: TradierLiveConfig,
+    state: Arc<Mutex<TradierLiveState>>,
+    stop: Arc<AtomicBool>,
+) {
+    ensure_crypto_provider();
+
+    let http = match Client::builder().timeout(Duration::from_secs(30)).build() {
+        Ok(http) => http,
+        Err(error) => {
+            error!("Tradier paper quote provider failed to start: {error}");
+            fanout_error(
+                &state,
+                format!("Tradier paper quote provider failed: {error}"),
+            );
+            return;
+        }
+    };
+
+    info!("Tradier paper quote provider polling {}", config.base_url());
+    eprintln!("rlean-plugin-tradier: paper quote provider polling Tradier REST quotes");
+
+    let mut ticker = tokio::time::interval(REST_QUOTE_POLL_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    while !stop.load(Ordering::Relaxed) {
+        wait_for_subscribers(&state, &stop).await;
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        ticker.tick().await;
+        let symbols = subscribed_symbols(&state);
+        if symbols.is_empty() {
+            set_connected(&state, false);
+            continue;
+        }
+
+        match fetch_rest_quotes(&http, &config, &symbols).await {
+            Ok(quotes) => {
+                set_connected(&state, true);
+                dispatch_rest_quotes(&state, quotes);
+            }
+            Err(error) => {
+                set_connected(&state, false);
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let error_text = format!("{error:#}");
+                warn!("Tradier paper quote poll failed: {error_text}");
+                if is_session_auth_error(&error_text) {
+                    fanout_error(&state, error_text);
+                    return;
+                }
+                tokio::time::sleep(config.reconnect_delay).await;
+            }
+        }
+    }
+
+    set_connected(&state, false);
+}
+
+fn subscribed_symbols(state: &Arc<Mutex<TradierLiveState>>) -> Vec<String> {
+    let state = state.lock().expect("Tradier live state poisoned");
+    state
+        .subscribers
+        .values()
+        .map(|subscriber| subscriber.wire_symbol.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+async fn fetch_rest_quotes(
+    http: &Client,
+    config: &TradierLiveConfig,
+    symbols: &[String],
+) -> Result<Vec<TradierQuote>> {
+    if symbols.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let csv = symbols.join(",");
+    let url = format!(
+        "{}/markets/quotes?symbols={csv}&greeks=false",
+        config.base_url()
+    );
+    let response = http
+        .get(url)
+        .bearer_auth(&config.access_token)
+        .header("Accept", "application/json")
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response.text().await.unwrap_or_default();
+        let detail = detail.trim();
+        let suffix = if detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {detail}")
+        };
+        if status == 401 {
+            bail!("Tradier quote request unauthorized{suffix}");
+        }
+        if status == 403 {
+            bail!("Tradier quote request forbidden{suffix}");
+        }
+        if status == 429 {
+            bail!("Tradier quote request rate limited{suffix}");
+        }
+        bail!("Tradier quote request failed with HTTP {status}{suffix}");
+    }
+
+    let container: TradierQuoteContainer = response.json().await?;
+    normalize_quote_list(container)
+}
+
+fn normalize_quote_list(container: TradierQuoteContainer) -> Result<Vec<TradierQuote>> {
+    let wrapper = match container.quotes {
+        None => return Ok(Vec::new()),
+        Some(wrapper) => wrapper,
+    };
+    parse_single_or_array(wrapper.quote)
+}
+
+fn parse_single_or_array<T: DeserializeOwned>(value: Value) -> Result<Vec<T>> {
+    match value {
+        Value::Array(_) => Ok(serde_json::from_value(value)?),
+        Value::Object(_) => Ok(vec![serde_json::from_value(value)?]),
+        other => bail!("expected object or array, got {other}"),
+    }
+}
+
+fn dispatch_rest_quotes(state: &Arc<Mutex<TradierLiveState>>, quotes: Vec<TradierQuote>) {
+    let quote_by_symbol: HashMap<String, TradierQuote> = quotes
+        .into_iter()
+        .map(|quote| (quote.symbol.to_ascii_uppercase(), quote))
+        .collect();
+
+    let mut state = state.lock().expect("Tradier live state poisoned");
+    state.subscribers.retain(|_, subscriber| {
+        let Some(quote) = quote_by_symbol.get(&subscriber.wire_symbol) else {
+            return true;
+        };
+
+        let item = match subscriber.config.tick_type {
+            TickType::Quote => rest_quote_to_quote_item(quote, &subscriber.config),
+            TickType::Trade => rest_quote_to_trade_item(quote, &subscriber.config),
+            TickType::OpenInterest => None,
+        };
+        item.map(|item| subscriber.sender.send(Ok(item)).is_ok())
+            .unwrap_or(true)
+    });
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -805,8 +972,115 @@ fn event_to_trade_item(
     )))
 }
 
+fn rest_quote_to_quote_item(
+    quote: &TradierQuote,
+    config: &SubscriptionDataConfig,
+) -> Option<LiveDataItem> {
+    let Some(bid) = positive_decimal_from_f64(quote.bid) else {
+        warn!(
+            "Tradier REST quote has non-positive bid for {}: bid={}",
+            config.symbol.value, quote.bid
+        );
+        return None;
+    };
+    let Some(ask) = positive_decimal_from_f64(quote.ask) else {
+        warn!(
+            "Tradier REST quote has non-positive ask for {}: ask={}",
+            config.symbol.value, quote.ask
+        );
+        return None;
+    };
+
+    let time = rest_quote_time(quote.bid_date.max(quote.ask_date));
+    let bid_size = non_negative_i64_decimal(quote.bidsize);
+    let ask_size = non_negative_i64_decimal(quote.asksize);
+
+    if config.resolution == Resolution::Tick {
+        return Some(LiveDataItem::Tick(Tick::quote(
+            config.symbol.clone(),
+            time,
+            bid,
+            ask,
+            bid_size,
+            ask_size,
+        )));
+    }
+
+    let period = config
+        .resolution
+        .to_time_span()
+        .unwrap_or(TimeSpan::ONE_SECOND);
+    let bucket = floor_time(time, period);
+    Some(LiveDataItem::QuoteBar(QuoteBar::new(
+        config.symbol.clone(),
+        bucket,
+        period,
+        positive_bar(bid),
+        positive_bar(ask),
+        bid_size,
+        ask_size,
+    )))
+}
+
+fn rest_quote_to_trade_item(
+    quote: &TradierQuote,
+    config: &SubscriptionDataConfig,
+) -> Option<LiveDataItem> {
+    let Some(price) = positive_decimal_from_f64(quote.last) else {
+        warn!(
+            "Tradier REST quote has non-positive last price for {}: last={}",
+            config.symbol.value, quote.last
+        );
+        return None;
+    };
+
+    let time = rest_quote_time(quote.trade_date);
+    let volume = positive_i64_decimal(quote.last_volume)
+        .or_else(|| positive_i64_decimal(quote.volume))
+        .unwrap_or(Decimal::ZERO);
+
+    if config.resolution == Resolution::Tick {
+        return Some(LiveDataItem::Tick(Tick::trade(
+            config.symbol.clone(),
+            time,
+            price,
+            volume,
+        )));
+    }
+
+    let period = config
+        .resolution
+        .to_time_span()
+        .unwrap_or(TimeSpan::ONE_SECOND);
+    let bucket = floor_time(time, period);
+    Some(LiveDataItem::TradeBar(TradeBar::new(
+        config.symbol.clone(),
+        bucket,
+        period,
+        TradeBarData::new(price, price, price, price, volume),
+    )))
+}
+
 fn positive_bar(price: Decimal) -> Option<Bar> {
     (price > Decimal::ZERO).then(|| Bar::from_price(price))
+}
+
+fn positive_decimal_from_f64(value: f64) -> Option<Decimal> {
+    if value <= 0.0 || !value.is_finite() {
+        return None;
+    }
+    Decimal::from_f64(value)
+}
+
+fn positive_i64_decimal(value: i64) -> Option<Decimal> {
+    if value <= 0 {
+        return None;
+    }
+    Decimal::from_i64(value)
+}
+
+fn non_negative_i64_decimal(value: i64) -> Decimal {
+    Decimal::from_i64(value.max(0)).unwrap_or(Decimal::ZERO)
 }
 
 fn quote_time(biddate: FlexibleI64, askdate: FlexibleI64) -> Option<DateTime> {
@@ -823,6 +1097,14 @@ fn date_time(date: FlexibleI64) -> Option<DateTime> {
         Some(DateTime::from_millis(date.0))
     } else {
         None
+    }
+}
+
+fn rest_quote_time(millis: i64) -> DateTime {
+    if millis > 0 {
+        DateTime::from_millis(millis)
+    } else {
+        DateTime::now()
     }
 }
 
@@ -931,17 +1213,16 @@ mod tests {
     use std::sync::{atomic::AtomicUsize, mpsc};
 
     #[test]
-    fn live_config_rejects_paper_streaming() {
+    fn live_config_allows_paper_rest_quotes() {
         let config = serde_json::json!({
             "access_token": "token",
             "tradier-environment": "paper",
         });
 
-        let error = TradierLiveConfig::from_json(&config)
-            .unwrap_err()
-            .to_string();
+        let config = TradierLiveConfig::from_json(&config).unwrap();
 
-        assert!(error.contains("paper/sandbox does not support streaming"));
+        assert!(config.use_sandbox);
+        assert_eq!(config.base_url, crate::config::SANDBOX_BASE);
     }
 
     #[test]
@@ -1015,6 +1296,66 @@ mod tests {
             }
             other => panic!("unexpected item: {other:?}"),
         }
+    }
+
+    #[test]
+    fn rest_quote_to_trade_bar_uses_last_price() {
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let config = SubscriptionDataConfig::new_equity(symbol, Resolution::Minute);
+
+        let item = rest_quote_to_trade_item(&sample_rest_quote(), &config).unwrap();
+
+        match item {
+            LiveDataItem::TradeBar(bar) => {
+                assert_eq!(bar.symbol.value, "SPY");
+                assert_eq!(bar.open, Decimal::from_f64(734.15).unwrap());
+                assert_eq!(bar.high, Decimal::from_f64(734.15).unwrap());
+                assert_eq!(bar.low, Decimal::from_f64(734.15).unwrap());
+                assert_eq!(bar.close, Decimal::from_f64(734.15).unwrap());
+                assert_eq!(bar.volume, Decimal::from_i64(125).unwrap());
+            }
+            other => panic!("unexpected item: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rest_quote_to_quote_bar_uses_bid_ask() {
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let mut config = SubscriptionDataConfig::new_equity(symbol, Resolution::Minute);
+        config.tick_type = TickType::Quote;
+
+        let item = rest_quote_to_quote_item(&sample_rest_quote(), &config).unwrap();
+
+        match item {
+            LiveDataItem::QuoteBar(bar) => {
+                assert_eq!(bar.symbol.value, "SPY");
+                assert_eq!(bar.last_bid_size, Decimal::from_i64(7).unwrap());
+                assert_eq!(bar.last_ask_size, Decimal::from_i64(8).unwrap());
+                assert_eq!(
+                    bar.bid.as_ref().map(|bar| bar.close),
+                    Some(Decimal::from_f64(734.14).unwrap())
+                );
+                assert_eq!(
+                    bar.ask.as_ref().map(|bar| bar.close),
+                    Some(Decimal::from_f64(734.16).unwrap())
+                );
+            }
+            other => panic!("unexpected item: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rest_quote_to_trade_bar_rejects_zero_last_price() {
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let config = SubscriptionDataConfig::new_equity(symbol, Resolution::Minute);
+        let quote = TradierQuote {
+            last: 0.0,
+            bid: 734.14,
+            ask: 734.16,
+            ..sample_rest_quote()
+        };
+
+        assert!(rest_quote_to_trade_item(&quote, &config).is_none());
     }
 
     #[test]
@@ -1202,6 +1543,23 @@ mod tests {
             "wss://stream.tradier.com/v1/markets/events"
         );
         assert_eq!(tradier_websocket_url(""), DEFAULT_MARKET_WS_URL);
+    }
+
+    fn sample_rest_quote() -> TradierQuote {
+        TradierQuote {
+            symbol: "SPY".to_string(),
+            last: 734.15,
+            bid: 734.14,
+            ask: 734.16,
+            volume: 1_000_000,
+            last_volume: 125,
+            trade_date: 1_557_757_190_000,
+            bid_date: 1_557_757_189_000,
+            ask_date: 1_557_757_190_000,
+            bidsize: 7,
+            asksize: 8,
+            ..Default::default()
+        }
     }
 
     fn spawn_mock_tradier_stream() -> (String, mpsc::Receiver<String>) {
