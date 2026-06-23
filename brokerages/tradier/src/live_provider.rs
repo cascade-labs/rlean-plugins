@@ -4,7 +4,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -30,6 +30,8 @@ const LIVE_BASE: &str = "https://api.tradier.com/v1";
 const SANDBOX_BASE: &str = "https://sandbox.tradier.com/v1";
 const DEFAULT_MARKET_WS_URL: &str = "wss://ws.tradier.com/v1/markets/events";
 const MARKET_EVENT_FILTER: [&str; 4] = ["quote", "trade", "timesale", "tradex"];
+const STREAM_SESSION_REFRESH_AFTER: Duration = Duration::from_secs(270);
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub struct TradierLiveConfig {
@@ -235,10 +237,16 @@ async fn run_tradier_stream(
     state: Arc<Mutex<TradierLiveState>>,
     stop: Arc<AtomicBool>,
 ) {
+    let mut session_cache = TradierSessionCache::default();
+    let mut reconnect_backoff = ReconnectBackoff::new(config.reconnect_delay);
+
     while !stop.load(Ordering::Relaxed) {
-        match run_tradier_stream_once(&config, &state, &stop).await {
-            Ok(()) => {}
+        match run_tradier_stream_once(&config, &state, &stop, &mut session_cache).await {
+            Ok(()) => {
+                reconnect_backoff.reset();
+            }
             Err(error) => {
+                let had_established_stream = is_connected(&state);
                 set_connected(&state, false);
                 if !stop.load(Ordering::Relaxed) {
                     let error_text = format!("{error:#}");
@@ -248,7 +256,16 @@ async fn run_tradier_stream(
                         fanout_error(&state, error_text);
                         return;
                     }
-                    tokio::time::sleep(config.reconnect_delay).await;
+                    if is_session_expired_error(&error_text) {
+                        session_cache.invalidate();
+                    }
+                    let delay = if had_established_stream {
+                        reconnect_backoff.reset();
+                        config.reconnect_delay
+                    } else {
+                        reconnect_backoff.next_delay()
+                    };
+                    tokio::time::sleep(delay).await;
                 }
             }
         }
@@ -260,18 +277,18 @@ async fn run_tradier_stream_once(
     config: &TradierLiveConfig,
     state: &Arc<Mutex<TradierLiveState>>,
     stop: &Arc<AtomicBool>,
+    session_cache: &mut TradierSessionCache,
 ) -> Result<()> {
     wait_for_subscribers(state, stop).await;
     if stop.load(Ordering::Relaxed) {
         return Ok(());
     }
 
-    let session = create_market_session(config).await?;
-    let ws_url = tradier_websocket_url(&session.stream.url);
+    let session = session_cache.get(config).await?;
+    let ws_url = tradier_websocket_url(&session.response.stream.url);
     let (mut socket, _) = tokio_tungstenite::connect_async(&ws_url)
         .await
         .with_context(|| format!("failed to connect Tradier websocket {ws_url}"))?;
-    set_connected(state, true);
     info!("Tradier live websocket connected: {ws_url}");
     eprintln!("rlean-plugin-tradier: live websocket connected");
 
@@ -285,11 +302,14 @@ async fn run_tradier_stream_once(
                 }
                 let signature = stream_signature(state);
                 if signature != last_signature && !signature.symbols.is_empty() {
+                    if !session.is_usable() {
+                        bail!("Tradier streaming session expired before subscription update");
+                    }
                     let symbols = signature.symbols.clone();
                     let payload = json!({
                         "symbols": symbols,
                         "filter": MARKET_EVENT_FILTER,
-                        "sessionid": session.stream.sessionid,
+                        "sessionid": session.response.stream.sessionid,
                         "linebreak": config.linebreak,
                         "validOnly": config.valid_only,
                     });
@@ -309,10 +329,16 @@ async fn run_tradier_stream_once(
                     bail!("Tradier websocket closed");
                 };
                 match message? {
-                    Message::Text(text) => dispatch_text_message(state, &text),
+                    Message::Text(text) => {
+                        if dispatch_text_message(state, &text).established_stream {
+                            set_connected(state, true);
+                        }
+                    }
                     Message::Binary(bytes) => {
                         if let Ok(text) = String::from_utf8(bytes) {
-                            dispatch_text_message(state, &text);
+                            if dispatch_text_message(state, &text).established_stream {
+                                set_connected(state, true);
+                            }
                         }
                     }
                     Message::Ping(payload) => {
@@ -362,9 +388,94 @@ fn stream_signature(state: &Arc<Mutex<TradierLiveState>>) -> StreamSignature {
     }
 }
 
+fn is_connected(state: &Arc<Mutex<TradierLiveState>>) -> bool {
+    state.lock().map(|state| state.connected).unwrap_or(false)
+}
+
 fn set_connected(state: &Arc<Mutex<TradierLiveState>>, connected: bool) {
     if let Ok(mut state) = state.lock() {
         state.connected = connected;
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TradierSessionLease {
+    response: TradierSessionResponse,
+    acquired_at: Instant,
+}
+
+impl TradierSessionLease {
+    fn is_usable(&self) -> bool {
+        self.acquired_at.elapsed() < STREAM_SESSION_REFRESH_AFTER
+    }
+}
+
+#[derive(Debug, Default)]
+struct TradierSessionCache {
+    current: Option<TradierSessionLease>,
+}
+
+impl TradierSessionCache {
+    async fn get(&mut self, config: &TradierLiveConfig) -> Result<TradierSessionLease> {
+        if let Some(session) = &self.current {
+            if session.is_usable() {
+                return Ok(session.clone());
+            }
+        }
+
+        let response = create_market_session(config).await?;
+        info!("Created Tradier market data stream session");
+        eprintln!("rlean-plugin-tradier: created market data stream session");
+        let session = TradierSessionLease {
+            response,
+            acquired_at: Instant::now(),
+        };
+        self.current = Some(session.clone());
+        Ok(session)
+    }
+
+    fn invalidate(&mut self) {
+        self.current = None;
+    }
+}
+
+#[derive(Debug)]
+struct ReconnectBackoff {
+    min_delay: Duration,
+    max_delay: Duration,
+    next_delay: Duration,
+    attempt: u32,
+}
+
+impl ReconnectBackoff {
+    fn new(min_delay: Duration) -> Self {
+        let min_delay = min_delay.max(Duration::from_millis(250));
+        Self {
+            min_delay,
+            max_delay: MAX_RECONNECT_DELAY,
+            next_delay: min_delay,
+            attempt: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.next_delay = self.min_delay;
+        self.attempt = 0;
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let delay = self.next_delay + self.jitter();
+        self.next_delay = (self.next_delay * 2).min(self.max_delay);
+        self.attempt = self.attempt.wrapping_add(1);
+        delay
+    }
+
+    fn jitter(&self) -> Duration {
+        let spread = self.min_delay.as_millis().min(1_000) as u64;
+        if spread == 0 {
+            return Duration::ZERO;
+        }
+        Duration::from_millis((u64::from(self.attempt) * 137) % spread)
     }
 }
 
@@ -398,21 +509,31 @@ async fn create_market_session(config: &TradierLiveConfig) -> Result<TradierSess
     Ok(response.json::<TradierSessionResponse>().await?)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct TradierSessionResponse {
     stream: TradierSession,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct TradierSession {
     #[serde(default)]
     url: String,
     sessionid: String,
 }
 
-fn dispatch_text_message(state: &Arc<Mutex<TradierLiveState>>, text: &str) {
+#[derive(Debug, Default)]
+struct DispatchResult {
+    established_stream: bool,
+}
+
+fn dispatch_text_message(state: &Arc<Mutex<TradierLiveState>>, text: &str) -> DispatchResult {
+    let mut result = DispatchResult::default();
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+            if value["success"].as_bool() == Some(true) {
+                result.established_stream = true;
+                continue;
+            }
             if let Some(error) = value["error"].as_str() {
                 warn!("Tradier stream error: {error}");
                 fanout_error(state, format!("Tradier stream error: {error}"));
@@ -420,10 +541,16 @@ fn dispatch_text_message(state: &Arc<Mutex<TradierLiveState>>, text: &str) {
             }
         }
         match serde_json::from_str::<TradierStreamEvent>(line) {
-            Ok(event) => dispatch_event(state, event),
+            Ok(event) => {
+                if event.symbol().is_some() {
+                    result.established_stream = true;
+                }
+                dispatch_event(state, event);
+            }
             Err(error) => debug!("ignoring Tradier websocket payload: {error}: {line}"),
         }
     }
+    result
 }
 
 fn dispatch_event(state: &Arc<Mutex<TradierLiveState>>, event: TradierStreamEvent) {
@@ -459,6 +586,11 @@ fn fanout_error(state: &Arc<Mutex<TradierLiveState>>, error: String) {
 fn is_session_auth_error(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     error.contains("unauthorized") || error.contains("forbidden")
+}
+
+fn is_session_expired_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("session") && (error.contains("expired") || error.contains("invalid"))
 }
 
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
@@ -808,7 +940,7 @@ mod tests {
     use rust_decimal_macros::dec;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::mpsc;
+    use std::sync::{atomic::AtomicUsize, mpsc};
 
     #[test]
     fn formats_equity_wire_symbol() {
@@ -928,6 +1060,77 @@ mod tests {
     }
 
     #[test]
+    fn provider_reuses_market_session_across_fast_websocket_reconnect() {
+        let (base_url, payload_receiver, session_requests) =
+            spawn_reconnecting_mock_tradier_stream();
+        let mut provider = TradierLiveDataProvider::new(TradierLiveConfig {
+            access_token: "test-token".to_string(),
+            use_sandbox: false,
+            base_url,
+            valid_only: true,
+            linebreak: true,
+            reconnect_delay: Duration::from_millis(25),
+        });
+        let mut config = SubscriptionDataConfig::new_equity(
+            Symbol::create_equity("SPY", &Market::usa()),
+            Resolution::Tick,
+        );
+        config.tick_type = TickType::Quote;
+
+        let subscription = provider.subscribe(&config).unwrap();
+        let first_payload: serde_json::Value = serde_json::from_str(
+            &payload_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap(),
+        )
+        .unwrap();
+        let second_payload: serde_json::Value = serde_json::from_str(
+            &payload_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap(),
+        )
+        .unwrap();
+        let item = subscription
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first_payload["sessionid"], "mock-session");
+        assert_eq!(second_payload["sessionid"], "mock-session");
+        assert_eq!(
+            session_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        match item {
+            LiveDataItem::Tick(tick) => {
+                assert_eq!(tick.symbol.value, "SPY");
+                assert_eq!(tick.bid_price, dec!(450.10));
+                assert_eq!(tick.ask_price, dec!(450.12));
+            }
+            other => panic!("unexpected item: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_success_payload_marks_stream_established() {
+        let state = Arc::new(Mutex::new(TradierLiveState::default()));
+        let result = dispatch_text_message(&state, r#"{"success":true}"#);
+        assert!(result.established_stream);
+    }
+
+    #[test]
+    fn reconnect_backoff_grows_and_resets() {
+        let mut backoff = ReconnectBackoff::new(Duration::from_millis(25));
+        let first = backoff.next_delay();
+        let second = backoff.next_delay();
+        assert!(second > first);
+
+        backoff.reset();
+        assert_eq!(backoff.next_delay(), first);
+    }
+
+    #[test]
     fn tradier_stream_session_url_is_normalized_for_websocket() {
         assert_eq!(
             tradier_websocket_url("https://stream.tradier.com/v1/markets/events"),
@@ -998,5 +1201,73 @@ mod tests {
         });
 
         (format!("http://{http_addr}"), payload_receiver)
+    }
+
+    fn spawn_reconnecting_mock_tradier_stream() -> (String, mpsc::Receiver<String>, Arc<AtomicUsize>)
+    {
+        let (payload_sender, payload_receiver) = mpsc::channel();
+
+        let ws_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ws_addr = ws_listener.local_addr().unwrap();
+        ws_listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(ws_listener).unwrap();
+                for attempt in 0..2 {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    if let Some(Ok(Message::Text(payload))) = socket.next().await {
+                        payload_sender.send(payload).unwrap();
+                    }
+                    if attempt == 0 {
+                        continue;
+                    }
+                    socket
+                        .send(Message::Text(
+                            r#"{"type":"quote","symbol":"SPY","bid":"450.10","ask":"450.12","bidsz":"7","asksz":"8","biddate":"1557757189000","askdate":"1557757190000"}"#
+                                .to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            });
+        });
+
+        let http_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let http_addr = http_listener.local_addr().unwrap();
+        let session_requests = Arc::new(AtomicUsize::new(0));
+        let session_requests_thread = session_requests.clone();
+        std::thread::spawn(move || {
+            let (mut stream, _) = http_listener.accept().unwrap();
+            session_requests_thread.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut request = [0_u8; 4096];
+            let bytes = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..bytes]);
+            assert!(request.starts_with("POST /markets/events/session "));
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer test-token"));
+
+            let body = format!(
+                r#"{{"stream":{{"url":"ws://{ws_addr}/v1/markets/events","sessionid":"mock-session"}}}}"#
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        (
+            format!("http://{http_addr}"),
+            payload_receiver,
+            session_requests,
+        )
     }
 }
