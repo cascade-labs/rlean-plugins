@@ -608,54 +608,35 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 enum TradierStreamEvent {
     Quote {
         symbol: String,
-        #[serde(default)]
         bid: FlexibleDecimal,
-        #[serde(default)]
         ask: FlexibleDecimal,
-        #[serde(default)]
         bidsz: FlexibleDecimal,
-        #[serde(default)]
         asksz: FlexibleDecimal,
-        #[serde(default)]
         biddate: FlexibleI64,
-        #[serde(default)]
         askdate: FlexibleI64,
     },
     Trade {
         symbol: String,
         #[serde(default)]
         exch: Option<String>,
-        #[serde(default)]
         price: FlexibleDecimal,
-        #[serde(default)]
         size: FlexibleDecimal,
-        #[serde(default)]
         date: FlexibleI64,
-        #[serde(default)]
-        last: FlexibleDecimal,
     },
     Tradex {
         symbol: String,
         #[serde(default)]
         exch: Option<String>,
-        #[serde(default)]
         price: FlexibleDecimal,
-        #[serde(default)]
         size: FlexibleDecimal,
-        #[serde(default)]
         date: FlexibleI64,
-        #[serde(default)]
-        last: FlexibleDecimal,
     },
     Timesale {
         symbol: String,
         #[serde(default)]
         exch: Option<String>,
-        #[serde(default)]
         last: FlexibleDecimal,
-        #[serde(default)]
         size: FlexibleDecimal,
-        #[serde(default)]
         date: FlexibleI64,
         #[serde(default)]
         flag: Option<String>,
@@ -701,7 +682,20 @@ fn event_to_quote_item(
         return None;
     };
 
-    let time = quote_time(*biddate, *askdate);
+    if bid.0 <= Decimal::ZERO || ask.0 <= Decimal::ZERO {
+        warn!(
+            "Tradier quote event has non-positive bid/ask for {}: bid={} ask={}",
+            config.symbol.value, bid.0, ask.0
+        );
+        return None;
+    }
+    let Some(time) = quote_time(*biddate, *askdate) else {
+        warn!(
+            "Tradier quote event has invalid timestamps for {}: biddate={} askdate={}",
+            config.symbol.value, biddate.0, askdate.0
+        );
+        return None;
+    };
     if config.resolution == Resolution::Tick {
         return Some(LiveDataItem::Tick(Tick::quote(
             config.symbol.clone(),
@@ -739,7 +733,6 @@ fn event_to_trade_item(
             size,
             date,
             exch,
-            last,
             ..
         }
         | TradierStreamEvent::Tradex {
@@ -747,16 +740,8 @@ fn event_to_trade_item(
             size,
             date,
             exch,
-            last,
             ..
-        } => {
-            let price = if price.0 > Decimal::ZERO {
-                price.0
-            } else {
-                last.0
-            };
-            (price, size.0, *date, exch.clone(), None, false)
-        }
+        } => (price.0, size.0, *date, exch.clone(), None, false),
         TradierStreamEvent::Timesale {
             last,
             size,
@@ -778,10 +763,27 @@ fn event_to_trade_item(
     };
 
     if price <= Decimal::ZERO {
+        warn!(
+            "Tradier trade event has non-positive price for {}: price={price}",
+            config.symbol.value
+        );
+        return None;
+    }
+    if size <= Decimal::ZERO {
+        warn!(
+            "Tradier trade event has non-positive size for {}: size={size}",
+            config.symbol.value
+        );
         return None;
     }
 
-    let time = date_time(date);
+    let Some(time) = date_time(date) else {
+        warn!(
+            "Tradier trade event has invalid timestamp for {}: date={}",
+            config.symbol.value, date.0
+        );
+        return None;
+    };
     if config.resolution == Resolution::Tick {
         let mut tick = Tick::trade(config.symbol.clone(), time, price, size);
         tick.exchange = exchange;
@@ -807,20 +809,20 @@ fn positive_bar(price: Decimal) -> Option<Bar> {
     (price > Decimal::ZERO).then(|| Bar::from_price(price))
 }
 
-fn quote_time(biddate: FlexibleI64, askdate: FlexibleI64) -> DateTime {
+fn quote_time(biddate: FlexibleI64, askdate: FlexibleI64) -> Option<DateTime> {
     let millis = biddate.0.max(askdate.0);
     if millis > 0 {
-        DateTime::from_millis(millis)
+        Some(DateTime::from_millis(millis))
     } else {
-        DateTime::now()
+        None
     }
 }
 
-fn date_time(date: FlexibleI64) -> DateTime {
+fn date_time(date: FlexibleI64) -> Option<DateTime> {
     if date.0 > 0 {
-        DateTime::from_millis(date.0)
+        Some(DateTime::from_millis(date.0))
     } else {
-        DateTime::now()
+        None
     }
 }
 
@@ -868,7 +870,7 @@ fn tradier_websocket_url(session_url: &str) -> String {
     session_url.to_string()
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct FlexibleDecimal(Decimal);
 
 impl<'de> Deserialize<'de> for FlexibleDecimal {
@@ -877,18 +879,24 @@ impl<'de> Deserialize<'de> for FlexibleDecimal {
         D: serde::Deserializer<'de>,
     {
         let value = serde_json::Value::deserialize(deserializer)?;
-        Ok(Self(match value {
+        let decimal = match value {
             serde_json::Value::Number(number) => number
                 .as_f64()
                 .and_then(Decimal::from_f64)
-                .unwrap_or(Decimal::ZERO),
-            serde_json::Value::String(value) => value.parse().unwrap_or(Decimal::ZERO),
-            _ => Decimal::ZERO,
-        }))
+                .ok_or_else(|| serde::de::Error::custom("invalid Tradier decimal number"))?,
+            serde_json::Value::String(value) => value
+                .parse()
+                .map_err(|_| serde::de::Error::custom("invalid Tradier decimal string"))?,
+            serde_json::Value::Null => {
+                return Err(serde::de::Error::custom("missing Tradier decimal value"));
+            }
+            _ => return Err(serde::de::Error::custom("invalid Tradier decimal type")),
+        };
+        Ok(Self(decimal))
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct FlexibleI64(i64);
 
 impl<'de> Deserialize<'de> for FlexibleI64 {
@@ -897,11 +905,19 @@ impl<'de> Deserialize<'de> for FlexibleI64 {
         D: serde::Deserializer<'de>,
     {
         let value = serde_json::Value::deserialize(deserializer)?;
-        Ok(Self(match value {
-            serde_json::Value::Number(number) => number.as_i64().unwrap_or_default(),
-            serde_json::Value::String(value) => value.parse().unwrap_or_default(),
-            _ => 0,
-        }))
+        let integer = match value {
+            serde_json::Value::Number(number) => number
+                .as_i64()
+                .ok_or_else(|| serde::de::Error::custom("invalid Tradier integer number"))?,
+            serde_json::Value::String(value) => value
+                .parse()
+                .map_err(|_| serde::de::Error::custom("invalid Tradier integer string"))?,
+            serde_json::Value::Null => {
+                return Err(serde::de::Error::custom("missing Tradier integer value"));
+            }
+            _ => return Err(serde::de::Error::custom("invalid Tradier integer type")),
+        };
+        Ok(Self(integer))
     }
 }
 
@@ -1013,6 +1029,61 @@ mod tests {
             }
             other => panic!("unexpected item: {other:?}"),
         }
+    }
+
+    #[test]
+    fn live_quote_event_rejects_null_numeric_fields() {
+        let error = serde_json::from_str::<TradierStreamEvent>(
+            r#"{"type":"quote","symbol":"SPY","bid":null,"bidsz":60,"biddate":"1557757189000","ask":281.85,"asksz":6,"askdate":"1557757190000"}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("missing Tradier decimal value"));
+    }
+
+    #[test]
+    fn live_quote_event_rejects_missing_required_fields() {
+        let error = serde_json::from_str::<TradierStreamEvent>(
+            r#"{"type":"quote","symbol":"SPY","bid":281.84,"bidsz":60,"biddate":"1557757189000","asksz":6,"askdate":"1557757190000"}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("missing field `ask`"));
+    }
+
+    #[test]
+    fn live_quote_event_does_not_publish_zero_prices() {
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let mut config = SubscriptionDataConfig::new_equity(symbol, Resolution::Tick);
+        config.tick_type = TickType::Quote;
+        let event: TradierStreamEvent = serde_json::from_str(
+            r#"{"type":"quote","symbol":"SPY","bid":"0","bidsz":"60","biddate":"1557757189000","ask":"281.85","asksz":"6","askdate":"1557757190000"}"#,
+        )
+        .unwrap();
+
+        assert!(event_to_quote_item(&event, &config).is_none());
+    }
+
+    #[test]
+    fn live_trade_event_rejects_invalid_numeric_strings() {
+        let error = serde_json::from_str::<TradierStreamEvent>(
+            r#"{"type":"trade","symbol":"SPY","exch":"J","price":"bad","size":"100","date":"1557757190000"}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("invalid Tradier decimal string"));
+    }
+
+    #[test]
+    fn live_trade_event_does_not_publish_zero_prices() {
+        let symbol = Symbol::create_equity("SPY", &Market::usa());
+        let config = SubscriptionDataConfig::new_equity(symbol, Resolution::Tick);
+        let event: TradierStreamEvent = serde_json::from_str(
+            r#"{"type":"trade","symbol":"SPY","exch":"J","price":"0","size":"100","date":"1557757190000"}"#,
+        )
+        .unwrap();
+
+        assert!(event_to_trade_item(&event, &config).is_none());
     }
 
     #[test]
