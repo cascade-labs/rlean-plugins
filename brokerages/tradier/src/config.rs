@@ -77,11 +77,7 @@ pub fn trading_environment_from_config(config: &serde_json::Value) -> Result<Tra
 pub fn market_data_environment_from_config(
     config: &serde_json::Value,
 ) -> Result<TradierEnvironment> {
-    let _ = config;
-    // Tradier sandbox is for account/order simulation. C# Lean rejects live
-    // streaming subscriptions in sandbox, so rlean keeps market data on live
-    // endpoints even when brokerage REST is configured for a paper account.
-    Ok(TradierEnvironment::Live)
+    trading_environment_from_config(config)
 }
 
 fn first_config_string(config: &serde_json::Value, keys: &[&str]) -> Option<String> {
@@ -140,11 +136,11 @@ mod tests {
     }
 
     #[test]
-    fn market_data_defaults_to_live_even_for_paper_trading_env() {
+    fn market_data_uses_paper_environment_for_rest_requests() {
         let config = json!({ "environment": "paper" });
         assert_eq!(
             market_data_environment_from_config(&config).unwrap(),
-            TradierEnvironment::Live
+            TradierEnvironment::Paper
         );
     }
 

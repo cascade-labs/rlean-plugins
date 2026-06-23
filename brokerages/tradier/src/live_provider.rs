@@ -48,6 +48,9 @@ impl TradierLiveConfig {
         let access_token = access_token_from_config(config).context("missing access_token")?;
 
         let environment = market_data_environment_from_config(config)?;
+        if environment.is_sandbox() {
+            bail!("Tradier paper/sandbox does not support streaming market data");
+        }
         let custom_base_url = config_string(config, "base_url")
             .or_else(|| config_string(config, "tradier_base_url"))
             .or_else(|| config_string(config, "tradier-base-url"));
@@ -926,6 +929,20 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::{atomic::AtomicUsize, mpsc};
+
+    #[test]
+    fn live_config_rejects_paper_streaming() {
+        let config = serde_json::json!({
+            "access_token": "token",
+            "tradier-environment": "paper",
+        });
+
+        let error = TradierLiveConfig::from_json(&config)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("paper/sandbox does not support streaming"));
+    }
 
     #[test]
     fn formats_equity_wire_symbol() {
