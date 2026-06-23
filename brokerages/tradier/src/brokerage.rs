@@ -18,6 +18,7 @@ use lean_core::{
 use lean_orders::{Order, OrderStatus, OrderType, TimeInForce, UpdateOrderRequest};
 
 use super::client::TradierClient;
+use super::config::TradierEnvironment;
 use super::models::{TradierOrder, TradierOrderDirection, TradierOrderStatus, TradierOrderType};
 use lean_brokerages::{Brokerage, BrokerageHolding};
 
@@ -25,14 +26,16 @@ use lean_brokerages::{Brokerage, BrokerageHolding};
 pub struct TradierBrokerage {
     client: TradierClient,
     account_id: String,
+    environment: TradierEnvironment,
     connected: bool,
 }
 
 impl TradierBrokerage {
-    pub fn new(access_token: String, account_id: String, use_sandbox: bool) -> Self {
+    pub fn new(access_token: String, account_id: String, environment: TradierEnvironment) -> Self {
         TradierBrokerage {
-            client: TradierClient::new(access_token, use_sandbox),
+            client: TradierClient::new(access_token, environment),
             account_id,
+            environment,
             connected: false,
         }
     }
@@ -55,7 +58,10 @@ impl TradierBrokerage {
 
 impl Brokerage for TradierBrokerage {
     fn name(&self) -> &str {
-        "Tradier"
+        match self.environment {
+            TradierEnvironment::Live => "Tradier",
+            TradierEnvironment::Paper => "Tradier Paper",
+        }
     }
 
     fn is_connected(&self) -> bool {
@@ -66,7 +72,11 @@ impl Brokerage for TradierBrokerage {
         match block_on_tradier(self.client.get_balance(&self.account_id)) {
             Ok(_) => {
                 self.connected = true;
-                info!("Tradier: connected (account {})", self.account_id);
+                info!(
+                    "Tradier: connected to {} account {}",
+                    self.environment.label(),
+                    self.account_id
+                );
                 Ok(())
             }
             Err(error) => {
@@ -966,7 +976,11 @@ mod tests {
 
     #[test]
     fn tradier_rejects_quantity_updates() {
-        let brokerage = TradierBrokerage::new("token".to_string(), "account".to_string(), true);
+        let brokerage = TradierBrokerage::new(
+            "token".to_string(),
+            "account".to_string(),
+            TradierEnvironment::Paper,
+        );
         let previous_order = Order::limit(
             1,
             Symbol::create_equity("SPY", &Market::usa()),

@@ -1,6 +1,7 @@
 pub mod brokerage;
 pub mod brokerage_model;
 pub mod client;
+pub mod config;
 pub mod history_provider;
 pub mod live_provider;
 pub mod models;
@@ -17,6 +18,11 @@ use lean_data_providers::IHistoryProvider;
 use lean_plugin::{ensure_crypto_provider, rlean_plugin, PluginKind};
 use std::ffi::CStr;
 use std::sync::Arc;
+
+use config::{
+    access_token_from_config, account_id_from_config, market_data_environment_from_config,
+    trading_environment_from_config,
+};
 
 rlean_plugin! {
     name    = "tradier",
@@ -35,14 +41,21 @@ pub unsafe extern "C" fn rlean_create_history_provider(
         .unwrap_or("{}");
     let config: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
 
-    let Some(access_token) = tradier_access_token(&config) else {
+    let Some(access_token) = access_token_from_config(&config) else {
         eprintln!("rlean-plugin-tradier: missing access_token.");
         return std::ptr::null_mut();
+    };
+    let market_data_environment = match market_data_environment_from_config(&config) {
+        Ok(environment) => environment,
+        Err(error) => {
+            eprintln!("rlean-plugin-tradier: invalid market data config: {error}");
+            return std::ptr::null_mut();
+        }
     };
 
     let provider: Arc<dyn IHistoryProvider> = Arc::new(TradierHistoryProvider::new(
         access_token,
-        parse_sandbox(&config),
+        market_data_environment.is_sandbox(),
     ));
     Box::into_raw(Box::new(provider)) as *mut ()
 }
@@ -65,24 +78,28 @@ pub unsafe extern "C" fn rlean_create_brokerage(
         .unwrap_or("{}");
     let config: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
 
-    let Some(access_token) = tradier_access_token(&config) else {
+    let Some(access_token) = access_token_from_config(&config) else {
         eprintln!("rlean-plugin-tradier: missing access_token.");
         return std::ptr::null_mut();
     };
 
-    let Some(account_id) = config_string(&config, "account_id")
-        .or_else(|| config_string(&config, "tradier_account_id"))
-        .or_else(|| config_string(&config, "tradier-account-id"))
-        .or_else(|| std::env::var("TRADIER_ACCOUNT_ID").ok())
-    else {
+    let Some(account_id) = account_id_from_config(&config) else {
         eprintln!("rlean-plugin-tradier: missing account_id.");
         return std::ptr::null_mut();
+    };
+
+    let trading_environment = match trading_environment_from_config(&config) {
+        Ok(environment) => environment,
+        Err(error) => {
+            eprintln!("rlean-plugin-tradier: invalid brokerage config: {error}");
+            return std::ptr::null_mut();
+        }
     };
 
     let brokerage: Box<dyn Brokerage> = Box::new(TradierBrokerage::new(
         access_token,
         account_id,
-        parse_sandbox(&config),
+        trading_environment,
     ));
     Box::into_raw(Box::new(brokerage)) as *mut ()
 }
@@ -120,39 +137,4 @@ pub unsafe extern "C" fn rlean_destroy_live_data_provider(ptr: *mut ()) {
     if !ptr.is_null() {
         drop(unsafe { Box::from_raw(ptr as *mut Box<dyn DataQueueHandler>) });
     }
-}
-
-fn config_string(config: &serde_json::Value, key: &str) -> Option<String> {
-    config[key]
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-fn tradier_access_token(config: &serde_json::Value) -> Option<String> {
-    config_string(config, "access_token")
-        .or_else(|| config_string(config, "tradier_access_token"))
-        .or_else(|| config_string(config, "tradier-access-token"))
-        .or_else(|| std::env::var("TRADIER_ACCESS_TOKEN").ok())
-}
-
-fn parse_sandbox(config: &serde_json::Value) -> bool {
-    if let Some(value) = config["use_sandbox"]
-        .as_bool()
-        .or_else(|| config["sandbox"].as_bool())
-    {
-        return value;
-    }
-    if let Some(environment) = config_string(config, "environment")
-        .or_else(|| config_string(config, "tradier_environment"))
-        .or_else(|| config_string(config, "tradier-environment"))
-        .or_else(|| std::env::var("TRADIER_ENVIRONMENT").ok())
-    {
-        return matches!(
-            environment.trim().to_ascii_lowercase().as_str(),
-            "sandbox" | "paper" | "test"
-        );
-    }
-    false
 }

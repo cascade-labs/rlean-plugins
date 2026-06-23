@@ -12,20 +12,18 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::debug;
 
+use super::config::TradierEnvironment;
 use super::models::{
     TradierBalanceContainer, TradierBalanceDetails, TradierOrder, TradierOrderResponse,
     TradierOrdersContainer, TradierPosition, TradierPositionsContainer, TradierQuote,
     TradierQuoteContainer, TradierUserProfile, TradierUserProfileContainer,
 };
 
-const LIVE_BASE: &str = "https://api.tradier.com/v1";
-const SANDBOX_BASE: &str = "https://sandbox.tradier.com/v1";
-
 /// Exposed for testing only — mirrors the private constants above.
 #[cfg(test)]
-pub const LIVE_BASE_FOR_TEST: &str = LIVE_BASE;
+pub const LIVE_BASE_FOR_TEST: &str = super::config::LIVE_BASE;
 #[cfg(test)]
-pub const SANDBOX_BASE_FOR_TEST: &str = SANDBOX_BASE;
+pub const SANDBOX_BASE_FOR_TEST: &str = super::config::SANDBOX_BASE;
 
 /// Minimal token-bucket rate limiter (one shared timestamp per category).
 struct RateLimiter {
@@ -62,8 +60,8 @@ pub struct TradierClient {
 }
 
 impl TradierClient {
-    /// Create a live or sandbox client.
-    pub fn new(access_token: String, use_sandbox: bool) -> Self {
+    /// Create a live or paper/sandbox client.
+    pub fn new(access_token: String, environment: TradierEnvironment) -> Self {
         ensure_crypto_provider();
 
         let http = Client::builder()
@@ -73,7 +71,7 @@ impl TradierClient {
 
         TradierClient {
             http,
-            base_url: if use_sandbox { SANDBOX_BASE } else { LIVE_BASE }.to_string(),
+            base_url: environment.base_url().to_string(),
             access_token,
             standard_limiter: RateLimiter::new(1.0),
             order_limiter: RateLimiter::new(1.0),

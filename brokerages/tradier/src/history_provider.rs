@@ -12,10 +12,8 @@ use serde_json::Value;
 use std::time::Duration;
 use tracing::debug;
 
+use crate::config::{LIVE_BASE, SANDBOX_BASE};
 use crate::models::{TradierQuote, TradierQuoteContainer};
-
-const LIVE_BASE: &str = "https://api.tradier.com/v1";
-const SANDBOX_BASE: &str = "https://sandbox.tradier.com/v1";
 
 pub struct TradierHistoryProvider {
     http: Client,

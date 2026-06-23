@@ -26,8 +26,8 @@ use serde_json::json;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
-const LIVE_BASE: &str = "https://api.tradier.com/v1";
-const SANDBOX_BASE: &str = "https://sandbox.tradier.com/v1";
+use crate::config::{access_token_from_config, config_string, market_data_environment_from_config};
+
 const DEFAULT_MARKET_WS_URL: &str = "wss://ws.tradier.com/v1/markets/events";
 const MARKET_EVENT_FILTER: [&str; 4] = ["quote", "trade", "timesale", "tradex"];
 const STREAM_SESSION_REFRESH_AFTER: Duration = Duration::from_secs(270);
@@ -45,23 +45,13 @@ pub struct TradierLiveConfig {
 
 impl TradierLiveConfig {
     pub fn from_json(config: &serde_json::Value) -> Result<Self> {
-        let access_token = config_string(config, "access_token")
-            .or_else(|| config_string(config, "tradier_access_token"))
-            .or_else(|| config_string(config, "tradier-access-token"))
-            .or_else(|| std::env::var("TRADIER_ACCESS_TOKEN").ok())
-            .context("missing access_token")?;
+        let access_token = access_token_from_config(config).context("missing access_token")?;
 
-        let use_sandbox = parse_sandbox(config);
-        let base_url = config_string(config, "base_url")
+        let environment = market_data_environment_from_config(config)?;
+        let custom_base_url = config_string(config, "base_url")
             .or_else(|| config_string(config, "tradier_base_url"))
-            .or_else(|| config_string(config, "tradier-base-url"))
-            .unwrap_or_else(|| {
-                if use_sandbox {
-                    SANDBOX_BASE.to_string()
-                } else {
-                    LIVE_BASE.to_string()
-                }
-            });
+            .or_else(|| config_string(config, "tradier-base-url"));
+        let base_url = custom_base_url.unwrap_or_else(|| environment.base_url().to_string());
         let valid_only = config["valid_only"].as_bool().unwrap_or(true);
         let linebreak = config["linebreak"].as_bool().unwrap_or(true);
         let reconnect_delay = config["reconnect_delay_seconds"]
@@ -71,7 +61,7 @@ impl TradierLiveConfig {
 
         Ok(Self {
             access_token,
-            use_sandbox,
+            use_sandbox: environment.is_sandbox(),
             base_url,
             valid_only,
             linebreak,
@@ -919,34 +909,6 @@ impl<'de> Deserialize<'de> for FlexibleI64 {
         };
         Ok(Self(integer))
     }
-}
-
-fn config_string(config: &serde_json::Value, key: &str) -> Option<String> {
-    config[key]
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-fn parse_sandbox(config: &serde_json::Value) -> bool {
-    if let Some(value) = config["use_sandbox"]
-        .as_bool()
-        .or_else(|| config["sandbox"].as_bool())
-    {
-        return value;
-    }
-    if let Some(environment) = config_string(config, "environment")
-        .or_else(|| config_string(config, "tradier_environment"))
-        .or_else(|| config_string(config, "tradier-environment"))
-        .or_else(|| std::env::var("TRADIER_ENVIRONMENT").ok())
-    {
-        return matches!(
-            environment.trim().to_ascii_lowercase().as_str(),
-            "sandbox" | "paper" | "test"
-        );
-    }
-    false
 }
 
 #[cfg(test)]
