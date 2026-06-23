@@ -1,5 +1,5 @@
 /// Tradier REST API response types.
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 // ─── Enums ────────────────────────────────────────────────────────────────────
 
@@ -233,22 +233,30 @@ pub struct TradierQuotesWrapper {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TradierQuote {
     pub symbol: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub last: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub bid: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub ask: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub volume: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub open: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub high: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub low: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub close: f64,
+}
+
+fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -292,6 +300,25 @@ mod tests {
         assert_eq!(quote.bid, 0.0);
         assert_eq!(quote.ask, 0.0);
         assert_eq!(quote.volume, 0);
+    }
+
+    #[test]
+    fn test_tradier_parse_quote_null_numeric_fields_default_to_zero() {
+        let json = r#"{
+            "symbol": "SPY",
+            "last": 737.1549,
+            "bid": 737.14,
+            "ask": 737.17,
+            "volume": 21269715,
+            "open": 733.81,
+            "high": 739.63,
+            "low": 732.3,
+            "close": null
+        }"#;
+        let quote: TradierQuote = serde_json::from_str(json).expect("should parse");
+        assert_eq!(quote.symbol, "SPY");
+        assert!((quote.last - 737.1549).abs() < 1e-9);
+        assert_eq!(quote.close, 0.0);
     }
 
     #[test]
