@@ -487,14 +487,21 @@ async fn create_market_session(config: &TradierLiveConfig) -> Result<TradierSess
         .send()
         .await?;
     let status = response.status();
-    if status == 401 {
-        bail!("Tradier streaming session unauthorized");
-    }
-    if status == 403 {
-        bail!("Tradier streaming session forbidden");
-    }
     if !status.is_success() {
-        bail!("Tradier streaming session failed with HTTP {status}");
+        let detail = response.text().await.unwrap_or_default();
+        let detail = detail.trim();
+        let suffix = if detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {detail}")
+        };
+        if status == 401 {
+            bail!("Tradier streaming session unauthorized{suffix}");
+        }
+        if status == 403 {
+            bail!("Tradier streaming session forbidden{suffix}");
+        }
+        bail!("Tradier streaming session failed with HTTP {status}{suffix}");
     }
     Ok(response.json::<TradierSessionResponse>().await?)
 }
