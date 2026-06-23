@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::future::Future;
 
 use anyhow::Result;
-use chrono::Timelike;
+use chrono::{DateTime as ChronoDateTime, Duration as ChronoDuration, Timelike, Utc};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use tracing::{error, info, warn};
@@ -336,12 +336,52 @@ impl TradierBrokerage {
                 params.push(("stop", s));
             }
 
-            let resp = self.client.place_order(&self.account_id, &params).await?;
+            let submitted_at = Utc::now();
+            let resp = match self.client.place_order(&self.account_id, &params).await {
+                Ok(resp) => resp,
+                Err(error) => {
+                    if let Some(tradier_id) = self
+                        .recover_submitted_order_id(&leg_order, leg.current_position, submitted_at)
+                        .await?
+                    {
+                        warn!(
+                            "Tradier: recovered submitted order id={tradier_id} after submit response error: {error}"
+                        );
+                        tradier_ids.push(tradier_id);
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
 
             if let Some(errors) = resp.errors {
                 if !errors.error.is_empty() {
+                    if let Some(tradier_id) = self
+                        .recover_submitted_order_id(&leg_order, leg.current_position, submitted_at)
+                        .await?
+                    {
+                        warn!(
+                            "Tradier: recovered submitted order id={tradier_id} after submit response errors: {}",
+                            errors.error.join("; ")
+                        );
+                        tradier_ids.push(tradier_id);
+                        continue;
+                    }
                     anyhow::bail!("Tradier order rejected: {}", errors.error.join("; "));
                 }
+            }
+            if resp.order.id <= 0 {
+                if let Some(tradier_id) = self
+                    .recover_submitted_order_id(&leg_order, leg.current_position, submitted_at)
+                    .await?
+                {
+                    warn!(
+                        "Tradier: recovered submitted order id={tradier_id} after empty submit id"
+                    );
+                    tradier_ids.push(tradier_id);
+                    continue;
+                }
+                anyhow::bail!("Tradier order response did not include a valid order id");
             }
 
             info!(
@@ -405,6 +445,26 @@ impl TradierBrokerage {
             .find(|position| position.symbol.eq_ignore_ascii_case(symbol))
             .map(|position| position.quantity)
             .unwrap_or(Decimal::ZERO))
+    }
+
+    async fn recover_submitted_order_id(
+        &self,
+        order: &Order,
+        current_position: Decimal,
+        submitted_at: ChronoDateTime<Utc>,
+    ) -> Result<Option<i64>> {
+        let wire = tradier_order_symbols(&order.symbol)?;
+        let (direction, _class, order_type, _duration, _price, _stop) =
+            translate_order(order, current_position)?;
+        let orders = self.client.get_orders(&self.account_id).await?;
+        Ok(find_recent_matching_order_id(
+            &orders,
+            &wire,
+            &direction,
+            &order_type,
+            order.quantity.abs(),
+            submitted_at,
+        ))
     }
 }
 
@@ -766,6 +826,81 @@ fn validate_order_basics(order: &Order, current_position: Decimal) -> Result<()>
     }
 
     Ok(())
+}
+
+fn find_recent_matching_order_id(
+    orders: &[TradierOrder],
+    wire: &TradierOrderSymbols,
+    direction: &str,
+    order_type: &str,
+    quantity: Decimal,
+    submitted_at: ChronoDateTime<Utc>,
+) -> Option<i64> {
+    let earliest = submitted_at - ChronoDuration::seconds(5);
+    let latest = Utc::now() + ChronoDuration::seconds(5);
+    orders
+        .iter()
+        .filter(|order| order.status != TradierOrderStatus::Rejected)
+        .filter(|order| tradier_order_symbol_matches(order, wire))
+        .filter(|order| tradier_direction_matches(&order.side, direction))
+        .filter(|order| tradier_type_matches(&order.order_type, order_type))
+        .filter(|order| {
+            Decimal::from_f64(order.quantity)
+                .map(|actual| (actual - quantity).abs() <= Decimal::new(1, 6))
+                .unwrap_or(false)
+        })
+        .filter_map(|order| {
+            let placed_at = tradier_order_time(order)?;
+            (placed_at >= earliest && placed_at <= latest).then_some((placed_at, order.id))
+        })
+        .max_by_key(|(placed_at, id)| (*placed_at, *id))
+        .map(|(_, id)| id)
+}
+
+fn tradier_order_symbol_matches(order: &TradierOrder, wire: &TradierOrderSymbols) -> bool {
+    let symbol_matches = order
+        .symbol
+        .eq_ignore_ascii_case(&wire.underlying_or_symbol);
+    let option_matches = match (&order.option_symbol, &wire.option_symbol) {
+        (Some(actual), Some(expected)) => actual.eq_ignore_ascii_case(expected),
+        (None, None) => true,
+        _ => false,
+    };
+    symbol_matches && option_matches
+}
+
+fn tradier_order_time(order: &TradierOrder) -> Option<ChronoDateTime<Utc>> {
+    parse_tradier_time(&order.transaction_date).or_else(|| parse_tradier_time(&order.create_date))
+}
+
+fn parse_tradier_time(value: &str) -> Option<ChronoDateTime<Utc>> {
+    ChronoDateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|time| time.with_timezone(&Utc))
+}
+
+fn tradier_direction_matches(direction: &TradierOrderDirection, expected: &str) -> bool {
+    matches!(
+        (direction, expected),
+        (TradierOrderDirection::Buy, "buy")
+            | (TradierOrderDirection::Sell, "sell")
+            | (TradierOrderDirection::SellShort, "sell_short")
+            | (TradierOrderDirection::BuyToCover, "buy_to_cover")
+            | (TradierOrderDirection::BuyToOpen, "buy_to_open")
+            | (TradierOrderDirection::BuyToClose, "buy_to_close")
+            | (TradierOrderDirection::SellToOpen, "sell_to_open")
+            | (TradierOrderDirection::SellToClose, "sell_to_close")
+    )
+}
+
+fn tradier_type_matches(order_type: &TradierOrderType, expected: &str) -> bool {
+    matches!(
+        (order_type, expected),
+        (TradierOrderType::Market, "market")
+            | (TradierOrderType::Limit, "limit")
+            | (TradierOrderType::StopLimit, "stop_limit")
+            | (TradierOrderType::StopMarket, "stop")
+    )
 }
 
 fn tradier_order_to_symbol(order: &TradierOrder) -> Option<Symbol> {
@@ -1155,6 +1290,60 @@ mod tests {
     }
 
     #[test]
+    fn finds_recent_matching_submitted_order_id() {
+        let submitted_at = parse_tradier_time("2026-06-23T19:51:57.000Z").unwrap();
+        let wire = TradierOrderSymbols {
+            underlying_or_symbol: "SPY".to_string(),
+            option_symbol: None,
+        };
+        let orders = vec![
+            tradier_equity_order(
+                111,
+                TradierOrderDirection::Buy,
+                TradierOrderStatus::Rejected,
+                "2026-06-23T19:51:58.000Z",
+            ),
+            tradier_equity_order(
+                222,
+                TradierOrderDirection::Sell,
+                TradierOrderStatus::Filled,
+                "2026-06-23T19:51:58.000Z",
+            ),
+            tradier_equity_order(
+                333,
+                TradierOrderDirection::Buy,
+                TradierOrderStatus::Filled,
+                "2026-06-23T19:51:58.000Z",
+            ),
+        ];
+
+        assert_eq!(
+            find_recent_matching_order_id(&orders, &wire, "buy", "market", dec!(1), submitted_at,),
+            Some(333)
+        );
+    }
+
+    #[test]
+    fn submitted_order_recovery_ignores_stale_orders() {
+        let submitted_at = parse_tradier_time("2026-06-23T19:51:57.000Z").unwrap();
+        let wire = TradierOrderSymbols {
+            underlying_or_symbol: "SPY".to_string(),
+            option_symbol: None,
+        };
+        let orders = vec![tradier_equity_order(
+            333,
+            TradierOrderDirection::Buy,
+            TradierOrderStatus::Filled,
+            "2026-06-23T19:50:57.000Z",
+        )];
+
+        assert_eq!(
+            find_recent_matching_order_id(&orders, &wire, "buy", "market", dec!(1), submitted_at,),
+            None
+        );
+    }
+
+    #[test]
     fn tradier_snapshot_stop_limit_preserves_stop_price() {
         let order: TradierOrder = serde_json::from_str(
             r#"{
@@ -1179,6 +1368,35 @@ mod tests {
         assert_eq!(lean_order.order_type, OrderType::StopLimit);
         assert_eq!(lean_order.limit_price, Some(dec!(451.25)));
         assert_eq!(lean_order.stop_price, Some(dec!(450.50)));
+    }
+
+    fn tradier_equity_order(
+        id: i64,
+        side: TradierOrderDirection,
+        status: TradierOrderStatus,
+        transaction_date: &str,
+    ) -> TradierOrder {
+        TradierOrder {
+            id,
+            order_type: TradierOrderType::Market,
+            symbol: "SPY".to_string(),
+            option_symbol: None,
+            side,
+            quantity: 1.0,
+            status,
+            duration: TradierOrderDuration::GoodTilCancelled,
+            price: 0.0,
+            stop_price: 0.0,
+            avg_fill_price: 734.96,
+            exec_quantity: 1.0,
+            last_fill_price: 734.96,
+            last_fill_quantity: 1.0,
+            remaining_quantity: 0.0,
+            create_date: transaction_date.to_string(),
+            transaction_date: transaction_date.to_string(),
+            order_class: TradierOrderClass::Equity,
+            reason_description: None,
+        }
     }
 
     fn ny_time(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> DateTime {
