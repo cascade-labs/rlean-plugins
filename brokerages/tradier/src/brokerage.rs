@@ -18,7 +18,9 @@ use lean_orders::{Order, OrderStatus, OrderType, TimeInForce, UpdateOrderRequest
 
 use super::client::TradierClient;
 use super::config::TradierEnvironment;
-use super::models::{TradierOrder, TradierOrderDirection, TradierOrderStatus, TradierOrderType};
+use super::models::{
+    TradierOrder, TradierOrderDirection, TradierOrderStatus, TradierOrderType, TradierQuote,
+};
 use lean_brokerages::{Brokerage, BrokerageHolding};
 
 /// Live brokerage backed by Tradier's REST API.
@@ -266,23 +268,57 @@ impl Brokerage for TradierBrokerage {
 
     fn get_account_detailed_holdings(&self) -> Vec<BrokerageHolding> {
         match block_on_tradier(self.client.get_positions(&self.account_id)) {
-            Ok(positions) => positions
-                .into_iter()
-                .filter_map(|position| {
-                    let symbol = parse_osi_symbol(&position.symbol)
-                        .unwrap_or_else(|| Symbol::create_equity(&position.symbol, &Market::usa()));
-                    let average_price = average_price_from_cost_basis(
-                        position.cost_basis,
-                        position.quantity,
-                        brokerage_contract_multiplier(&symbol),
-                    );
-                    Some(BrokerageHolding {
-                        symbol,
-                        quantity: position.quantity,
-                        average_price,
+            Ok(positions) => {
+                let quote_symbols = positions
+                    .iter()
+                    .filter(|position| !position.quantity.is_zero())
+                    .map(|position| position.symbol.as_str())
+                    .collect::<Vec<_>>();
+                let quote_by_symbol: HashMap<String, Decimal> = if quote_symbols.is_empty() {
+                    HashMap::new()
+                } else {
+                    match block_on_tradier(self.client.get_quotes(&quote_symbols)) {
+                        Ok(quotes) => quotes
+                            .into_iter()
+                            .filter_map(|quote| {
+                                quote_market_price(&quote)
+                                    .map(|price| (quote.symbol.to_ascii_uppercase(), price))
+                            })
+                            .collect(),
+                        Err(e) => {
+                            warn!(
+                                "Tradier: get_account_detailed_holdings quote seed failed: {}",
+                                e
+                            );
+                            HashMap::new()
+                        }
+                    }
+                };
+
+                positions
+                    .into_iter()
+                    .filter_map(|position| {
+                        let symbol = parse_osi_symbol(&position.symbol).unwrap_or_else(|| {
+                            Symbol::create_equity(&position.symbol, &Market::usa())
+                        });
+                        let average_price = average_price_from_cost_basis(
+                            position.cost_basis,
+                            position.quantity,
+                            brokerage_contract_multiplier(&symbol),
+                        );
+                        let market_price = quote_by_symbol
+                            .get(&position.symbol.to_ascii_uppercase())
+                            .copied()
+                            .unwrap_or(Decimal::ZERO);
+                        Some(BrokerageHolding {
+                            symbol,
+                            quantity: position.quantity,
+                            average_price,
+                            market_price,
+                        })
                     })
-                })
-                .collect(),
+                    .collect()
+            }
             Err(e) => {
                 error!("Tradier: get_account_detailed_holdings failed: {}", e);
                 Vec::new()
@@ -494,6 +530,25 @@ fn average_price_from_cost_basis(
 
     let cost_basis = Decimal::from_f64(cost_basis).unwrap_or(Decimal::ZERO).abs();
     cost_basis / quantity.abs() / contract_multiplier
+}
+
+fn quote_market_price(quote: &TradierQuote) -> Option<Decimal> {
+    positive_decimal(quote.last)
+        .or_else(
+            || match (positive_decimal(quote.bid), positive_decimal(quote.ask)) {
+                (Some(bid), Some(ask)) => Some((bid + ask) / Decimal::from(2)),
+                _ => None,
+            },
+        )
+        .or_else(|| positive_decimal(quote.close))
+        .or_else(|| positive_decimal(quote.open))
+}
+
+fn positive_decimal(value: f64) -> Option<Decimal> {
+    if value <= 0.0 || !value.is_finite() {
+        return None;
+    }
+    Decimal::from_f64(value)
 }
 
 fn block_on_tradier<F, T>(future: F) -> Result<T>
@@ -1253,6 +1308,66 @@ mod tests {
         assert_eq!(
             average_price_from_cost_basis(250.0, dec!(2), Decimal::from(100)),
             dec!(1.25)
+        );
+    }
+
+    #[test]
+    fn quote_market_price_prefers_last_then_midpoint_then_close_then_open() {
+        assert_eq!(
+            quote_market_price(&TradierQuote {
+                symbol: "SPY".to_string(),
+                last: 450.25,
+                bid: 449.0,
+                ask: 451.0,
+                close: 448.0,
+                open: 447.0,
+                ..Default::default()
+            }),
+            Some(dec!(450.25))
+        );
+        assert_eq!(
+            quote_market_price(&TradierQuote {
+                symbol: "SPY".to_string(),
+                bid: 449.0,
+                ask: 451.0,
+                close: 448.0,
+                open: 447.0,
+                ..Default::default()
+            }),
+            Some(dec!(450))
+        );
+        assert_eq!(
+            quote_market_price(&TradierQuote {
+                symbol: "SPY".to_string(),
+                close: 448.0,
+                open: 447.0,
+                ..Default::default()
+            }),
+            Some(dec!(448))
+        );
+        assert_eq!(
+            quote_market_price(&TradierQuote {
+                symbol: "SPY".to_string(),
+                open: 447.0,
+                ..Default::default()
+            }),
+            Some(dec!(447))
+        );
+    }
+
+    #[test]
+    fn quote_market_price_rejects_non_positive_values() {
+        assert_eq!(
+            quote_market_price(&TradierQuote {
+                symbol: "SPY".to_string(),
+                last: 0.0,
+                bid: 0.0,
+                ask: 0.0,
+                close: 0.0,
+                open: 0.0,
+                ..Default::default()
+            }),
+            None
         );
     }
 
