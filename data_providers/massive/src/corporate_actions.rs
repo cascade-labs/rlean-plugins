@@ -9,14 +9,12 @@
 /// The sentinel row (newest date, factors = 1.0) marks when the file was
 /// last verified and enables incremental updates identical to the C# provider.
 use std::collections::HashMap;
-use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::NaiveDate;
 use tracing::{info, warn};
 
 use lean_storage::schema::{FactorFileEntry, MapFileEntry};
-use lean_storage::{ParquetReader, ParquetWriter, WriterConfig};
 
 use crate::models::{MassiveDividendItem, MassiveSplitItem, TickerEvent};
 
@@ -165,37 +163,18 @@ fn find_prev_close(event_date: NaiveDate, prices: &HashMap<NaiveDate, f64>) -> f
     0.0
 }
 
-// ─── Parquet I/O ─────────────────────────────────────────────────────────────
+// ─── Massive fetch (pure data source) ─────────────────────────────────────────
 
-/// Write factor rows (newest first) to a Parquet file.
-pub fn write_factor_file(path: &Path, rows: &[FactorFileEntry]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).context("create factor_files dir")?;
-    }
-    let writer = ParquetWriter::new(WriterConfig::default());
-    writer
-        .write_factor_file(rows, path)
-        .map_err(|e| anyhow::anyhow!("{e}"))
-}
-
-/// Read factor rows (newest first) from a Parquet file.
-/// Returns an empty Vec (no error) if the file doesn't exist.
-pub fn read_factor_file(path: &Path) -> Result<Vec<FactorFileEntry>> {
-    let reader = ParquetReader::new();
-    reader
-        .read_factor_file(path)
-        .map_err(|e| anyhow::anyhow!("{e}"))
-}
-
-// ─── Massive fetch + write ────────────────────────────────────────────────────
-
-/// Fetch splits + dividends from Massive and write a factor file for `symbol`.
+/// Fetch splits + dividends from Massive and compute factor rows for `ticker`.
+///
+/// This is a pure data source: it returns the computed rows and performs **no**
+/// persistence. The rlean framework owns all writes (into Iceberg), exactly as
+/// it does for trade/quote bars.
 ///
 /// `ref_prices` — map of date → unadjusted close (used to compute the dividend
-/// price factor).  Typically built from already-downloaded bar data.
-pub async fn fetch_and_write_factor_file(
+/// price factor). Typically built from already-downloaded bar data.
+pub async fn fetch_factor_rows(
     client: &crate::client::MassiveRestClient,
-    factor_path: &Path,
     ticker: &str,
     start: NaiveDate,
     end: NaiveDate,
@@ -213,10 +192,12 @@ pub async fn fetch_and_write_factor_file(
         ticker
     );
 
-    let rows = compute_factor_rows(&splits, &dividends, ref_prices, lean_factor_file_end_date());
-    write_factor_file(factor_path, &rows)?;
-
-    Ok(rows)
+    Ok(compute_factor_rows(
+        &splits,
+        &dividends,
+        ref_prices,
+        lean_factor_file_end_date(),
+    ))
 }
 
 // ─── Apply factors ────────────────────────────────────────────────────────────
@@ -353,10 +334,12 @@ fn parse_ticker_change_event(
     })
 }
 
-/// Fetch ticker details and write a map file for `ticker`.
-pub async fn fetch_and_write_map_file(
+/// Fetch ticker details and compute map file rows for `ticker`.
+///
+/// Pure data source: returns rows, performs no persistence. The rlean framework
+/// owns the write into the Iceberg `map_files` table.
+pub async fn fetch_map_rows(
     client: &crate::client::MassiveRestClient,
-    map_path: &Path,
     ticker: &str,
     today: NaiveDate,
 ) -> Result<Vec<MapFileEntry>> {
@@ -402,19 +385,7 @@ pub async fn fetch_and_write_map_file(
     }
 
     let rows = compute_map_file_rows(ticker, list_date, delisting_date, &ticker_changes, today);
-    write_map_file(map_path, &rows)?;
     Ok(rows)
-}
-
-/// Write map file rows (oldest first) to a Parquet file.
-pub fn write_map_file(path: &Path, rows: &[MapFileEntry]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).context("create map_files dir")?;
-    }
-    let writer = ParquetWriter::new(WriterConfig::default());
-    writer
-        .write_map_file(rows, path)
-        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 #[cfg(test)]
@@ -554,36 +525,5 @@ mod tests {
     #[test]
     fn factor_for_date_returns_one_one_when_no_rows() {
         assert_eq!(factor_for_date(&[], date(2023, 1, 1)), (1.0, 1.0));
-    }
-
-    #[test]
-    fn factor_file_round_trip_with_multiple_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("aapl.parquet");
-
-        let rows = vec![
-            FactorFileEntry {
-                date: date(2024, 1, 1),
-                price_factor: 1.0,
-                split_factor: 1.0,
-                reference_price: 0.0,
-            },
-            FactorFileEntry {
-                date: date(2022, 8, 31),
-                price_factor: 1.0,
-                split_factor: 0.25,
-                reference_price: 150.0,
-            },
-        ];
-
-        write_factor_file(&path, &rows).unwrap();
-        assert!(path.exists());
-
-        let read_back = read_factor_file(&path).unwrap();
-        assert_eq!(read_back.len(), rows.len());
-        for (orig, got) in rows.iter().zip(read_back.iter()) {
-            assert_eq!(orig.date, got.date);
-            assert!((orig.split_factor - got.split_factor).abs() < 1e-9);
-        }
     }
 }

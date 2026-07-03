@@ -11,10 +11,9 @@ use lean_core::{
     LeanError, Market, NanosecondTimestamp, Resolution, SecurityType, Symbol, TickType, TimeSpan,
 };
 use lean_data::{
-    live_data_channel, Bar, CustomDataPoint, CustomDataSubscription, DataQueueHandler,
-    LiveDataItem, LiveDataSubscription, LiveDataSubscriptionConfig, LiveNodePacket,
-    LiveUniverseSubscriptionConfig, OrderBook, OrderBookLevel, QuoteBar, SubscriptionDataConfig,
-    TradeBar, TradeBarData,
+    live_data_channel, Bar, CustomDataPoint, DataQueueHandler, LiveDataItem, LiveDataSubscription,
+    LiveDataSubscriptionConfig, LiveNodePacket, LiveUniverseSubscriptionConfig, OrderBook,
+    OrderBookLevel, QuoteBar, SubscriptionDataConfig, SubscriptionDataKind, TradeBar, TradeBarData,
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -154,6 +153,50 @@ impl HyperliquidLiveDataProvider {
         });
         Ok(command_sender)
     }
+
+    fn subscribe_custom_config(
+        &mut self,
+        config: &SubscriptionDataConfig,
+    ) -> lean_core::Result<LiveDataSubscription> {
+        let custom = config.custom.as_ref().ok_or_else(|| {
+            LeanError::DataError("custom live subscription missing custom metadata".to_string())
+        })?;
+        if custom.source_type != "hyperliquid" {
+            return Err(LeanError::Unsupported(format!(
+                "Hyperliquid live provider does not support custom source {}",
+                custom.source_type
+            )));
+        }
+
+        let key = format!("{}:{}", custom.source_type, custom.ticker);
+        let stop = Arc::new(AtomicBool::new(false));
+        self.custom_stops
+            .lock()
+            .unwrap()
+            .insert(key.clone(), stop.clone());
+        let (sender, receiver) = live_data_channel();
+        let error_sender = sender.clone();
+        let live_config = self.config.clone();
+        let subscription = config.clone();
+        let thread_ticker = custom.ticker.clone();
+
+        std::thread::Builder::new()
+            .name(format!("hyperliquid-custom-live-{thread_ticker}"))
+            .spawn(move || {
+                if let Err(error) =
+                    poll_custom_subscription(subscription, live_config, sender, stop)
+                {
+                    let _ = error_sender.send(Err(LeanError::DataError(error.to_string())));
+                    warn!("Hyperliquid custom live subscription stopped with error: {error:#}");
+                }
+            })
+            .map_err(|error| LeanError::DataError(error.to_string()))?;
+
+        Ok(LiveDataSubscription::new(
+            LiveDataSubscriptionConfig::Market(Box::new(config.clone())),
+            receiver,
+        ))
+    }
 }
 
 impl DataQueueHandler for HyperliquidLiveDataProvider {
@@ -165,6 +208,10 @@ impl DataQueueHandler for HyperliquidLiveDataProvider {
         &mut self,
         config: &SubscriptionDataConfig,
     ) -> lean_core::Result<LiveDataSubscription> {
+        if config.data_kind == SubscriptionDataKind::Custom {
+            return self.subscribe_custom_config(config);
+        }
+
         if config.symbol.market().as_str() != Market::HYPERLIQUID {
             return Err(LeanError::Unsupported(format!(
                 "Hyperliquid live provider does not support market {} for {}",
@@ -196,53 +243,7 @@ impl DataQueueHandler for HyperliquidLiveDataProvider {
             .map_err(|error| LeanError::DataError(error.to_string()))?;
 
         Ok(LiveDataSubscription::new(
-            LiveDataSubscriptionConfig::Market(config.clone()),
-            receiver,
-        ))
-    }
-
-    fn subscribe_custom(
-        &mut self,
-        subscription: &CustomDataSubscription,
-    ) -> lean_core::Result<LiveDataSubscription> {
-        if subscription.is_universe() {
-            return Err(LeanError::Unsupported(format!(
-                "Hyperliquid universe input {}:{} must be subscribed through subscribe_universe",
-                subscription.source_type, subscription.ticker
-            )));
-        }
-        if subscription.source_type != "hyperliquid" {
-            return Err(LeanError::Unsupported(format!(
-                "Hyperliquid live provider does not support custom source {}",
-                subscription.source_type
-            )));
-        }
-
-        let key = format!("{}:{}", subscription.source_type, subscription.ticker);
-        let stop = Arc::new(AtomicBool::new(false));
-        self.custom_stops
-            .lock()
-            .unwrap()
-            .insert(key.clone(), stop.clone());
-        let (sender, receiver) = live_data_channel();
-        let error_sender = sender.clone();
-        let live_config = self.config.clone();
-        let subscription_clone = subscription.clone();
-
-        std::thread::Builder::new()
-            .name(format!("hyperliquid-custom-live-{}", subscription.ticker))
-            .spawn(move || {
-                if let Err(error) =
-                    poll_custom_subscription(subscription_clone, live_config, sender, stop)
-                {
-                    let _ = error_sender.send(Err(LeanError::DataError(error.to_string())));
-                    warn!("Hyperliquid custom live subscription stopped with error: {error:#}");
-                }
-            })
-            .map_err(|error| LeanError::DataError(error.to_string()))?;
-
-        Ok(LiveDataSubscription::new(
-            LiveDataSubscriptionConfig::Custom(subscription.clone()),
+            LiveDataSubscriptionConfig::Market(Box::new(config.clone())),
             receiver,
         ))
     }
@@ -288,22 +289,21 @@ impl DataQueueHandler for HyperliquidLiveDataProvider {
     }
 
     fn unsubscribe(&mut self, config: &SubscriptionDataConfig) -> lean_core::Result<()> {
+        if config.data_kind == SubscriptionDataKind::Custom {
+            if let Some(custom) = config.custom.as_ref() {
+                let key = format!("{}:{}", custom.source_type, custom.ticker);
+                if let Some(stop) = self.custom_stops.lock().unwrap().remove(&key) {
+                    stop.store(true, Ordering::Relaxed);
+                }
+            }
+            return Ok(());
+        }
+
         self.ensure_market_worker()?
             .send(MarketCommand::Unsubscribe {
                 config: config.clone(),
             })
             .map_err(|error| LeanError::DataError(error.to_string()))?;
-        Ok(())
-    }
-
-    fn unsubscribe_custom(
-        &mut self,
-        subscription: &CustomDataSubscription,
-    ) -> lean_core::Result<()> {
-        let key = format!("{}:{}", subscription.source_type, subscription.ticker);
-        if let Some(stop) = self.custom_stops.lock().unwrap().remove(&key) {
-            stop.store(true, Ordering::Relaxed);
-        }
         Ok(())
     }
 
@@ -341,7 +341,7 @@ fn hyperliquid_wire_coin(symbol: &Symbol) -> String {
     if let Some((dex, coin)) = symbol.value.split_once(':') {
         format!("{}:{coin}", dex.to_ascii_lowercase())
     } else {
-        symbol.value.clone()
+        symbol.value.to_string()
     }
 }
 
@@ -606,7 +606,7 @@ fn l2_to_order_book(symbol: &Symbol, book: &hyperliquid_rust_sdk::L2BookData) ->
     let time = NanosecondTimestamp::from_millis(book.time as i64);
     let bids = book
         .levels
-        .get(0)
+        .first()
         .into_iter()
         .flatten()
         .filter_map(book_level_to_order_book_level)
@@ -648,15 +648,21 @@ fn book_level_to_order_book_level(
 }
 
 fn poll_custom_subscription(
-    subscription: CustomDataSubscription,
+    subscription: SubscriptionDataConfig,
     config: HyperliquidLiveConfig,
     sender: crossbeam_channel::Sender<lean_core::Result<LiveDataItem>>,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
+    let custom = subscription
+        .custom
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("custom live subscription missing custom metadata"))?;
     let info = HyperliquidInfoClient::new(config.info_url);
     let mut consecutive_errors = 0u32;
     while !stop.load(Ordering::Relaxed) {
-        let points = match load_live_custom_points(&info, &subscription) {
+        let points = match load_live_custom_points(&info, &custom.ticker, &custom.config.properties)
+        {
             Ok(points) => {
                 consecutive_errors = 0;
                 points
@@ -666,8 +672,8 @@ fn poll_custom_subscription(
                 let backoff = live_custom_error_backoff(config.poll_interval, consecutive_errors);
                 warn!(
                     "Hyperliquid live custom poll {}:{} failed with retriable error; backing off for {:?}: {error:#}",
-                    subscription.source_type,
-                    subscription.ticker,
+                    custom.source_type,
+                    custom.ticker,
                     backoff
                 );
                 sleep_until_stopped(&stop, backoff);
@@ -677,15 +683,16 @@ fn poll_custom_subscription(
         };
         tracing::info!(
             "Hyperliquid live custom poll {}:{} points={}",
-            subscription.source_type,
-            subscription.ticker,
+            custom.source_type,
+            custom.ticker,
             points.len()
         );
         for point in points {
             if sender
                 .send(Ok(LiveDataItem::CustomData {
-                    source_type: subscription.source_type.clone(),
-                    ticker: subscription.ticker.clone(),
+                    symbol: subscription.symbol.clone(),
+                    source_type: custom.source_type.clone(),
+                    ticker: custom.ticker.clone(),
                     point,
                 }))
                 .is_err()
@@ -769,11 +776,16 @@ fn live_universe_poll_interval(configured: Duration, resolution: Resolution) -> 
 fn is_retriable_live_custom_error(error: &anyhow::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("http 429")
+        || message.contains("http 500")
+        || message.contains("http 502")
+        || message.contains("http 503")
+        || message.contains("http 504")
         || message.contains("rate limited")
         || message.contains("timeout")
         || message.contains("timed out")
         || message.contains("connection")
         || message.contains("failed to call hyperliquid info api")
+        || message.contains("hyperliquid info api returned an error")
 }
 
 fn live_custom_error_backoff(base: Duration, consecutive_errors: u32) -> Duration {
@@ -794,9 +806,10 @@ fn sleep_until_stopped(stop: &AtomicBool, duration: Duration) {
 
 fn load_live_custom_points(
     info: &HyperliquidInfoClient,
-    subscription: &CustomDataSubscription,
+    ticker: &str,
+    properties: &HashMap<String, String>,
 ) -> Result<Vec<CustomDataPoint>> {
-    load_live_points(info, &subscription.ticker, &subscription.config.properties)
+    load_live_points(info, ticker, properties)
 }
 
 fn load_live_universe_points(
@@ -1145,5 +1158,22 @@ mod tests {
 
         assert_eq!(fields["impact_ask_px"], json!("5004.5"));
         assert_eq!(fields["impact_bid_px"], json!("5001.5"));
+    }
+
+    #[test]
+    fn live_custom_retry_classifier_treats_info_status_errors_as_retriable() {
+        let error = anyhow::anyhow!(
+            "Hyperliquid Info API returned an error for {{\"dex\":\"xyz\",\"type\":\"metaAndAssetCtxs\"}}"
+        )
+        .context("HTTP status 500 Internal Server Error");
+
+        assert!(is_retriable_live_custom_error(&error));
+    }
+
+    #[test]
+    fn live_custom_retry_classifier_keeps_parse_errors_fatal() {
+        let error = anyhow::anyhow!("Hyperliquid metaAndAssetCtxs response must be [meta, ctxs]");
+
+        assert!(!is_retriable_live_custom_error(&error));
     }
 }

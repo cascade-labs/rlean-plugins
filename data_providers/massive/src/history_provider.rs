@@ -1,71 +1,40 @@
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::Path;
 use std::pin::Pin;
 
 use async_trait::async_trait;
-use chrono::Duration as ChronoDuration;
 use chrono::NaiveDate;
-use tracing::info;
 
-use lean_core::{DateTime, LeanError, Resolution, Result as LeanResult, Symbol, TickType};
+use lean_core::{DateTime, LeanError, Resolution, Result as LeanResult, Symbol};
 use lean_data::{IHistoricalDataProvider, TradeBar};
-use lean_storage::{ParquetWriter, PathResolver, WriterConfig};
 
 use crate::client::MassiveRestClient;
-use crate::corporate_actions::{
-    fetch_and_write_factor_file, fetch_and_write_map_file, lean_factor_file_start_date,
-};
+use crate::corporate_actions::{fetch_factor_rows, fetch_map_rows, lean_factor_file_start_date};
+use lean_storage::{FactorFileEntry, MapFileEntry};
 
 /// Massive historical data provider.
 ///
-/// On every call to `get_trade_bars` it:
-/// 1. Fetches **unadjusted** OHLCV aggregates from Massive.
-/// 2. Fetches splits + dividends and computes a LEAN-compatible factor file.
-/// 3. Writes bars and factor file to the local data directory.
-/// 4. Returns the raw bars (callers apply the factor file separately).
+/// Massive is a **pure data source**: it fetches raw data from the Massive API
+/// and returns it. All persistence is owned by the rlean framework, which writes
+/// the returned rows into Iceberg (trade bars, factor files, and map files
+/// alike). This provider never writes factor/map files itself.
+///
+/// On `get_history` (trade bars) it fetches **unadjusted** OHLCV aggregates.
+/// Corporate actions are served separately via the typed `get_factor_file` /
+/// `get_map_file` methods, which the framework calls and persists.
 pub struct MassiveHistoryProvider {
     client: MassiveRestClient,
-    resolver: PathResolver,
-    writer: ParquetWriter,
 }
 
 impl MassiveHistoryProvider {
     pub fn new(
         api_key: impl Into<String>,
-        data_root: impl AsRef<Path>,
+        _data_root: impl AsRef<std::path::Path>,
         requests_per_second: f64,
     ) -> Self {
         MassiveHistoryProvider {
             client: MassiveRestClient::new(api_key.into(), requests_per_second),
-            resolver: PathResolver::new(data_root),
-            writer: ParquetWriter::new(WriterConfig::default()),
         }
-    }
-
-    /// Path to the LEAN factor file for a symbol.
-    fn factor_file_path(&self, symbol: &Symbol) -> std::path::PathBuf {
-        let ticker = symbol.permtick.to_lowercase();
-        let market = symbol.market().as_str().to_lowercase();
-        let sec = format!("{}", symbol.security_type()).to_lowercase();
-        self.resolver
-            .data_root
-            .join(&sec)
-            .join(&market)
-            .join("factor_files")
-            .join(format!("{ticker}.parquet"))
-    }
-
-    /// Path to the LEAN map file for a symbol.
-    fn map_file_path(&self, symbol: &Symbol) -> std::path::PathBuf {
-        let ticker = symbol.permtick.to_lowercase();
-        let market = symbol.market().as_str().to_lowercase();
-        self.resolver
-            .data_root
-            .join("equity")
-            .join(&market)
-            .join("map_files")
-            .join(format!("{ticker}.parquet"))
     }
 
     async fn fetch_and_cache(
@@ -82,142 +51,60 @@ impl MassiveHistoryProvider {
             .await
             .map_err(|e| LeanError::DataError(e.to_string()))?;
 
-        if bars.is_empty() {
-            return Ok(bars);
-        }
-
-        // Write bars to disk.
-        self.write_to_disk(&symbol, resolution, &bars)?;
-
-        // For equity daily bars, also fetch corporate actions and write factor file,
-        // and fetch ticker details to write the map file.
-        if resolution == Resolution::Daily {
-            if let Err(e) = self
-                .fetch_and_write_factor_file(&symbol, start, end, &bars)
-                .await
-            {
-                // Non-fatal: log the error but continue.
-                tracing::warn!(
-                    "Massive: could not generate factor file for {}: {}",
-                    symbol.value,
-                    e
-                );
-            }
-            let map_path = self.map_file_path(&symbol);
-            let ticker = symbol.permtick.to_uppercase();
-            let today = chrono::Utc::now().date_naive();
-            if let Err(e) = fetch_and_write_map_file(&self.client, &map_path, &ticker, today).await
-            {
-                tracing::warn!(
-                    "Massive: could not generate map file for {}: {}",
-                    symbol.value,
-                    e
-                );
-            }
-        }
-
         Ok(bars)
     }
 
-    async fn fetch_and_write_factor_file(
+    /// Compute factor rows for `symbol`, fetching daily reference prices from
+    /// Massive so dividend price factors can be computed. Returns the rows for
+    /// the framework to persist; performs no writes itself.
+    async fn compute_factor_rows_for(
         &self,
         symbol: &Symbol,
-        start: DateTime,
-        end: DateTime,
-        bars: &[TradeBar],
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<FactorFileEntry>> {
         let ticker = symbol.permtick.to_uppercase();
-        let requested_start_day = start.date_utc();
-        let end_day = end.date_utc();
         let action_start_day = lean_factor_file_start_date();
-        let action_end_day = end_day.max(chrono::Utc::now().date_naive());
+        let action_end_day = chrono::Utc::now().date_naive();
         let action_end = date_to_datetime(action_end_day, 23, 59, 59);
 
-        let mut ref_prices: HashMap<NaiveDate, f64> = bars
-            .iter()
-            .map(|b| {
-                (
-                    b.time.date_utc(),
-                    b.close.to_string().parse::<f64>().unwrap_or(0.0),
-                )
-            })
-            .collect();
-
-        let missing_older_reference_prices = ref_prices
-            .keys()
-            .min()
-            .is_none_or(|first| *first > requested_start_day - ChronoDuration::days(10));
-        if missing_older_reference_prices && action_start_day < requested_start_day {
-            match self
-                .client
-                .get_aggregates(
-                    symbol,
-                    Resolution::Daily,
-                    date_to_datetime(action_start_day, 0, 0, 0),
-                    action_end,
-                    false,
-                )
-                .await
-            {
-                Ok(reference_bars) => {
-                    for bar in reference_bars {
-                        ref_prices
-                            .entry(bar.time.date_utc())
-                            .or_insert_with(|| bar.close.to_string().parse::<f64>().unwrap_or(0.0));
-                    }
+        // Fetch daily bars only for reference prices (needed to compute dividend
+        // adjustment factors). A bars-endpoint permission failure must not
+        // prevent split-factor generation, so treat it as empty ref prices.
+        let mut ref_prices: HashMap<NaiveDate, f64> = HashMap::new();
+        match self
+            .client
+            .get_aggregates(
+                symbol,
+                Resolution::Daily,
+                date_to_datetime(action_start_day, 0, 0, 0),
+                action_end,
+                false,
+            )
+            .await
+        {
+            Ok(reference_bars) => {
+                for bar in reference_bars {
+                    ref_prices
+                        .entry(bar.time.date_utc())
+                        .or_insert_with(|| bar.close.to_string().parse::<f64>().unwrap_or(0.0));
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "Massive: could not fetch full factor reference prices for {} ({}); dividends without reference closes will be skipped",
-                        symbol.value,
-                        e
-                    );
-                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Massive: could not fetch factor reference prices for {} ({}); dividends without reference closes will be skipped",
+                    symbol.value,
+                    e
+                );
             }
         }
 
-        let factor_path = self.factor_file_path(symbol);
-        fetch_and_write_factor_file(
+        fetch_factor_rows(
             &self.client,
-            &factor_path,
             &ticker,
             action_start_day,
             action_end_day,
             &ref_prices,
         )
-        .await?;
-
-        Ok(())
-    }
-
-    fn write_to_disk(
-        &self,
-        symbol: &Symbol,
-        resolution: Resolution,
-        bars: &[TradeBar],
-    ) -> LeanResult<()> {
-        let mut by_date: HashMap<NaiveDate, Vec<TradeBar>> = HashMap::new();
-        for bar in bars {
-            by_date
-                .entry(bar.time.date_utc())
-                .or_default()
-                .push(bar.clone());
-        }
-
-        for (date, day_bars) in by_date {
-            let path =
-                self.resolver
-                    .market_data_partition(symbol, resolution, TickType::Trade, date);
-            self.writer
-                .merge_trade_bar_partition(&day_bars, &path)
-                .map_err(|e| LeanError::DataError(e.to_string()))?;
-            info!(
-                "Massive: cached {} bars → {}",
-                day_bars.len(),
-                path.display()
-            );
-        }
-        Ok(())
+        .await
     }
 }
 
@@ -248,60 +135,12 @@ impl lean_data_providers::IHistoryProvider for MassiveHistoryProvider {
         use lean_data_providers::DataType;
 
         match request.data_type {
-            DataType::FactorFile => {
-                // Fetch daily bars only for reference prices (needed to compute
-                // dividend adjustment factors); do NOT write bars to disk.
-                // Splits do not need reference prices, so a bars endpoint
-                // permission failure must not prevent split factor generation.
-                let bars_start = date_to_datetime(lean_factor_file_start_date(), 0, 0, 0);
-                let bars_end = date_to_datetime(
-                    request.end.date_utc().max(chrono::Utc::now().date_naive()),
-                    23,
-                    59,
-                    59,
-                );
-                let bars = match self
-                    .client
-                    .get_aggregates(
-                        &request.symbol,
-                        lean_core::Resolution::Daily,
-                        bars_start,
-                        bars_end,
-                        false,
-                    )
-                    .await
-                {
-                    Ok(bars) => bars,
-                    Err(e) => {
-                        tracing::warn!(
-                            "Massive: could not fetch daily bars for {} factor refs ({}); continuing with corporate actions only",
-                            request.symbol.value,
-                            e
-                        );
-                        Vec::new()
-                    }
-                };
-
-                self.fetch_and_write_factor_file(
-                    &request.symbol,
-                    request.start,
-                    request.end,
-                    &bars,
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-                Ok(vec![])
-            }
-            DataType::MapFile => {
-                let map_path = self.map_file_path(&request.symbol);
-                let ticker = request.symbol.permtick.to_uppercase();
-                let today = chrono::Utc::now().date_naive();
-                fetch_and_write_map_file(&self.client, &map_path, &ticker, today)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                Ok(vec![])
-            }
+            // Corporate-action files are served via the typed `get_factor_file` /
+            // `get_map_file` methods below; the framework owns persistence.
+            DataType::FactorFile | DataType::MapFile => Err(anyhow::anyhow!(
+                "NotImplemented: Massive serves {:?} via get_factor_file/get_map_file",
+                request.data_type
+            )),
             _ => self
                 .fetch_and_cache(
                     request.symbol.clone(),
@@ -312,5 +151,17 @@ impl lean_data_providers::IHistoryProvider for MassiveHistoryProvider {
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}")),
         }
+    }
+
+    async fn get_factor_file(&self, symbol: &Symbol) -> anyhow::Result<Vec<FactorFileEntry>> {
+        self.compute_factor_rows_for(symbol).await
+    }
+
+    async fn get_map_file(&self, symbol: &Symbol) -> anyhow::Result<Vec<MapFileEntry>> {
+        let ticker = symbol.permtick.to_uppercase();
+        let today = chrono::Utc::now().date_naive();
+        fetch_map_rows(&self.client, &ticker, today)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
     }
 }

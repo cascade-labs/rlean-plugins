@@ -528,6 +528,7 @@ impl ICustomDataSource for HyperliquidUniverseDataSource {
                 uri: path.to_string_lossy().into_owned(),
                 transport: lean_data::custom::CustomDataTransport::LocalFile,
                 format: CustomDataFormat::Csv,
+                headers: std::collections::HashMap::new(),
             }),
             Ok(None) => None,
             Err(error) => {

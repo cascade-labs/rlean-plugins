@@ -5,8 +5,7 @@ pub mod models;
 
 pub use client::MassiveRestClient;
 pub use corporate_actions::{
-    compute_map_file_rows, factor_for_date, fetch_and_write_factor_file, fetch_and_write_map_file,
-    read_factor_file, write_factor_file, write_map_file,
+    compute_map_file_rows, factor_for_date, fetch_factor_rows, fetch_map_rows,
 };
 pub use history_provider::MassiveHistoryProvider;
 

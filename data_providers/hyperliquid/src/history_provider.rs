@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc};
 use lean_core::{
-    DateTime, Market, NanosecondTimestamp, Resolution, SecurityType, Symbol, TickType, TimeSpan,
+    DateTime, Market, NanosecondTimestamp, Resolution, SecurityType, Symbol, TimeSpan,
 };
 use lean_data::{
     Bar, MarginInterestRate, PerpetualContext, QuoteBar, Tick, TradeBar, TradeBarData,
@@ -15,14 +15,10 @@ use lean_data::{
 use lean_data_providers::{
     DataType, HistoryBatchRequest, HistoryRequest, IHistoryProvider, MarketDataBatch,
 };
-use lean_storage::{
-    custom_data_path, ParquetReader, ParquetWriter, PathResolver, QueryParams, WriterConfig,
-};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::json;
 use serde_json::Value;
-use tracing::info;
 
 use crate::archive::{ArchiveRuntime, S3ArchiveClient};
 
@@ -159,9 +155,14 @@ pub struct HyperliquidHistoryProvider {
     archive: S3ArchiveClient,
     info: HyperliquidInfoClient,
     config: HyperliquidArchiveConfig,
-    resolver: PathResolver,
-    reader: ParquetReader,
-    writer: ParquetWriter,
+}
+
+#[derive(Default)]
+struct HyperliquidDerivedData {
+    contexts: Vec<PerpetualContext>,
+    margin_interest_rates: Vec<MarginInterestRate>,
+    quote_bars: Vec<QuoteBar>,
+    open_interest_ticks: Vec<Tick>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -172,7 +173,7 @@ struct ImpactQuoteRatio {
 
 impl HyperliquidHistoryProvider {
     pub fn new(
-        data_root: impl AsRef<Path>,
+        _data_root: impl AsRef<Path>,
         archive: S3ArchiveClient,
         config: HyperliquidArchiveConfig,
     ) -> Self {
@@ -184,9 +185,6 @@ impl HyperliquidHistoryProvider {
             archive,
             info: HyperliquidInfoClient::new(info_url),
             config,
-            resolver: PathResolver::new(data_root),
-            reader: ParquetReader::new(),
-            writer: ParquetWriter::new(WriterConfig::default()),
         }
     }
 
@@ -260,7 +258,7 @@ impl HyperliquidHistoryProvider {
         symbol: &Symbol,
         start: DateTime,
         end: DateTime,
-    ) -> Result<()> {
+    ) -> Result<Vec<Tick>> {
         let coin = self.archive_coin(symbol)?;
         let mut ticks = Vec::new();
         for hour in hours_in_range(start, end) {
@@ -270,8 +268,9 @@ impl HyperliquidHistoryProvider {
             };
             ticks.extend(parse_fill_archive(&text, &coin, symbol)?);
         }
-        self.write_ticks_by_day(symbol, TickType::Trade, &ticks)?;
-        Ok(())
+        ticks.retain(|tick| tick.time >= start && tick.time <= end);
+        sort_and_dedupe_ticks(&mut ticks);
+        Ok(ticks)
     }
 
     async fn ensure_quote_ticks(
@@ -279,7 +278,7 @@ impl HyperliquidHistoryProvider {
         symbol: &Symbol,
         start: DateTime,
         end: DateTime,
-    ) -> Result<()> {
+    ) -> Result<Vec<Tick>> {
         let coin = self.archive_coin(symbol)?;
         let mut ticks = Vec::new();
         for hour in hours_in_range(start, end) {
@@ -289,8 +288,9 @@ impl HyperliquidHistoryProvider {
             };
             ticks.extend(parse_l2_book_archive(&text, &coin, symbol)?);
         }
-        self.write_ticks_by_day(symbol, TickType::Quote, &ticks)?;
-        Ok(())
+        ticks.retain(|tick| tick.time >= start && tick.time <= end);
+        sort_and_dedupe_ticks(&mut ticks);
+        Ok(ticks)
     }
 
     async fn ensure_perpetual_contexts(
@@ -299,7 +299,7 @@ impl HyperliquidHistoryProvider {
         start: DateTime,
         end: DateTime,
         quote_resolution: Resolution,
-    ) -> Result<()> {
+    ) -> Result<HyperliquidDerivedData> {
         if quote_resolution == Resolution::Tick || quote_resolution == Resolution::Second {
             return Err(anyhow::anyhow!(
                 "NotImplemented: Hyperliquid asset_ctxs supports minute, hour, and daily quote bars"
@@ -319,8 +319,9 @@ impl HyperliquidHistoryProvider {
                 .push(symbol.clone());
         }
         if symbols_by_coin.is_empty() {
-            return Ok(());
+            return Ok(HyperliquidDerivedData::default());
         }
+        let mut output = HyperliquidDerivedData::default();
 
         for date in dates_in_range(start, end) {
             let key = asset_contexts_key(date);
@@ -329,130 +330,27 @@ impl HyperliquidHistoryProvider {
             };
             let parsed = parse_asset_context_archive(&text, &symbols_by_coin, start, end)
                 .with_context(|| format!("failed to parse Hyperliquid asset contexts {key}"))?;
-            self.write_perpetual_contexts_by_day(&parsed.contexts)?;
-            self.write_margin_interest_rates_by_day(&parsed.margin_interest_rates)?;
-            self.write_quote_bars_by_day(Resolution::Minute, &parsed.quote_bars)?;
-            self.write_open_interest_ticks_by_day(&parsed.open_interest_ticks)?;
+            output.contexts.extend(parsed.contexts);
+            output
+                .margin_interest_rates
+                .extend(parsed.margin_interest_rates);
+            output
+                .open_interest_ticks
+                .extend(parsed.open_interest_ticks);
 
             if quote_resolution != Resolution::Minute {
                 let aggregated = aggregate_quote_bars(&parsed.quote_bars, quote_resolution)?;
-                self.write_quote_bars_by_day(quote_resolution, &aggregated)?;
+                output.quote_bars.extend(aggregated);
+            } else {
+                output.quote_bars.extend(parsed.quote_bars);
             }
         }
 
-        Ok(())
-    }
-
-    fn archive_coin(&self, symbol: &Symbol) -> Result<String> {
-        validate_hyperliquid_symbol(symbol)?;
-        let key = symbol.value.trim().to_ascii_uppercase();
-        if let Some(mapped) = self.config.coin_map.get(&key) {
-            return Ok(mapped.clone());
-        }
-        if let Some((dex, coin)) = key.split_once(':') {
-            let coin = strip_quote_suffix(coin);
-            let coin = default_archive_coin_alias_for_dex(dex, &coin)
-                .map(str::to_string)
-                .unwrap_or(coin);
-            return Ok(format!("{}:{coin}", dex.to_ascii_lowercase()));
-        }
-        if key.starts_with('@') {
-            return Ok(key);
-        }
-        if let Some(mapped) = default_archive_coin_alias(&key) {
-            return Ok(mapped.to_string());
-        }
-        Ok(strip_quote_suffix(&key))
-    }
-
-    fn read_ticks(
-        &self,
-        symbol: &Symbol,
-        tick_type: TickType,
-        start: DateTime,
-        end: DateTime,
-    ) -> Result<Vec<Tick>> {
-        let mut ticks = Vec::new();
-        let params = QueryParams::new()
-            .with_time_range(start, end)
-            .with_symbols(vec![symbol.id.sid]);
-        for date in dates_in_range(start, end) {
-            let path =
-                self.resolver
-                    .market_data_partition(symbol, Resolution::Tick, tick_type, date);
-            ticks.extend(self.reader.read_tick_partition(&path, symbol, &params)?);
-        }
-        ticks.sort_by_key(|tick| tick.time.0);
-        Ok(ticks)
-    }
-
-    fn read_margin_interest_rates(
-        &self,
-        symbol: &Symbol,
-        start: DateTime,
-        end: DateTime,
-    ) -> Result<Vec<MarginInterestRate>> {
-        let mut rates = Vec::new();
-        let params = QueryParams::new()
-            .with_time_range(start, end)
-            .with_symbols(vec![symbol.id.sid]);
-        for date in dates_in_range(start, end) {
-            let path = self.resolver.margin_interest_partition(symbol, date);
-            rates.extend(
-                self.reader
-                    .read_margin_interest_rate_partition(&path, symbol, &params)?,
-            );
-        }
-        rates.sort_by_key(|rate| rate.time.0);
-        Ok(rates)
-    }
-
-    fn read_quote_bars(
-        &self,
-        symbol: &Symbol,
-        resolution: Resolution,
-        start: DateTime,
-        end: DateTime,
-    ) -> Result<Vec<QuoteBar>> {
-        let mut bars = Vec::new();
-        let params = QueryParams::new()
-            .with_time_range(start, end)
-            .with_symbols(vec![symbol.id.sid]);
-        for date in dates_in_range(start, end) {
-            let path =
-                self.resolver
-                    .market_data_partition(symbol, resolution, TickType::Quote, date);
-            bars.extend(
-                self.reader
-                    .read_quote_bar_partition(&path, symbol, &params)?,
-            );
-        }
-        bars.sort_by_key(|bar| bar.time.0);
-        Ok(bars)
-    }
-
-    fn read_trade_bars(
-        &self,
-        symbol: &Symbol,
-        resolution: Resolution,
-        start: DateTime,
-        end: DateTime,
-    ) -> Result<Vec<TradeBar>> {
-        let mut bars = Vec::new();
-        let params = QueryParams::new()
-            .with_time_range(start, end)
-            .with_symbols(vec![symbol.id.sid]);
-        for date in dates_in_range(start, end) {
-            let path =
-                self.resolver
-                    .market_data_partition(symbol, resolution, TickType::Trade, date);
-            bars.extend(
-                self.reader
-                    .read_trade_bar_partition(&path, symbol, &params)?,
-            );
-        }
-        bars.sort_by_key(|bar| bar.time.0);
-        Ok(bars)
+        sort_and_dedupe_quote_bars(&mut output.quote_bars);
+        sort_and_dedupe_margin_interest_rates(&mut output.margin_interest_rates);
+        sort_and_dedupe_perpetual_contexts(&mut output.contexts);
+        sort_and_dedupe_ticks(&mut output.open_interest_ticks);
+        Ok(output)
     }
 
     async fn read_or_fetch_trade_bars_from_info(
@@ -465,173 +363,13 @@ impl HyperliquidHistoryProvider {
         let mut output = Vec::new();
         for symbol in symbols {
             validate_hyperliquid_symbol(symbol)?;
-            let cached = self.read_trade_bars(symbol, resolution, start, end)?;
-            if !cached.is_empty() {
-                output.extend(cached);
-                continue;
-            }
-
             let fetched = self
                 .fetch_trade_bars_from_info(symbol, resolution, start, end)
                 .await?;
-            self.write_trade_bars_by_day(symbol, resolution, &fetched)?;
-            if fetched.is_empty() && is_hip3_symbol(symbol) {
-                self.ensure_hip3_market_data_from_custom_universe(
-                    std::slice::from_ref(symbol),
-                    resolution,
-                    start,
-                    end,
-                )?;
-                output.extend(self.read_trade_bars(symbol, resolution, start, end)?);
-            } else {
-                output.extend(fetched);
-            }
+            output.extend(fetched);
         }
         sort_and_dedupe_trade_bars(&mut output);
         Ok(output)
-    }
-
-    fn ensure_hip3_market_data_from_custom_universe(
-        &self,
-        symbols: &[Symbol],
-        resolution: Resolution,
-        start: DateTime,
-        end: DateTime,
-    ) -> Result<()> {
-        if matches!(resolution, Resolution::Tick | Resolution::Second) {
-            return Ok(());
-        }
-
-        let mut by_ticker: HashMap<String, Vec<(String, Symbol)>> = HashMap::new();
-        for symbol in symbols.iter().filter(|symbol| is_hip3_symbol(symbol)) {
-            let coin = self.archive_coin(symbol)?;
-            let Some((dex, _)) = coin.split_once(':') else {
-                continue;
-            };
-            by_ticker
-                .entry(format!("HIP3_{}", dex.to_ascii_uppercase()))
-                .or_default()
-                .push((archive_coin_key(&coin), symbol.clone()));
-        }
-        if by_ticker.is_empty() {
-            return Ok(());
-        }
-
-        let mut minute_trade_bars = Vec::new();
-        let mut minute_quote_bars = Vec::new();
-        let mut contexts = Vec::new();
-        let mut margin_rates = Vec::new();
-        let mut open_interest_ticks = Vec::new();
-
-        for date in dates_in_range(start, end) {
-            for (ticker, requested_symbols) in &by_ticker {
-                let path = custom_data_path(&self.resolver.data_root, "hyperliquid", ticker, date);
-                let points = self.reader.read_custom_data_points(&path)?;
-                for point in points {
-                    let Some(time) = point.end_time else {
-                        continue;
-                    };
-                    if time < start || time > end {
-                        continue;
-                    }
-                    let row_symbol = custom_string_field(&point, "symbol")
-                        .map(|value| value.to_ascii_uppercase())
-                        .unwrap_or_default();
-                    let row_coin = custom_string_field(&point, "coin")
-                        .as_deref()
-                        .map(archive_coin_key)
-                        .unwrap_or_default();
-                    let source = custom_string_field(&point, "source").unwrap_or_default();
-                    if !matches!(
-                        source.as_str(),
-                        "asset_ctxs" | "info_api_candle" | "node_fills_by_block"
-                    ) {
-                        continue;
-                    }
-
-                    for (coin_key, symbol) in requested_symbols {
-                        if row_coin != *coin_key && row_symbol != symbol.value {
-                            continue;
-                        }
-                        let Some(price) = custom_decimal_field(&point, "mid_px")
-                            .or_else(|| custom_decimal_field(&point, "mark_px"))
-                            .or_else(|| Some(point.value))
-                            .filter(|price| *price > Decimal::ZERO)
-                        else {
-                            continue;
-                        };
-
-                        minute_trade_bars.push(TradeBar::new(
-                            symbol.clone(),
-                            time,
-                            TimeSpan::ONE_MINUTE,
-                            TradeBarData::new(price, price, price, price, Decimal::ZERO),
-                        ));
-
-                        let funding =
-                            custom_decimal_field(&point, "funding").unwrap_or(Decimal::ZERO);
-                        let open_interest =
-                            custom_decimal_field(&point, "open_interest").unwrap_or(Decimal::ZERO);
-                        let prev_day_px =
-                            custom_decimal_field(&point, "prev_day_px").unwrap_or(Decimal::ZERO);
-                        let day_ntl_vlm =
-                            custom_decimal_field(&point, "day_ntl_vlm").unwrap_or(Decimal::ZERO);
-                        let premium =
-                            custom_decimal_field(&point, "premium").unwrap_or(Decimal::ZERO);
-                        let oracle_px =
-                            custom_decimal_field(&point, "oracle_px").unwrap_or(Decimal::ZERO);
-                        let mark_px = custom_decimal_field(&point, "mark_px").unwrap_or(price);
-                        let mid_px = custom_decimal_field(&point, "mid_px").unwrap_or(price);
-                        let impact_bid_px =
-                            custom_decimal_field(&point, "impact_bid_px").unwrap_or(Decimal::ZERO);
-                        let impact_ask_px =
-                            custom_decimal_field(&point, "impact_ask_px").unwrap_or(Decimal::ZERO);
-
-                        let context = PerpetualContext::new(
-                            symbol.clone(),
-                            time,
-                            TimeSpan::ONE_MINUTE,
-                            funding,
-                            open_interest,
-                            prev_day_px,
-                            day_ntl_vlm,
-                            premium,
-                            oracle_px,
-                            mark_px,
-                            mid_px,
-                            impact_bid_px,
-                            impact_ask_px,
-                        );
-                        if let Some(quote_bar) = quote_bar_from_perpetual_context(&context) {
-                            minute_quote_bars.push(quote_bar);
-                        }
-                        margin_rates.push(MarginInterestRate::new(symbol.clone(), time, funding));
-                        if open_interest > Decimal::ZERO {
-                            open_interest_ticks.push(Tick::open_interest(
-                                symbol.clone(),
-                                time,
-                                open_interest,
-                            ));
-                        }
-                        contexts.push(context);
-                    }
-                }
-            }
-        }
-
-        sort_and_dedupe_trade_bars(&mut minute_trade_bars);
-        sort_and_dedupe_quote_bars(&mut minute_quote_bars);
-        sort_and_dedupe_margin_interest_rates(&mut margin_rates);
-        sort_and_dedupe_perpetual_contexts(&mut contexts);
-        sort_and_dedupe_ticks(&mut open_interest_ticks);
-        let trade_bars = aggregate_trade_bars(&minute_trade_bars, resolution)?;
-        let quote_bars = aggregate_quote_bars(&minute_quote_bars, resolution)?;
-        self.write_trade_bars_by_day_for_all_symbols(resolution, &trade_bars)?;
-        self.write_quote_bars_by_day(resolution, &quote_bars)?;
-        self.write_perpetual_contexts_by_day(&contexts)?;
-        self.write_margin_interest_rates_by_day(&margin_rates)?;
-        self.write_open_interest_ticks_by_day(&open_interest_ticks)?;
-        Ok(())
     }
 
     async fn ensure_hip3_quote_bars_from_trade_bars(
@@ -640,44 +378,19 @@ impl HyperliquidHistoryProvider {
         resolution: Resolution,
         start: DateTime,
         end: DateTime,
-    ) -> Result<()> {
+    ) -> Result<Vec<QuoteBar>> {
         let hip3_symbols = symbols
             .iter()
             .filter(|symbol| is_hip3_symbol(symbol))
             .cloned()
             .collect::<Vec<_>>();
         if hip3_symbols.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let ratios = self.current_impact_quote_ratios(&hip3_symbols)?;
         if ratios.is_empty() {
-            return Ok(());
-        }
-
-        let mut trade_bars_by_sid: HashMap<u64, Vec<TradeBar>> = HashMap::new();
-        if resolution == Resolution::Minute {
-            let mut missing_symbols = Vec::new();
-            for symbol in &hip3_symbols {
-                let cached = self.read_trade_bars(symbol, resolution, start, end)?;
-                if cached.is_empty() {
-                    missing_symbols.push(symbol.clone());
-                } else {
-                    trade_bars_by_sid.insert(symbol.id.sid, cached);
-                }
-            }
-
-            if !missing_symbols.is_empty() {
-                let bars = self
-                    .read_or_fetch_trade_bars_from_info(&missing_symbols, resolution, start, end)
-                    .await?;
-                for bar in bars {
-                    trade_bars_by_sid
-                        .entry(bar.symbol.id.sid)
-                        .or_default()
-                        .push(bar);
-                }
-            }
+            return Ok(Vec::new());
         }
 
         let mut quote_bars = Vec::new();
@@ -687,22 +400,14 @@ impl HyperliquidHistoryProvider {
                 continue;
             };
 
-            let trade_bars = if let Some(bars) = trade_bars_by_sid.get(&symbol.id.sid) {
-                bars.clone()
-            } else {
-                let cached = self.read_trade_bars(symbol, resolution, start, end)?;
-                if !cached.is_empty() {
-                    cached
-                } else {
-                    self.read_or_fetch_trade_bars_from_info(
-                        std::slice::from_ref(symbol),
-                        resolution,
-                        start,
-                        end,
-                    )
-                    .await?
-                }
-            };
+            let trade_bars = self
+                .read_or_fetch_trade_bars_from_info(
+                    std::slice::from_ref(symbol),
+                    resolution,
+                    start,
+                    end,
+                )
+                .await?;
 
             quote_bars.extend(
                 trade_bars
@@ -712,7 +417,7 @@ impl HyperliquidHistoryProvider {
         }
 
         sort_and_dedupe_quote_bars(&mut quote_bars);
-        self.write_quote_bars_by_day(resolution, &quote_bars)
+        Ok(quote_bars)
     }
 
     fn current_impact_quote_ratios(
@@ -790,242 +495,26 @@ impl HyperliquidHistoryProvider {
         Ok(ratios)
     }
 
-    fn read_perpetual_contexts(
-        &self,
-        symbol: &Symbol,
-        start: DateTime,
-        end: DateTime,
-    ) -> Result<Vec<PerpetualContext>> {
-        let mut contexts = Vec::new();
-        let params = QueryParams::new()
-            .with_time_range(start, end)
-            .with_symbols(vec![symbol.id.sid]);
-        for date in dates_in_range(start, end) {
-            let path = self.resolver.perpetual_context_partition(symbol, date);
-            contexts.extend(
-                self.reader
-                    .read_perpetual_context_partition(&path, symbol, &params)?,
-            );
+    fn archive_coin(&self, symbol: &Symbol) -> Result<String> {
+        validate_hyperliquid_symbol(symbol)?;
+        let key = symbol.value.trim().to_ascii_uppercase();
+        if let Some(mapped) = self.config.coin_map.get(&key) {
+            return Ok(mapped.clone());
         }
-        contexts.sort_by_key(|context| context.time.0);
-        Ok(contexts)
-    }
-
-    fn read_existing_ticks_for_day(
-        &self,
-        symbol: &Symbol,
-        tick_type: TickType,
-        date: NaiveDate,
-    ) -> Result<Vec<Tick>> {
-        let path = self
-            .resolver
-            .market_data_partition(symbol, Resolution::Tick, tick_type, date);
-        let params = QueryParams::new().with_symbols(vec![symbol.id.sid]);
-        Ok(self.reader.read_tick_partition(&path, symbol, &params)?)
-    }
-
-    fn write_ticks_by_day(
-        &self,
-        symbol: &Symbol,
-        tick_type: TickType,
-        new_ticks: &[Tick],
-    ) -> Result<()> {
-        if new_ticks.is_empty() {
-            return Ok(());
+        if let Some((dex, coin)) = key.split_once(':') {
+            let coin = strip_quote_suffix(coin);
+            let coin = default_archive_coin_alias_for_dex(dex, &coin)
+                .map(str::to_string)
+                .unwrap_or(coin);
+            return Ok(format!("{}:{coin}", dex.to_ascii_lowercase()));
         }
-
-        let mut by_date: BTreeMap<NaiveDate, Vec<Tick>> = BTreeMap::new();
-        for tick in new_ticks {
-            by_date
-                .entry(tick.time.date_utc())
-                .or_default()
-                .push(tick.clone());
+        if key.starts_with('@') {
+            return Ok(key);
         }
-
-        for (date, mut ticks) in by_date {
-            ticks.extend(self.read_existing_ticks_for_day(symbol, tick_type, date)?);
-            sort_and_dedupe_ticks(&mut ticks);
-            let path =
-                self.resolver
-                    .market_data_partition(symbol, Resolution::Tick, tick_type, date);
-            self.writer.merge_tick_partition(&ticks, &path)?;
-            info!(
-                "Hyperliquid: cached {} {:?} ticks to {}",
-                ticks.len(),
-                tick_type,
-                path.display()
-            );
+        if let Some(mapped) = default_archive_coin_alias(&key) {
+            return Ok(mapped.to_string());
         }
-        Ok(())
-    }
-
-    fn write_trade_bars_by_day(
-        &self,
-        symbol: &Symbol,
-        resolution: Resolution,
-        bars: &[TradeBar],
-    ) -> Result<()> {
-        if bars.is_empty() {
-            return Ok(());
-        }
-        let mut by_date: BTreeMap<NaiveDate, Vec<TradeBar>> = BTreeMap::new();
-        for bar in bars {
-            by_date
-                .entry(bar.time.date_utc())
-                .or_default()
-                .push(bar.clone());
-        }
-        for (date, mut bars) in by_date {
-            let path =
-                self.resolver
-                    .market_data_partition(symbol, resolution, TickType::Trade, date);
-            let params = QueryParams::new().with_symbols(vec![symbol.id.sid]);
-            bars.extend(
-                self.reader
-                    .read_trade_bar_partition(&path, symbol, &params)?,
-            );
-            sort_and_dedupe_trade_bars(&mut bars);
-            self.writer.merge_trade_bar_partition(&bars, &path)?;
-            info!(
-                "Hyperliquid: cached {} trade bars to {}",
-                bars.len(),
-                path.display()
-            );
-        }
-        Ok(())
-    }
-
-    fn write_trade_bars_by_day_for_all_symbols(
-        &self,
-        resolution: Resolution,
-        bars: &[TradeBar],
-    ) -> Result<()> {
-        if bars.is_empty() {
-            return Ok(());
-        }
-        let mut by_date: BTreeMap<NaiveDate, Vec<TradeBar>> = BTreeMap::new();
-        for bar in bars {
-            by_date
-                .entry(bar.time.date_utc())
-                .or_default()
-                .push(bar.clone());
-        }
-        for (date, mut bars) in by_date {
-            sort_and_dedupe_trade_bars(&mut bars);
-            let path = self.resolver.market_data_partition(
-                &bars[0].symbol,
-                resolution,
-                TickType::Trade,
-                date,
-            );
-            self.writer.merge_trade_bar_partition(&bars, &path)?;
-            info!(
-                "Hyperliquid: cached {} trade bars to {}",
-                bars.len(),
-                path.display()
-            );
-        }
-        Ok(())
-    }
-
-    fn write_quote_bars_by_day(&self, resolution: Resolution, bars: &[QuoteBar]) -> Result<()> {
-        if bars.is_empty() {
-            return Ok(());
-        }
-        let mut by_date: BTreeMap<NaiveDate, Vec<QuoteBar>> = BTreeMap::new();
-        for bar in bars {
-            by_date
-                .entry(bar.time.date_utc())
-                .or_default()
-                .push(bar.clone());
-        }
-        for (date, mut bars) in by_date {
-            sort_and_dedupe_quote_bars(&mut bars);
-            let path = self.resolver.market_data_partition(
-                &bars[0].symbol,
-                resolution,
-                TickType::Quote,
-                date,
-            );
-            self.writer.merge_quote_bar_partition(&bars, &path)?;
-            info!(
-                "Hyperliquid: cached {} quote bars to {}",
-                bars.len(),
-                path.display()
-            );
-        }
-        Ok(())
-    }
-
-    fn write_open_interest_ticks_by_day(&self, ticks: &[Tick]) -> Result<()> {
-        if ticks.is_empty() {
-            return Ok(());
-        }
-        let mut by_symbol: HashMap<u64, Vec<Tick>> = HashMap::new();
-        for tick in ticks {
-            by_symbol
-                .entry(tick.symbol.id.sid)
-                .or_default()
-                .push(tick.clone());
-        }
-        for ticks in by_symbol.values() {
-            self.write_ticks_by_day(&ticks[0].symbol, TickType::OpenInterest, ticks)?;
-        }
-        Ok(())
-    }
-
-    fn write_perpetual_contexts_by_day(&self, contexts: &[PerpetualContext]) -> Result<()> {
-        if contexts.is_empty() {
-            return Ok(());
-        }
-        let mut by_date: BTreeMap<NaiveDate, Vec<PerpetualContext>> = BTreeMap::new();
-        for context in contexts {
-            by_date
-                .entry(context.time.date_utc())
-                .or_default()
-                .push(context.clone());
-        }
-        for (date, mut contexts) in by_date {
-            sort_and_dedupe_perpetual_contexts(&mut contexts);
-            let path = self
-                .resolver
-                .perpetual_context_partition(&contexts[0].symbol, date);
-            self.writer
-                .merge_perpetual_context_partition(&contexts, &path)?;
-            info!(
-                "Hyperliquid: cached {} perpetual context rows to {}",
-                contexts.len(),
-                path.display()
-            );
-        }
-        Ok(())
-    }
-
-    fn write_margin_interest_rates_by_day(&self, rates: &[MarginInterestRate]) -> Result<()> {
-        if rates.is_empty() {
-            return Ok(());
-        }
-        let mut by_date: BTreeMap<NaiveDate, Vec<MarginInterestRate>> = BTreeMap::new();
-        for rate in rates {
-            by_date
-                .entry(rate.time.date_utc())
-                .or_default()
-                .push(rate.clone());
-        }
-        for (date, mut rates) in by_date {
-            sort_and_dedupe_margin_interest_rates(&mut rates);
-            let path = self
-                .resolver
-                .margin_interest_partition(&rates[0].symbol, date);
-            self.writer
-                .merge_margin_interest_rate_partition(&rates, &path)?;
-            info!(
-                "Hyperliquid: cached {} funding rates to {}",
-                rates.len(),
-                path.display()
-            );
-        }
-        Ok(())
+        Ok(strip_quote_suffix(&key))
     }
 }
 
@@ -1059,13 +548,14 @@ impl IHistoryProvider for HyperliquidHistoryProvider {
             )
             .await?;
         if !bars.is_empty() && request.symbol.security_type() == SecurityType::CryptoFuture {
-            self.ensure_perpetual_contexts(
-                std::slice::from_ref(&request.symbol),
-                request.start,
-                request.end,
-                request.resolution,
-            )
-            .await?;
+            let _ = self
+                .ensure_perpetual_contexts(
+                    std::slice::from_ref(&request.symbol),
+                    request.start,
+                    request.end,
+                    request.resolution,
+                )
+                .await?;
         }
         Ok(bars)
     }
@@ -1088,33 +578,24 @@ impl IHistoryProvider for HyperliquidHistoryProvider {
                 "NotImplemented: Hyperliquid asset_ctxs does not provide second quote bars"
             ));
         }
-        self.ensure_perpetual_contexts(
-            std::slice::from_ref(&request.symbol),
-            request.start,
-            request.end,
-            request.resolution,
-        )
-        .await?;
-        let mut bars = self.read_quote_bars(
-            &request.symbol,
-            request.resolution,
-            request.start,
-            request.end,
-        )?;
-        if bars.is_empty() && is_hip3_symbol(&request.symbol) {
-            self.ensure_hip3_quote_bars_from_trade_bars(
+        let derived = self
+            .ensure_perpetual_contexts(
                 std::slice::from_ref(&request.symbol),
-                request.resolution,
                 request.start,
                 request.end,
+                request.resolution,
             )
             .await?;
-            bars = self.read_quote_bars(
-                &request.symbol,
-                request.resolution,
-                request.start,
-                request.end,
-            )?;
+        let mut bars = derived.quote_bars;
+        if bars.is_empty() && is_hip3_symbol(&request.symbol) {
+            bars = self
+                .ensure_hip3_quote_bars_from_trade_bars(
+                    std::slice::from_ref(&request.symbol),
+                    request.resolution,
+                    request.start,
+                    request.end,
+                )
+                .await?;
         }
         Ok(bars)
     }
@@ -1128,19 +609,13 @@ impl IHistoryProvider for HyperliquidHistoryProvider {
         }
         validate_hyperliquid_symbol(&request.symbol)?;
 
-        self.ensure_trade_ticks(&request.symbol, request.start, request.end)
+        let mut ticks = self
+            .ensure_trade_ticks(&request.symbol, request.start, request.end)
             .await?;
-        self.ensure_quote_ticks(&request.symbol, request.start, request.end)
-            .await?;
-
-        let mut ticks =
-            self.read_ticks(&request.symbol, TickType::Trade, request.start, request.end)?;
-        ticks.extend(self.read_ticks(
-            &request.symbol,
-            TickType::Quote,
-            request.start,
-            request.end,
-        )?);
+        ticks.extend(
+            self.ensure_quote_ticks(&request.symbol, request.start, request.end)
+                .await?,
+        );
         ticks.sort_by_key(|tick| tick.time.0);
         Ok(ticks)
     }
@@ -1164,21 +639,20 @@ impl IHistoryProvider for HyperliquidHistoryProvider {
 
         if is_hip3_symbol(&request.symbol) {
             let fetch_end = funding_history_cache_end(request.end);
-            let rates = self
+            return self
                 .fetch_margin_interest_rates_from_info(&request.symbol, request.start, fetch_end)
-                .await?;
-            self.write_margin_interest_rates_by_day(&rates)?;
-            return self.read_margin_interest_rates(&request.symbol, request.start, request.end);
+                .await;
         }
 
-        self.ensure_perpetual_contexts(
-            std::slice::from_ref(&request.symbol),
-            request.start,
-            request.end,
-            Resolution::Minute,
-        )
-        .await?;
-        self.read_margin_interest_rates(&request.symbol, request.start, request.end)
+        let derived = self
+            .ensure_perpetual_contexts(
+                std::slice::from_ref(&request.symbol),
+                request.start,
+                request.end,
+                Resolution::Minute,
+            )
+            .await?;
+        Ok(derived.margin_interest_rates)
     }
 
     async fn get_perpetual_contexts(
@@ -1203,14 +677,15 @@ impl IHistoryProvider for HyperliquidHistoryProvider {
             ));
         }
 
-        self.ensure_perpetual_contexts(
-            std::slice::from_ref(&request.symbol),
-            request.start,
-            request.end,
-            Resolution::Minute,
-        )
-        .await?;
-        self.read_perpetual_contexts(&request.symbol, request.start, request.end)
+        let derived = self
+            .ensure_perpetual_contexts(
+                std::slice::from_ref(&request.symbol),
+                request.start,
+                request.end,
+                Resolution::Minute,
+            )
+            .await?;
+        Ok(derived.contexts)
     }
 
     async fn get_history_batch(&self, request: &HistoryBatchRequest) -> Result<MarketDataBatch> {
@@ -1232,13 +707,14 @@ impl IHistoryProvider for HyperliquidHistoryProvider {
                         .cloned()
                         .collect::<Vec<_>>();
                     if !symbols.is_empty() {
-                        self.ensure_perpetual_contexts(
-                            &symbols,
-                            request.start,
-                            request.end,
-                            request.resolution,
-                        )
-                        .await?;
+                        let _ = self
+                            .ensure_perpetual_contexts(
+                                &symbols,
+                                request.start,
+                                request.end,
+                                request.resolution,
+                            )
+                            .await?;
                     }
                 }
                 Ok(MarketDataBatch {
@@ -1252,63 +728,45 @@ impl IHistoryProvider for HyperliquidHistoryProvider {
                         "NotImplemented: Hyperliquid asset_ctxs is minute-resolution context data"
                     ));
                 }
-                self.ensure_perpetual_contexts(
-                    &request.symbols,
-                    request.start,
-                    request.end,
-                    Resolution::Minute,
-                )
-                .await?;
+                let derived = self
+                    .ensure_perpetual_contexts(
+                        &request.symbols,
+                        request.start,
+                        request.end,
+                        Resolution::Minute,
+                    )
+                    .await?;
                 let mut batch = MarketDataBatch::default();
-                for symbol in &request.symbols {
-                    batch
-                        .perpetual_contexts
-                        .extend(self.read_perpetual_contexts(
-                            symbol,
-                            request.start,
-                            request.end,
-                        )?);
-                }
+                batch.perpetual_contexts.extend(derived.contexts);
                 Ok(batch)
             }
             DataType::QuoteBar => {
-                self.ensure_perpetual_contexts(
-                    &request.symbols,
-                    request.start,
-                    request.end,
-                    request.resolution,
-                )
-                .await?;
-                let mut batch = MarketDataBatch::default();
-                let mut missing_hip3_symbols = Vec::new();
-                for symbol in &request.symbols {
-                    let bars = self.read_quote_bars(
-                        symbol,
-                        request.resolution,
+                let derived = self
+                    .ensure_perpetual_contexts(
+                        &request.symbols,
                         request.start,
                         request.end,
-                    )?;
-                    if bars.is_empty() && is_hip3_symbol(symbol) {
-                        missing_hip3_symbols.push(symbol.clone());
-                    }
-                    batch.quote_bars.extend(bars);
-                }
-                if !missing_hip3_symbols.is_empty() {
-                    self.ensure_hip3_quote_bars_from_trade_bars(
-                        &missing_hip3_symbols,
                         request.resolution,
-                        request.start,
-                        request.end,
                     )
                     .await?;
-                    for symbol in &missing_hip3_symbols {
-                        batch.quote_bars.extend(self.read_quote_bars(
-                            symbol,
+                let mut batch = MarketDataBatch::default();
+                batch.quote_bars.extend(derived.quote_bars);
+                let missing_hip3_symbols = request
+                    .symbols
+                    .iter()
+                    .filter(|symbol| is_hip3_symbol(symbol))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !missing_hip3_symbols.is_empty() {
+                    batch.quote_bars.extend(
+                        self.ensure_hip3_quote_bars_from_trade_bars(
+                            &missing_hip3_symbols,
                             request.resolution,
                             request.start,
                             request.end,
-                        )?);
-                    }
+                        )
+                        .await?,
+                    );
                 }
                 Ok(batch)
             }
@@ -1326,8 +784,19 @@ impl IHistoryProvider for HyperliquidHistoryProvider {
                         DataType::TradeBar | DataType::FactorFile | DataType::MapFile => {
                             batch.trade_bars.extend(self.get_history(&single).await?);
                         }
-                        DataType::Tick | DataType::OpenInterest => {
+                        DataType::Tick => {
                             batch.ticks.extend(self.get_ticks(&single).await?);
+                        }
+                        DataType::OpenInterest => {
+                            let derived = self
+                                .ensure_perpetual_contexts(
+                                    std::slice::from_ref(symbol),
+                                    request.start,
+                                    request.end,
+                                    Resolution::Minute,
+                                )
+                                .await?;
+                            batch.ticks.extend(derived.open_interest_ticks);
                         }
                         DataType::MarginInterestRate => {
                             batch
@@ -1627,55 +1096,6 @@ fn quote_bar_from_trade_bar_with_impact_ratio(
         Decimal::ZERO,
         Decimal::ZERO,
     ))
-}
-
-fn custom_string_field(point: &lean_data::CustomDataPoint, field: &str) -> Option<String> {
-    point
-        .fields
-        .get(field)?
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-fn custom_decimal_field(point: &lean_data::CustomDataPoint, field: &str) -> Option<Decimal> {
-    parse_decimal(point.fields.get(field)?).filter(|value| *value != Decimal::ZERO)
-}
-
-fn aggregate_trade_bars(bars: &[TradeBar], resolution: Resolution) -> Result<Vec<TradeBar>> {
-    if resolution == Resolution::Minute {
-        return Ok(bars.to_vec());
-    }
-    let period = resolution
-        .to_time_span()
-        .with_context(|| format!("resolution {resolution:?} cannot produce trade bars"))?;
-    let mut aggregates: BTreeMap<(u64, i64), TradeBar> = BTreeMap::new();
-
-    let mut sorted = bars.to_vec();
-    sorted.sort_by_key(|bar| (bar.symbol.id.sid, bar.time.0));
-    for bar in sorted {
-        let bucket_time = quote_bar_bucket_time(bar.time, resolution)?;
-        let key = (bar.symbol.id.sid, bucket_time.0);
-        match aggregates.get_mut(&key) {
-            Some(existing) => {
-                existing.merge(&bar);
-                existing.end_time = bucket_time + period;
-                existing.period = period;
-            }
-            None => {
-                let mut aggregate = bar.clone();
-                aggregate.time = bucket_time;
-                aggregate.end_time = bucket_time + period;
-                aggregate.period = period;
-                aggregates.insert(key, aggregate);
-            }
-        }
-    }
-
-    let mut output = aggregates.into_values().collect::<Vec<_>>();
-    sort_and_dedupe_trade_bars(&mut output);
-    Ok(output)
 }
 
 fn aggregate_quote_bars(bars: &[QuoteBar], resolution: Resolution) -> Result<Vec<QuoteBar>> {
@@ -2219,22 +1639,6 @@ mod tests {
         assert_eq!(rates[0].time, DateTime::from_millis(1_761_336_000_000));
         assert_eq!(rates[0].interest_rate, Decimal::new(125, 7));
 
-        let cached_trade_bar = TradeBar::new(
-            symbol.clone(),
-            DateTime::from_millis(1_761_336_000_000),
-            TimeSpan::ONE_MINUTE,
-            TradeBarData::new(
-                Decimal::new(3277, 3),
-                Decimal::new(3277, 3),
-                Decimal::new(3277, 3),
-                Decimal::new(3277, 3),
-                Decimal::new(70, 1),
-            ),
-        );
-        provider
-            .write_trade_bars_by_day(&symbol, Resolution::Minute, &[cached_trade_bar])
-            .unwrap();
-
         let trade_bars = provider
             .get_history(&request(
                 symbol.clone(),
@@ -2243,163 +1647,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(trade_bars.len(), 1);
-        assert_eq!(trade_bars[0].open, Decimal::new(3277, 3));
-        assert_eq!(trade_bars[0].close, Decimal::new(3277, 3));
-        assert_eq!(trade_bars[0].volume, Decimal::new(70, 1));
-    }
-
-    #[tokio::test]
-    async fn hip3_trade_requests_backfill_impact_quote_bars_from_asset_contexts() {
-        let temp = TempDir::new().unwrap();
-        let provider = provider(&temp, HashMap::new());
-        let symbol = Symbol::create_crypto_future("XYZ:TSLA", &Market::hyperliquid());
-        let cached_trade_bar = TradeBar::new(
-            symbol.clone(),
-            DateTime::from_millis(1_761_336_000_000),
-            TimeSpan::ONE_MINUTE,
-            TradeBarData::new(
-                Decimal::new(25225, 2),
-                Decimal::new(25225, 2),
-                Decimal::new(25225, 2),
-                Decimal::new(25225, 2),
-                Decimal::new(20, 1),
-            ),
-        );
-        provider
-            .write_trade_bars_by_day(&symbol, Resolution::Minute, &[cached_trade_bar])
-            .unwrap();
-        write_cached_archive(
-            &temp,
-            "hyperliquid-archive",
-            "asset_ctxs/20251024.csv.lz4",
-            "time,coin,funding,open_interest,prev_day_px,day_ntl_vlm,premium,oracle_px,mark_px,mid_px,impact_bid_px,impact_ask_px\n\
-2025-10-24 20:00:00.000,xyz:TSLA,0.000031,100.0,250.00,10000.0,0.0002,252.00,252.10,252.20,251.80,252.70\n",
-        );
-
-        let trade_bars = provider
-            .get_history(&request(
-                symbol.clone(),
-                DataType::TradeBar,
-                Resolution::Minute,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(trade_bars.len(), 1);
-        assert_eq!(trade_bars[0].symbol.value, "XYZ:TSLA");
-
-        let cached_quote_bars = provider
-            .read_quote_bars(
-                &symbol,
-                Resolution::Minute,
-                DateTime::from_millis(1_761_336_000_000),
-                DateTime::from_millis(1_761_336_060_000),
-            )
-            .unwrap();
-        assert_eq!(cached_quote_bars.len(), 1);
-        assert_eq!(
-            cached_quote_bars[0].bid.as_ref().unwrap().close,
-            Decimal::new(25180, 2)
-        );
-        assert_eq!(
-            cached_quote_bars[0].ask.as_ref().unwrap().close,
-            Decimal::new(25270, 2)
-        );
-
-        let direct_quote_bars = provider
-            .get_quote_bars(&request(
-                symbol.clone(),
-                DataType::QuoteBar,
-                Resolution::Minute,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(direct_quote_bars.len(), 1);
-        assert_eq!(direct_quote_bars[0].symbol.value, "XYZ:TSLA");
-    }
-
-    #[test]
-    fn hip3_custom_universe_rows_materialize_market_data_partitions() {
-        let temp = TempDir::new().unwrap();
-        let provider = provider(&temp, HashMap::new());
-        let symbol = Symbol::create_crypto_future("XYZ:TSLA", &Market::hyperliquid());
-        let date = chrono::NaiveDate::from_ymd_opt(2025, 10, 24).unwrap();
-        let time = DateTime::from_millis(1_761_336_000_000);
-        let end = time + TimeSpan::ONE_MINUTE;
-        let path = custom_data_path(
-            temp.path().join("lean-data"),
-            "hyperliquid",
-            "HIP3_XYZ",
-            date,
-        );
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        provider
-            .writer
-            .write_custom_data_points(
-                &[lean_data::CustomDataPoint {
-                    time: date,
-                    end_time: Some(time),
-                    value: Decimal::new(25220, 2),
-                    fields: HashMap::from([
-                        ("source".to_string(), serde_json::json!("asset_ctxs")),
-                        ("symbol".to_string(), serde_json::json!("XYZ:TSLA")),
-                        ("coin".to_string(), serde_json::json!("xyz:TSLA")),
-                        ("funding".to_string(), serde_json::json!("0.000031")),
-                        ("open_interest".to_string(), serde_json::json!("100.0")),
-                        ("prev_day_px".to_string(), serde_json::json!("250.00")),
-                        ("day_ntl_vlm".to_string(), serde_json::json!("10000.0")),
-                        ("premium".to_string(), serde_json::json!("0.0002")),
-                        ("oracle_px".to_string(), serde_json::json!("252.00")),
-                        ("mark_px".to_string(), serde_json::json!("252.10")),
-                        ("mid_px".to_string(), serde_json::json!("252.20")),
-                        ("impact_bid_px".to_string(), serde_json::json!("251.80")),
-                        ("impact_ask_px".to_string(), serde_json::json!("252.70")),
-                    ]),
-                }],
-                &path,
-            )
-            .unwrap();
-
-        provider
-            .ensure_hip3_market_data_from_custom_universe(
-                std::slice::from_ref(&symbol),
-                Resolution::Minute,
-                time,
-                end,
-            )
-            .unwrap();
-
-        let trade_bars = provider
-            .read_trade_bars(&symbol, Resolution::Minute, time, end)
-            .unwrap();
-        assert_eq!(trade_bars.len(), 1);
-        assert_eq!(trade_bars[0].close, Decimal::new(25220, 2));
-        assert_eq!(trade_bars[0].volume, Decimal::ZERO);
-
-        let quote_bars = provider
-            .read_quote_bars(&symbol, Resolution::Minute, time, end)
-            .unwrap();
-        assert_eq!(quote_bars.len(), 1);
-        assert_eq!(
-            quote_bars[0].bid.as_ref().unwrap().close,
-            Decimal::new(25180, 2)
-        );
-        assert_eq!(
-            quote_bars[0].ask.as_ref().unwrap().close,
-            Decimal::new(25270, 2)
-        );
-
-        let rates = provider
-            .read_margin_interest_rates(&symbol, time, end)
-            .unwrap();
-        assert_eq!(rates.len(), 1);
-        assert_eq!(rates[0].interest_rate, Decimal::new(31, 6));
-
-        let contexts = provider
-            .read_perpetual_contexts(&symbol, time, end)
-            .unwrap();
-        assert_eq!(contexts.len(), 1);
-        assert_eq!(contexts[0].mid_px, Decimal::new(25220, 2));
+        assert!(trade_bars.is_empty());
     }
 
     #[test]

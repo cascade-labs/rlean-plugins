@@ -1,5 +1,7 @@
 # rlean-plugins
 
+[![Tests](https://github.com/jfbrown/rlean-plugins/actions/workflows/test.yml/badge.svg)](https://github.com/jfbrown/rlean-plugins/actions/workflows/test.yml)
+
 Runtime plugins for [rlean](../rlean/) — brokerages, data providers, and custom data sources. Each plugin is a Rust `cdylib` crate compiled independently and loaded from `~/.rlean/plugins/` at startup.
 
 ## Plugin Kinds
@@ -128,7 +130,7 @@ See `data_providers/thetadata/` for a complete implementation.
 
 ### Data storage
 
-All data fetched must be written as Parquet via `lean-storage`. **Never write CSV.** See the [data architecture section](#data-architecture) below.
+Data providers must only return rows to the engine. Providers must not write files, query local storage, or maintain provider-side caches. The rlean engine is the single writer and reader for persisted data, and it writes everything into Iceberg tables under `lean-storage`.
 
 ---
 
@@ -238,10 +240,11 @@ For live trading, also implement `Brokerage` (connect/disconnect, place/cancel/u
 
 ## Data Architecture
 
-**All data is Parquet. No CSV.**
+**All persisted data is Iceberg-backed Parquet. No CSV.**
 
-- Use `lean-storage` types (`ParquetWriter`, `ParquetReader`) for all persistence.
-- If an upstream API returns CSV (e.g., FRED's `fredgraph.csv`), parse it in memory and write Parquet — never persist the raw CSV.
+- Providers only fetch and parse upstream data, then return rows to the engine.
+- The rlean engine persists returned rows into Iceberg through `lean-storage::IcebergStore`.
+- If an upstream API returns CSV, parse it in memory and return typed rows — never persist the raw CSV.
 - Do not add `csv` or `serde_csv` as dependencies.
 
 ---

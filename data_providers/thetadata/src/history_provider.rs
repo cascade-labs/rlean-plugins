@@ -5,10 +5,8 @@ use std::collections::HashSet;
 /// store, and returns the raw bars.  The runner applies factor-file adjustments
 /// afterwards (same as the Polygon provider).
 use std::future::Future;
-use std::path::Path;
 use std::pin::Pin;
 
-use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{NaiveDate, TimeZone, Utc};
 use chrono_tz::America::New_York;
@@ -19,11 +17,11 @@ use tracing::info;
 
 use lean_core::{
     DateTime, LeanError, Market, NanosecondTimestamp, OptionRight, OptionStyle, Resolution,
-    Result as LeanResult, Symbol, SymbolOptionsExt, TickType, TimeSpan,
+    Result as LeanResult, Symbol, SymbolOptionsExt, TimeSpan,
 };
 use lean_data::{Bar as LeanBar, IHistoricalDataProvider, QuoteBar, Tick, TradeBar, TradeBarData};
 use lean_data_providers::TickStream;
-use lean_storage::{OptionUniverseRow, ParquetWriter, PathResolver, WriterConfig};
+use lean_storage::OptionUniverseRow;
 
 use crate::client::ThetaDataClient;
 use crate::models::{
@@ -33,8 +31,6 @@ use crate::models::{
 
 pub struct ThetaDataHistoryProvider {
     client: ThetaDataClient,
-    resolver: PathResolver,
-    writer: ParquetWriter,
     /// Earliest date this subscription tier covers.  Requests that start before
     /// this date are silently clipped to avoid HTTP 403 subscription errors.
     /// Defaults to 2018-01-01 (ThetaData STANDARD tier lower bound).
@@ -52,7 +48,7 @@ impl ThetaDataHistoryProvider {
     pub fn new(
         access_token: Option<String>,
         base_url: Option<String>,
-        data_root: impl AsRef<Path>,
+        data_root: impl AsRef<std::path::Path>,
         requests_per_second: f64,
         max_concurrent: usize,
         standard_start_date: Option<NaiveDate>,
@@ -65,8 +61,6 @@ impl ThetaDataHistoryProvider {
                 max_concurrent,
                 data_root.as_ref(),
             ),
-            resolver: PathResolver::new(data_root),
-            writer: ParquetWriter::new(WriterConfig::default()),
             standard_start_date: standard_start_date
                 .unwrap_or_else(|| NaiveDate::from_ymd_opt(2018, 1, 1).unwrap()),
         }
@@ -241,85 +235,11 @@ impl ThetaDataHistoryProvider {
         end: DateTime,
     ) -> LeanResult<Vec<TradeBar>> {
         let bars = self
-            .fetch_trade_bars(symbol.clone(), resolution, start, end)
+            .fetch_trade_bars(symbol, resolution, start, end)
             .await?;
 
-        if bars.is_empty() {
-            return Ok(bars);
-        }
-
-        if let Err(e) = self.write_to_disk(&symbol, resolution, &bars) {
-            tracing::warn!("ThetaData: disk write failed for {}: {e}", symbol.value);
-        }
-
-        info!(
-            "ThetaData: cached {} bars for {}",
-            bars.len(),
-            symbol.permtick
-        );
+        info!("ThetaData: fetched {} bars", bars.len(),);
         Ok(bars)
-    }
-
-    fn write_to_disk(
-        &self,
-        symbol: &Symbol,
-        resolution: Resolution,
-        bars: &[TradeBar],
-    ) -> Result<()> {
-        use std::collections::HashMap;
-
-        if bars.is_empty() {
-            return Ok(());
-        }
-
-        // All resolutions use date partitions with all symbols for the day.
-        let mut by_date: HashMap<NaiveDate, Vec<&TradeBar>> = HashMap::new();
-        for bar in bars {
-            let date = bar.time.to_naive_utc().date();
-            by_date.entry(date).or_default().push(bar);
-        }
-
-        for (date, day_bars) in by_date {
-            let owned: Vec<TradeBar> = day_bars.into_iter().cloned().collect();
-            let path =
-                self.resolver
-                    .market_data_partition(symbol, resolution, TickType::Trade, date);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            self.writer.merge_trade_bar_partition(&owned, &path)?;
-        }
-        Ok(())
-    }
-
-    fn write_quote_bars_to_disk(
-        &self,
-        symbol: &Symbol,
-        resolution: Resolution,
-        bars: &[QuoteBar],
-    ) -> Result<()> {
-        use std::collections::HashMap;
-
-        if bars.is_empty() {
-            return Ok(());
-        }
-
-        let mut by_date: HashMap<NaiveDate, Vec<&QuoteBar>> = HashMap::new();
-        for bar in bars {
-            by_date
-                .entry(bar.time.to_naive_utc().date())
-                .or_default()
-                .push(bar);
-        }
-
-        for (date, day_bars) in by_date {
-            let owned: Vec<QuoteBar> = day_bars.into_iter().cloned().collect();
-            let path =
-                self.resolver
-                    .market_data_partition(symbol, resolution, TickType::Quote, date);
-            self.writer.merge_quote_bar_partition(&owned, &path)?;
-        }
-        Ok(())
     }
 
     async fn fetch_quote_bars(
@@ -347,31 +267,6 @@ impl ThetaDataHistoryProvider {
             .into_iter()
             .filter_map(|row| stock_quote_to_lean_quote_bar(symbol.clone(), row, period))
             .collect())
-    }
-
-    fn write_ticks_to_disk(&self, symbol: &Symbol, ticks: &[Tick]) -> Result<()> {
-        use std::collections::HashMap;
-
-        if ticks.is_empty() {
-            return Ok(());
-        }
-
-        let mut by_partition: HashMap<(NaiveDate, TickType), Vec<&Tick>> = HashMap::new();
-        for tick in ticks {
-            by_partition
-                .entry((tick.time.to_naive_utc().date(), tick.tick_type))
-                .or_default()
-                .push(tick);
-        }
-
-        for ((date, tick_type), partition_ticks) in by_partition {
-            let owned: Vec<Tick> = partition_ticks.into_iter().cloned().collect();
-            let path =
-                self.resolver
-                    .market_data_partition(symbol, Resolution::Tick, tick_type, date);
-            self.writer.merge_tick_partition(&owned, &path)?;
-        }
-        Ok(())
     }
 
     async fn fetch_option_universe_rows(
@@ -447,7 +342,7 @@ impl ThetaDataHistoryProvider {
         Ok(rows
             .into_iter()
             .filter_map(|row| option_ohlc_to_trade_bar(&underlying, row, period))
-            .filter(|bar| allowed.contains(bar.symbol.value.as_str()))
+            .filter(|bar| allowed.contains(&*bar.symbol.value))
             .collect())
     }
 
@@ -509,7 +404,7 @@ impl ThetaDataHistoryProvider {
         Ok(rows
             .into_iter()
             .filter_map(|row| option_quote_to_quote_bar(&underlying, row, period))
-            .filter(|bar| allowed.contains(bar.symbol.value.as_str()))
+            .filter(|bar| allowed.contains(&*bar.symbol.value))
             .collect())
     }
 
@@ -567,7 +462,7 @@ impl ThetaDataHistoryProvider {
         let mut ticks: Vec<Tick> = trade_quote_rows
             .into_iter()
             .flat_map(|row| option_trade_quote_to_ticks(&underlying, row))
-            .filter(|tick| allowed.contains(tick.symbol.value.as_str()))
+            .filter(|tick| allowed.contains(&*tick.symbol.value))
             .collect();
         info!(
             "ThetaData filtered option tick fetch {ticker} {date}: {} filtered trade_quote ticks",
@@ -576,81 +471,6 @@ impl ThetaDataHistoryProvider {
 
         ticks.sort_by_key(|tick| (tick.time.0, tick.tick_type as u8));
         Ok(ticks)
-    }
-
-    fn write_option_universe_to_disk(
-        &self,
-        _ticker: &str,
-        date: NaiveDate,
-        rows: &[OptionUniverseRow],
-    ) -> Result<()> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-        let path = self.resolver.option_universe_partition(date);
-        self.writer
-            .merge_option_universe_partition(rows, &path)
-            .map_err(Into::into)
-    }
-
-    fn write_option_trade_bars_to_disk(
-        &self,
-        _ticker: &str,
-        resolution: Resolution,
-        date: NaiveDate,
-        bars: &[TradeBar],
-    ) -> Result<()> {
-        if bars.is_empty() {
-            return Ok(());
-        }
-        let path = self
-            .resolver
-            .option_partition(resolution, TickType::Trade, date);
-        self.writer
-            .merge_trade_bar_partition(bars, &path)
-            .map_err(Into::into)
-    }
-
-    fn write_option_quote_bars_to_disk(
-        &self,
-        _ticker: &str,
-        resolution: Resolution,
-        date: NaiveDate,
-        bars: &[QuoteBar],
-    ) -> Result<()> {
-        if bars.is_empty() {
-            return Ok(());
-        }
-        let path = self
-            .resolver
-            .option_partition(resolution, TickType::Quote, date);
-        self.writer
-            .merge_quote_bar_partition(bars, &path)
-            .map_err(Into::into)
-    }
-
-    fn write_option_ticks_to_disk(
-        &self,
-        _ticker: &str,
-        date: NaiveDate,
-        ticks: &[Tick],
-    ) -> Result<()> {
-        for tick_type in [TickType::Trade, TickType::Quote, TickType::OpenInterest] {
-            let type_ticks: Vec<Tick> = ticks
-                .iter()
-                .filter(|tick| tick.tick_type == tick_type)
-                .cloned()
-                .collect();
-            if type_ticks.is_empty() {
-                continue;
-            }
-
-            let path = self
-                .resolver
-                .option_partition(Resolution::Tick, tick_type, date);
-            self.writer.merge_tick_partition(&type_ticks, &path)?;
-        }
-        Ok(())
     }
 }
 
@@ -702,16 +522,13 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
         &self,
         request: &lean_data_providers::HistoryRequest,
     ) -> anyhow::Result<Vec<QuoteBar>> {
-        let bars = self
-            .fetch_quote_bars(
-                request.symbol.clone(),
-                request.resolution,
-                request.start,
-                request.end,
-            )
-            .await?;
-        self.write_quote_bars_to_disk(&request.symbol, request.resolution, &bars)?;
-        Ok(bars)
+        self.fetch_quote_bars(
+            request.symbol.clone(),
+            request.resolution,
+            request.start,
+            request.end,
+        )
+        .await
     }
 
     async fn get_ticks(
@@ -736,7 +553,6 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
             .flat_map(|row| stock_trade_quote_to_ticks(request.symbol.clone(), row))
             .collect();
 
-        self.write_ticks_to_disk(&request.symbol, &ticks)?;
         Ok(ticks)
     }
 
@@ -768,27 +584,6 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
                     let rows = rows?;
                     batch.trade_bars.extend(rows);
                 }
-
-                let mut by_date: std::collections::HashMap<NaiveDate, Vec<TradeBar>> =
-                    std::collections::HashMap::new();
-                for bar in &batch.trade_bars {
-                    by_date
-                        .entry(bar.time.to_naive_utc().date())
-                        .or_default()
-                        .push(bar.clone());
-                }
-                for (date, rows) in by_date {
-                    let Some(symbol) = rows.first().map(|bar| &bar.symbol) else {
-                        continue;
-                    };
-                    let path = self.resolver.market_data_partition(
-                        symbol,
-                        request.resolution,
-                        TickType::Trade,
-                        date,
-                    );
-                    self.writer.merge_trade_bar_partition(&rows, &path)?;
-                }
             }
             DataType::QuoteBar => {
                 let results = stream::iter(request.symbols.iter().cloned())
@@ -808,27 +603,6 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
                 for rows in results {
                     let rows = rows?;
                     batch.quote_bars.extend(rows);
-                }
-
-                let mut by_date: std::collections::HashMap<NaiveDate, Vec<QuoteBar>> =
-                    std::collections::HashMap::new();
-                for bar in &batch.quote_bars {
-                    by_date
-                        .entry(bar.time.to_naive_utc().date())
-                        .or_default()
-                        .push(bar.clone());
-                }
-                for (date, rows) in by_date {
-                    let Some(symbol) = rows.first().map(|bar| &bar.symbol) else {
-                        continue;
-                    };
-                    let path = self.resolver.market_data_partition(
-                        symbol,
-                        request.resolution,
-                        TickType::Quote,
-                        date,
-                    );
-                    self.writer.merge_quote_bar_partition(&rows, &path)?;
                 }
             }
             DataType::Tick => {
@@ -871,27 +645,6 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
                     let rows = rows?;
                     batch.ticks.extend(rows);
                 }
-
-                let mut by_date_type: std::collections::HashMap<(NaiveDate, TickType), Vec<Tick>> =
-                    std::collections::HashMap::new();
-                for tick in &batch.ticks {
-                    by_date_type
-                        .entry((tick.time.to_naive_utc().date(), tick.tick_type))
-                        .or_default()
-                        .push(tick.clone());
-                }
-                for ((date, tick_type), rows) in by_date_type {
-                    let Some(symbol) = rows.first().map(|tick| &tick.symbol) else {
-                        continue;
-                    };
-                    let path = self.resolver.market_data_partition(
-                        symbol,
-                        Resolution::Tick,
-                        tick_type,
-                        date,
-                    );
-                    self.writer.merge_tick_partition(&rows, &path)?;
-                }
             }
             DataType::OpenInterest
             | DataType::FactorFile
@@ -917,9 +670,6 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
         let mut batch = OptionMarketDataBatch::default();
         match request.data_type {
             OptionDataType::EodBar => {
-                // Option EOD cache writes use an all-underlying daily partition.
-                // Keep this path sequential until the client exposes a no-write
-                // bulk EOD fetch, so concurrent roots cannot race the partition.
                 for ticker in &request.tickers {
                     batch.eod_bars.extend(
                         self.client
@@ -940,17 +690,6 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
                 for rows in results {
                     batch.universe.extend(rows?);
                 }
-                let mut by_ticker: std::collections::HashMap<String, Vec<OptionUniverseRow>> =
-                    std::collections::HashMap::new();
-                for row in &batch.universe {
-                    by_ticker
-                        .entry(row.underlying.to_ascii_uppercase())
-                        .or_default()
-                        .push(row.clone());
-                }
-                for (ticker, rows) in by_ticker {
-                    self.write_option_universe_to_disk(&ticker, request.date, &rows)?;
-                }
             }
             OptionDataType::TradeBar => {
                 let results = stream::iter(request.tickers.iter().cloned())
@@ -968,17 +707,10 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
                     .await;
 
                 for result in results {
-                    let (ticker, universe, bars) = result?;
-                    self.write_option_universe_to_disk(&ticker, request.date, &universe)?;
+                    let (_ticker, universe, bars) = result?;
                     batch.universe.extend(universe);
                     batch.trade_bars.extend(bars);
                 }
-                self.write_option_trade_bars_to_disk(
-                    "",
-                    request.resolution,
-                    request.date,
-                    &batch.trade_bars,
-                )?;
             }
             OptionDataType::QuoteBar => {
                 let results = stream::iter(request.tickers.iter().cloned())
@@ -996,17 +728,10 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
                     .await;
 
                 for result in results {
-                    let (ticker, universe, bars) = result?;
-                    self.write_option_universe_to_disk(&ticker, request.date, &universe)?;
+                    let (_ticker, universe, bars) = result?;
                     batch.universe.extend(universe);
                     batch.quote_bars.extend(bars);
                 }
-                self.write_option_quote_bars_to_disk(
-                    "",
-                    request.resolution,
-                    request.date,
-                    &batch.quote_bars,
-                )?;
             }
             OptionDataType::Tick => {
                 let results = stream::iter(request.tickers.iter().cloned())
@@ -1022,12 +747,10 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
                     .await;
 
                 for result in results {
-                    let (ticker, universe, ticks) = result?;
-                    self.write_option_universe_to_disk(&ticker, request.date, &universe)?;
+                    let (_ticker, universe, ticks) = result?;
                     batch.universe.extend(universe);
                     batch.ticks.extend(ticks);
                 }
-                self.write_option_ticks_to_disk("", request.date, &batch.ticks)?;
             }
         }
 
@@ -1047,9 +770,7 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
         ticker: &str,
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<OptionUniverseRow>> {
-        let rows = self.fetch_option_universe_rows(ticker, date).await?;
-        self.write_option_universe_to_disk(ticker, date, &rows)?;
-        Ok(rows)
+        self.fetch_option_universe_rows(ticker, date).await
     }
 
     async fn get_option_trade_bars(
@@ -1058,11 +779,7 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
         resolution: Resolution,
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<TradeBar>> {
-        let bars = self
-            .fetch_option_trade_bars(ticker, resolution, date)
-            .await?;
-        self.write_option_trade_bars_to_disk(ticker, resolution, date, &bars)?;
-        Ok(bars)
+        self.fetch_option_trade_bars(ticker, resolution, date).await
     }
 
     async fn get_option_trade_bars_filtered(
@@ -1072,11 +789,8 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
         date: chrono::NaiveDate,
         contracts: &[OptionUniverseRow],
     ) -> anyhow::Result<Vec<TradeBar>> {
-        let bars = self
-            .fetch_option_trade_bars_for_contracts(ticker, resolution, date, contracts)
-            .await?;
-        self.write_option_trade_bars_to_disk(ticker, resolution, date, &bars)?;
-        Ok(bars)
+        self.fetch_option_trade_bars_for_contracts(ticker, resolution, date, contracts)
+            .await
     }
 
     async fn get_option_quote_bars(
@@ -1085,11 +799,7 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
         resolution: Resolution,
         date: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<QuoteBar>> {
-        let bars = self
-            .fetch_option_quote_bars(ticker, resolution, date)
-            .await?;
-        self.write_option_quote_bars_to_disk(ticker, resolution, date, &bars)?;
-        Ok(bars)
+        self.fetch_option_quote_bars(ticker, resolution, date).await
     }
 
     async fn get_option_quote_bars_filtered(
@@ -1099,11 +809,8 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
         date: chrono::NaiveDate,
         contracts: &[OptionUniverseRow],
     ) -> anyhow::Result<Vec<QuoteBar>> {
-        let bars = self
-            .fetch_option_quote_bars_for_contracts(ticker, resolution, date, contracts)
-            .await?;
-        self.write_option_quote_bars_to_disk(ticker, resolution, date, &bars)?;
-        Ok(bars)
+        self.fetch_option_quote_bars_for_contracts(ticker, resolution, date, contracts)
+            .await
     }
 
     async fn get_option_ticks(
@@ -1115,7 +822,6 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
         let ticks = self
             .fetch_option_ticks_for_contracts(ticker, date, &contracts)
             .await?;
-        self.write_option_ticks_to_disk(ticker, date, &ticks)?;
         Ok(ticks)
     }
 
@@ -1125,11 +831,8 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
         date: chrono::NaiveDate,
         contracts: &[OptionUniverseRow],
     ) -> anyhow::Result<Vec<Tick>> {
-        let ticks = self
-            .fetch_option_ticks_for_contracts(ticker, date, contracts)
-            .await?;
-        self.write_option_ticks_to_disk(ticker, date, &ticks)?;
-        Ok(ticks)
+        self.fetch_option_ticks_for_contracts(ticker, date, contracts)
+            .await
     }
 
     async fn stream_option_ticks_filtered(
@@ -1380,7 +1083,7 @@ fn allowed_option_symbol_values(
     contracts
         .iter()
         .filter_map(|row| {
-            option_symbol_from_universe_row(underlying, row).map(|symbol| symbol.value)
+            option_symbol_from_universe_row(underlying, row).map(|symbol| symbol.value.to_string())
         })
         .collect()
 }

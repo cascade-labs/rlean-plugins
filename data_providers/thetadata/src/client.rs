@@ -8,10 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 ///   - Concurrent request limiting (default 4 — STANDARD plan cap)
 ///   - Retry on 429 with exponential back-off + jitter
 ///   - Treat HTTP 472 / 475 / 572 as "no data" (empty result, not an error)
-///   - Option EOD chain data is cached in partitioned Parquet files under
-///     `{data_root}/option/usa/daily/trade/date=YYYY-MM-DD/data.parquet`
 use std::io::{BufRead, BufReader, Lines};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -24,7 +22,7 @@ use serde::de::DeserializeOwned;
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
-use lean_storage::{OptionEodBar, ParquetReader, ParquetWriter, WriterConfig};
+use lean_storage::OptionEodBar;
 
 use crate::models::*;
 
@@ -102,10 +100,6 @@ pub struct ThetaDataClient {
     limiter: Arc<RateLimiter>,
     concurrency: Arc<Semaphore>,
     max_concurrent: usize,
-    /// Root of the structured data store.
-    data_root: PathBuf,
-    parquet_writer: ParquetWriter,
-    parquet_reader: ParquetReader,
 }
 
 pub struct ThetaDataNdjsonStream<T> {
@@ -135,39 +129,6 @@ where
 }
 
 impl ThetaDataClient {
-    fn option_eod_partition_path(&self, date: NaiveDate) -> PathBuf {
-        self.data_root
-            .join("option")
-            .join("usa")
-            .join("daily")
-            .join("trade")
-            .join(format!("date={date}"))
-            .join("data.parquet")
-    }
-
-    fn read_cached_option_eod_bars_for_root(
-        &self,
-        parquet_path: &Path,
-        root: &str,
-    ) -> Result<Option<Vec<OptionEodBar>>> {
-        if !parquet_path.exists() {
-            return Ok(None);
-        }
-
-        let cached = self
-            .parquet_reader
-            .read_option_eod_bars(&[parquet_path.to_path_buf()])?
-            .into_iter()
-            .filter(|bar| bar.underlying.eq_ignore_ascii_case(root))
-            .collect::<Vec<_>>();
-
-        if cached.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(cached))
-        }
-    }
-
     /// Create a new client.
     ///
     /// - `base_url`: ThetaData endpoint.  Pass `None` to use the env var
@@ -180,7 +141,7 @@ impl ThetaDataClient {
         base_url: Option<String>,
         requests_per_second: f64,
         max_concurrent: usize,
-        data_root: impl AsRef<Path>,
+        _data_root: impl AsRef<Path>,
     ) -> Self {
         let http = Client::builder()
             .timeout(Duration::from_secs(300))
@@ -198,9 +159,6 @@ impl ThetaDataClient {
             limiter: Arc::new(RateLimiter::new(requests_per_second)),
             concurrency: Arc::new(Semaphore::new(max_concurrent.max(1))),
             max_concurrent: max_concurrent.max(1),
-            data_root: data_root.as_ref().to_path_buf(),
-            parquet_writer: ParquetWriter::new(WriterConfig::default()),
-            parquet_reader: ParquetReader::new(),
         }
     }
 
@@ -705,26 +663,11 @@ impl ThetaDataClient {
     /// Fetch the full option EOD chain for a root symbol for a single trading day.
     ///
     /// Uses `expiration="*"` and `strike="*"` to retrieve the full chain for that date.
-    ///
-    /// Date-partitioned layout: `{data_root}/option/usa/daily/trade/date=YYYY-MM-DD/data.parquet`
     pub async fn get_option_eod_for_date(
         &self,
         root: &str,
         date: NaiveDate,
     ) -> Result<Vec<V3OptionEod>> {
-        let parquet_path = self.option_eod_partition_path(date);
-
-        // A date partition can contain other underlyings. It is only a cache hit
-        // when the requested root is present in that partition.
-        if let Some(cached) = self.read_cached_option_eod_bars_for_root(&parquet_path, root)? {
-            debug!(
-                "ThetaData: cache hit for {root} on {date} at {}",
-                parquet_path.display()
-            );
-            return Ok(option_eod_bars_to_v3(cached));
-        }
-
-        // ── Cache miss: fetch from API ────────────────────────────────────────
         // strike=* is required — without it the API returns only a single strike.
         let d = fmt_date(date);
         let params = vec![
@@ -734,69 +677,15 @@ impl ThetaDataClient {
             ("start_date", d.clone()),
             ("end_date", d),
         ];
-        let api_rows: Vec<V3OptionEod> = self.execute("option/history/eod", &params).await?;
-
-        if !api_rows.is_empty() {
-            let new_bars: Vec<OptionEodBar> = v3_to_option_eod_bars(root, date, &api_rows);
-            let mut merged = if parquet_path.exists() {
-                self.parquet_reader
-                    .read_option_eod_bars(std::slice::from_ref(&parquet_path))
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            merged.retain(|bar| !bar.underlying.eq_ignore_ascii_case(root));
-            merged.extend_from_slice(&new_bars);
-            if let Err(e) = self
-                .parquet_writer
-                .write_option_eod_bars(&merged, &parquet_path)
-            {
-                warn!("ThetaData: failed to write option EOD Parquet for {root} {date}: {e}");
-            } else {
-                debug!(
-                    "ThetaData: wrote {} option EOD bars to {}",
-                    new_bars.len(),
-                    parquet_path.display()
-                );
-            }
-        }
-
-        Ok(api_rows)
+        self.execute("option/history/eod", &params).await
     }
 
     /// Like `get_option_eod_for_date` but returns `OptionEodBar` directly.
-    ///
-    /// Avoids the double conversion (OptionEodBar→V3OptionEod→OptionChain) on
-    /// the cache-hit path — the Parquet schema already uses typed fields.
-    /// On a cache miss the API rows are converted to OptionEodBar, written to
-    /// disk, and returned (same net cost as `get_option_eod_for_date`).
     pub async fn get_option_eod_bars_for_date(
         &self,
         root: &str,
         date: NaiveDate,
     ) -> Result<Vec<OptionEodBar>> {
-        let parquet_path = self.option_eod_partition_path(date);
-
-        // A date partition can contain other underlyings. It is only a cache hit
-        // when the requested root is present in that partition.
-        match self.read_cached_option_eod_bars_for_root(&parquet_path, root) {
-            Ok(Some(cached)) => {
-                debug!(
-                    "ThetaData: cache hit for {root} on {date} at {}",
-                    parquet_path.display()
-                );
-                return Ok(cached);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                warn!(
-                    "ThetaData: ignoring unreadable option EOD cache for {root} {date} at {}: {e}",
-                    parquet_path.display()
-                );
-            }
-        }
-
-        // Cache miss — fetch from API, write to disk, return as OptionEodBar.
         let d = fmt_date(date);
         let params = vec![
             ("symbol", root.to_string()),
@@ -806,36 +695,7 @@ impl ThetaDataClient {
             ("end_date", d),
         ];
         let api_rows: Vec<V3OptionEod> = self.execute("option/history/eod", &params).await?;
-
-        let bars = v3_to_option_eod_bars(root, date, &api_rows);
-        if !bars.is_empty() {
-            let mut merged = if parquet_path.exists() {
-                match self
-                    .parquet_reader
-                    .read_option_eod_bars(std::slice::from_ref(&parquet_path))
-                {
-                    Ok(rows) => rows,
-                    Err(e) => {
-                        warn!(
-                            "ThetaData: replacing unreadable option EOD cache for {date} at {}: {e}",
-                            parquet_path.display()
-                        );
-                        Vec::new()
-                    }
-                }
-            } else {
-                Vec::new()
-            };
-            merged.retain(|bar| !bar.underlying.eq_ignore_ascii_case(root));
-            merged.extend_from_slice(&bars);
-            if let Err(e) = self
-                .parquet_writer
-                .write_option_eod_bars(&merged, &parquet_path)
-            {
-                warn!("ThetaData: failed to write option EOD Parquet for {root} {date}: {e}");
-            }
-        }
-        Ok(bars)
+        Ok(v3_to_option_eod_bars(root, date, &api_rows))
     }
 
     /// Option EOD for a single contract.
@@ -1239,6 +1099,7 @@ fn v3_to_option_eod_bars(root: &str, date: NaiveDate, rows: &[V3OptionEod]) -> V
 
 /// Convert a slice of `OptionEodBar` back to `V3OptionEod` for callers that
 /// expect the original wire type.
+#[cfg(test)]
 fn option_eod_bars_to_v3(bars: Vec<OptionEodBar>) -> Vec<V3OptionEod> {
     use rust_decimal::prelude::ToPrimitive;
     bars.into_iter()
@@ -2129,195 +1990,5 @@ mod tests {
         assert_eq!(r.right, "C");
         assert_eq!(r.volume, 500.0);
         assert_eq!(r.date, "20210419");
-    }
-
-    /// Test helper: construct the option EOD partition path.
-    fn test_eod_path(root: &std::path::Path, _ul: &str, date: NaiveDate) -> std::path::PathBuf {
-        root.join("option")
-            .join("usa")
-            .join("daily")
-            .join("trade")
-            .join(format!("date={date}"))
-            .join("data.parquet")
-    }
-
-    #[test]
-    fn test_option_eod_parquet_write_and_read() {
-        // Write bars for a date, read them back — entire file is for that date,
-        // no predicate filtering needed.
-        use lean_storage::{OptionEodBar, ParquetReader, ParquetWriter, WriterConfig};
-        use rust_decimal::Decimal;
-        use std::str::FromStr;
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().expect("tmp dir");
-        let root = tmp.path();
-
-        let date = NaiveDate::from_ymd_opt(2021, 4, 19).unwrap();
-        let expiration = NaiveDate::from_ymd_opt(2021, 4, 30).unwrap();
-
-        let bar = OptionEodBar {
-            date,
-            symbol_value: "SPY 210430P00480000".to_string(),
-            underlying: "SPY".to_string(),
-            expiration,
-            strike: Decimal::from_str("480.00").unwrap(),
-            right: "P".to_string(),
-            open: Decimal::from_str("1.50").unwrap(),
-            high: Decimal::from_str("2.00").unwrap(),
-            low: Decimal::from_str("1.00").unwrap(),
-            close: Decimal::from_str("1.80").unwrap(),
-            volume: 1000,
-            bid: Decimal::from_str("1.70").unwrap(),
-            ask: Decimal::from_str("1.90").unwrap(),
-            bid_size: 10,
-            ask_size: 5,
-        };
-
-        // Date-partitioned: one file per date for all underlyings.
-        let path = test_eod_path(root, "SPY", date);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let writer = ParquetWriter::new(WriterConfig::default());
-        writer
-            .write_option_eod_bars(std::slice::from_ref(&bar), &path)
-            .expect("write");
-        assert!(path.exists(), "parquet file should be created");
-
-        // Read back — all rows in this partition are for `date`.
-        let reader = ParquetReader::new();
-        let rows = reader.read_option_eod_bars(&[path]).expect("read");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].symbol_value, "SPY 210430P00480000");
-        assert_eq!(rows[0].underlying, "SPY");
-        assert_eq!(rows[0].volume, 1000);
-        assert_eq!(rows[0].right, "P");
-        assert_eq!(rows[0].date, date);
-    }
-
-    #[test]
-    fn test_option_eod_partition_is_not_cache_hit_for_missing_root() {
-        use lean_storage::{OptionEodBar, ParquetWriter, WriterConfig};
-        use rust_decimal::Decimal;
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().expect("tmp dir");
-        let root = tmp.path();
-        let date = NaiveDate::from_ymd_opt(2021, 4, 19).unwrap();
-        let expiration = NaiveDate::from_ymd_opt(2021, 4, 30).unwrap();
-        let path = test_eod_path(root, "SPY", date);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-
-        let bar = OptionEodBar {
-            date,
-            symbol_value: "SPY 210430P00480000".to_string(),
-            underlying: "SPY".to_string(),
-            expiration,
-            strike: Decimal::from(480),
-            right: "P".to_string(),
-            open: Decimal::from(2),
-            high: Decimal::from(2),
-            low: Decimal::from(2),
-            close: Decimal::from(2),
-            volume: 100,
-            bid: Decimal::from(2),
-            ask: Decimal::from(2),
-            bid_size: 1,
-            ask_size: 1,
-        };
-        ParquetWriter::new(WriterConfig::default())
-            .write_option_eod_bars(&[bar], &path)
-            .expect("write");
-
-        let client =
-            ThetaDataClient::new(None, Some("http://127.0.0.1:9".to_string()), 1.0, 1, root);
-        assert!(client
-            .read_cached_option_eod_bars_for_root(&path, "QQQ")
-            .unwrap()
-            .is_none());
-        assert_eq!(
-            client
-                .read_cached_option_eod_bars_for_root(&path, "SPY")
-                .unwrap()
-                .unwrap()
-                .len(),
-            1
-        );
-    }
-
-    #[test]
-    fn test_option_eod_parquet_cache_miss_for_different_date() {
-        // Writing bars for date A must NOT affect date B; they live in separate partitions.
-        use lean_storage::{OptionEodBar, ParquetWriter, WriterConfig};
-        use rust_decimal::Decimal;
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().expect("tmp dir");
-        let root = tmp.path();
-
-        let date_a = NaiveDate::from_ymd_opt(2021, 4, 19).unwrap();
-        let date_b = NaiveDate::from_ymd_opt(2021, 4, 20).unwrap();
-        let expiration = NaiveDate::from_ymd_opt(2021, 4, 30).unwrap();
-
-        let bar = OptionEodBar {
-            date: date_a,
-            symbol_value: "SPY 210430P00480000".to_string(),
-            underlying: "SPY".to_string(),
-            expiration,
-            strike: Decimal::from(480),
-            right: "P".to_string(),
-            open: Decimal::from(2),
-            high: Decimal::from(2),
-            low: Decimal::from(2),
-            close: Decimal::from(2),
-            volume: 100,
-            bid: Decimal::from(2),
-            ask: Decimal::from(2),
-            bid_size: 1,
-            ask_size: 1,
-        };
-
-        let path_a = test_eod_path(root, "SPY", date_a);
-        std::fs::create_dir_all(path_a.parent().unwrap()).unwrap();
-        let writer = ParquetWriter::new(WriterConfig::default());
-        writer
-            .write_option_eod_bars(&[bar], &path_a)
-            .expect("write");
-
-        // Cache check is just file.exists(); date B has its own partition path.
-        let path_b = test_eod_path(root, "SPY", date_b);
-        assert!(
-            !path_b.exists(),
-            "date B file should not exist when only date A was written"
-        );
-    }
-
-    #[test]
-    fn test_option_eod_parquet_path_layout() {
-        // Date-partitioned: option/usa/daily/trade/date=YYYY-MM-DD/data.parquet
-        use std::path::Path;
-
-        let root = Path::new("/data");
-        let date = NaiveDate::from_ymd_opt(2021, 5, 7).unwrap();
-
-        let path = test_eod_path(root, "SPY", date);
-        assert_eq!(
-            path.to_str().unwrap(),
-            "/data/option/usa/daily/trade/date=2021-05-07/data.parquet"
-        );
-
-        let path2 = test_eod_path(root, "QQQ", date);
-        assert_eq!(
-            path2.to_str().unwrap(),
-            "/data/option/usa/daily/trade/date=2021-05-07/data.parquet"
-        );
-    }
-
-    #[test]
-    fn test_option_eod_date_not_cached_when_file_missing() {
-        // Cache check is file.exists() — missing file = cache miss.
-        use std::path::Path;
-        let date = NaiveDate::from_ymd_opt(2021, 4, 19).unwrap();
-        let path = test_eod_path(Path::new("/nonexistent"), "SPY", date);
-        assert!(!path.exists(), "missing file should not be a cache hit");
     }
 }
