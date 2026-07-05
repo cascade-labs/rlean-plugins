@@ -1,15 +1,15 @@
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 
 use async_trait::async_trait;
 use chrono::NaiveDate;
 
 use lean_core::{DateTime, LeanError, Resolution, Result as LeanResult, Symbol};
-use lean_data::{IHistoricalDataProvider, TradeBar};
+use lean_data::TradeBar;
 
 use crate::client::MassiveRestClient;
-use crate::corporate_actions::{fetch_factor_rows, fetch_map_rows, lean_factor_file_start_date};
+use crate::corporate_actions::{
+    fetch_factor_rows, fetch_map_rows, lean_factor_file_start_date, massive_aggregates_floor_date,
+};
 use lean_storage::{FactorFileEntry, MapFileEntry};
 
 /// Massive historical data provider.
@@ -57,10 +57,7 @@ impl MassiveHistoryProvider {
     /// Compute factor rows for `symbol`, fetching daily reference prices from
     /// Massive so dividend price factors can be computed. Returns the rows for
     /// the framework to persist; performs no writes itself.
-    async fn compute_factor_rows_for(
-        &self,
-        symbol: &Symbol,
-    ) -> anyhow::Result<Vec<FactorFileEntry>> {
+    async fn compute_factor_rows_for(&self, symbol: &Symbol) -> anyhow::Result<Vec<FactorFileEntry>> {
         let ticker = symbol.permtick.to_uppercase();
         let action_start_day = lean_factor_file_start_date();
         let action_end_day = chrono::Utc::now().date_naive();
@@ -69,13 +66,19 @@ impl MassiveHistoryProvider {
         // Fetch daily bars only for reference prices (needed to compute dividend
         // adjustment factors). A bars-endpoint permission failure must not
         // prevent split-factor generation, so treat it as empty ref prices.
+        //
+        // The bars API rejects pre-epoch `from` values, so we must clamp the
+        // fetch to Massive's equities inception rather than passing the factor
+        // file's 1900 base date (which returns a silent `status:"ERROR"` with no
+        // rows and zeroes out every dividend price factor).
+        let reference_start_day = action_start_day.max(massive_aggregates_floor_date());
         let mut ref_prices: HashMap<NaiveDate, f64> = HashMap::new();
         match self
             .client
             .get_aggregates(
                 symbol,
                 Resolution::Daily,
-                date_to_datetime(action_start_day, 0, 0, 0),
+                date_to_datetime(reference_start_day, 0, 0, 0),
                 action_end,
                 false,
             )
@@ -86,6 +89,14 @@ impl MassiveHistoryProvider {
                     ref_prices
                         .entry(bar.time.date_utc())
                         .or_insert_with(|| bar.close.to_string().parse::<f64>().unwrap_or(0.0));
+                }
+                if ref_prices.is_empty() {
+                    tracing::warn!(
+                        "Massive: reference-price fetch for {} returned no daily bars ({} → {}); dividend price factors cannot be computed",
+                        symbol.value,
+                        reference_start_day,
+                        action_end_day,
+                    );
                 }
             }
             Err(e) => {
@@ -106,22 +117,11 @@ impl MassiveHistoryProvider {
         )
         .await
     }
+
 }
 
 fn date_to_datetime(date: NaiveDate, hour: u32, minute: u32, second: u32) -> DateTime {
     date.and_hms_opt(hour, minute, second).unwrap().into()
-}
-
-impl IHistoricalDataProvider for MassiveHistoryProvider {
-    fn get_trade_bars(
-        &self,
-        symbol: Symbol,
-        resolution: Resolution,
-        start: DateTime,
-        end: DateTime,
-    ) -> Pin<Box<dyn Future<Output = LeanResult<Vec<TradeBar>>> + Send + '_>> {
-        Box::pin(self.fetch_and_cache(symbol, resolution, start, end))
-    }
 }
 
 // ─── lean_data_providers::IHistoryProvider ────────────────────────────────────

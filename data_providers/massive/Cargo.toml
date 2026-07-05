@@ -32,3 +32,4 @@ parquet      = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio    = { workspace = true }
+futures  = "0.3"

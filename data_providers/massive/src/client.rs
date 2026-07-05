@@ -313,7 +313,15 @@ impl MassiveRestClient {
                     continue;
                 }
                 Ok(r) if r.status().is_success() => {
-                    return Ok(r.json::<AggregatesResponse>()?);
+                    let resp = r.json::<AggregatesResponse>()?;
+                    // Massive returns HTTP 200 with `status:"ERROR"` for bad
+                    // requests (e.g. an out-of-range `from` timestamp). Treating
+                    // that as an empty result silently zeroed dividend factors,
+                    // so surface it as a hard error instead.
+                    if resp.status.eq_ignore_ascii_case("ERROR") {
+                        bail!("Massive aggregates error status for {}", url);
+                    }
+                    return Ok(resp);
                 }
                 Ok(r) => {
                     bail!("Massive API error: HTTP {}", r.status());

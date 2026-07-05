@@ -26,6 +26,19 @@ pub(crate) fn lean_factor_file_start_date() -> NaiveDate {
     NaiveDate::from_ymd_opt(1900, 1, 1).unwrap()
 }
 
+/// Earliest date Massive's aggregates (bars) endpoint accepts.
+///
+/// The factor file spans back to `lean_factor_file_start_date()` (1900), but the
+/// bars API rejects pre-epoch dates: a 1900 `from` becomes a **negative** Unix
+/// timestamp and returns `{"status":"ERROR","error":"Could not parse the time
+/// parameter: 'from'"}` with no rows. That silently emptied the dividend
+/// reference-price map, so every dividend was skipped and `price_factor`
+/// collapsed to 1.0. Reference prices only need to cover the dividends we can
+/// price, so clamp the bars fetch to Polygon/Massive's equities inception.
+pub(crate) fn massive_aggregates_floor_date() -> NaiveDate {
+    NaiveDate::from_ymd_opt(2003, 9, 10).unwrap()
+}
+
 // ─── Computation ─────────────────────────────────────────────────────────────
 
 /// Build a list of `FactorFileEntry`s from raw Massive API data.
@@ -525,5 +538,54 @@ mod tests {
     #[test]
     fn factor_for_date_returns_one_one_when_no_rows() {
         assert_eq!(factor_for_date(&[], date(2023, 1, 1)), (1.0, 1.0));
+    }
+
+    /// A cash dividend with a known reference close must produce a price factor
+    /// below 1.0 for pre-ex-date bars. Regression guard for the bug where an
+    /// empty `ref_prices` map silently collapsed every dividend to pf=1.0.
+    #[test]
+    fn dividend_with_reference_price_lowers_price_factor() {
+        let ex = date(2022, 2, 28);
+        // Close the day before the ex-date used to price the dividend.
+        let mut prices = HashMap::new();
+        prices.insert(ex - chrono::Duration::days(1), 20.0);
+
+        let dividend = crate::models::MassiveDividendItem {
+            ex_dividend_date: "2022-02-28".to_string(),
+            cash_amount: 0.20,
+            ticker: "KEY".to_string(),
+            dividend_type: "CD".to_string(),
+        };
+
+        let rows = compute_factor_rows(&[], &[dividend], &prices, lean_factor_file_end_date());
+
+        // Bars on/after the ex-date see pf=1.0 (sentinel era); bars before it
+        // must be scaled by (20 - 0.20)/20 = 0.99.
+        let (pf_before, _) = factor_for_date(&rows, ex - chrono::Duration::days(1));
+        assert!(
+            (pf_before - 0.99).abs() < 1e-9,
+            "pre-ex-date price factor should be 0.99, got {pf_before}"
+        );
+        assert!(
+            pf_before < 1.0,
+            "dividend must lower the pre-ex-date price factor below 1.0"
+        );
+    }
+
+    /// Without reference prices the dividend is skipped (documents the failure
+    /// mode the history-provider clamp now prevents by supplying real closes).
+    #[test]
+    fn dividend_without_reference_price_is_skipped() {
+        let dividend = crate::models::MassiveDividendItem {
+            ex_dividend_date: "2022-02-28".to_string(),
+            cash_amount: 0.20,
+            ticker: "KEY".to_string(),
+            dividend_type: "CD".to_string(),
+        };
+        let rows = compute_factor_rows(&[], &[dividend], &HashMap::new(), lean_factor_file_end_date());
+        assert!(
+            rows.iter().all(|r| (r.price_factor - 1.0).abs() < 1e-9),
+            "with no reference prices all price factors stay 1.0 (bug condition)"
+        );
     }
 }
