@@ -34,8 +34,7 @@ impl Default for CboeVixDataSource {
 }
 
 impl ICustomDataSource for CboeVixDataSource {
-    fn initialize(&mut self, _context: &CustomDataContext) {
-    }
+    fn initialize(&mut self, _context: &CustomDataContext) {}
 
     fn name(&self) -> &str {
         "cboe_vix"
@@ -62,7 +61,12 @@ impl ICustomDataSource for CboeVixDataSource {
         lean_core::Resolution::Daily
     }
 
-    fn reader(&self, line: &str, _date: NaiveDate, _config: &CustomDataConfig) -> Option<CustomDataPoint> {
+    fn reader(
+        &self,
+        line: &str,
+        _date: NaiveDate,
+        _config: &CustomDataConfig,
+    ) -> Option<CustomDataPoint> {
         parse_index_history_row(line).map(|row| custom_point(row.date, row.close))
     }
 
@@ -70,11 +74,7 @@ impl ICustomDataSource for CboeVixDataSource {
         true
     }
 
-    fn read_history_line(
-        &self,
-        line: &str,
-        _config: &CustomDataConfig,
-    ) -> Option<CustomDataPoint> {
+    fn read_history_line(&self, line: &str, _config: &CustomDataConfig) -> Option<CustomDataPoint> {
         self.reader(line, NaiveDate::MIN, _config)
     }
 
@@ -85,7 +85,7 @@ impl ICustomDataSource for CboeVixDataSource {
     ) -> Option<Result<Vec<CustomDataPoint>, String>> {
         let ticker = normalize_ticker(ticker);
         if ticker == "VX30" {
-            Some(fetch_vx30_history())
+            Some(fetch_vx30_history(config))
         } else {
             let source = self.get_source(&ticker, NaiveDate::MIN, config)?;
             Some(
@@ -94,6 +94,7 @@ impl ICustomDataSource for CboeVixDataSource {
                     .map(|text| {
                         text.lines()
                             .filter_map(|line| self.read_history_line(line, config))
+                            .filter(|point| custom_point_in_query(point, config))
                             .collect()
                     }),
             )
@@ -105,10 +106,14 @@ fn normalize_ticker(ticker: &str) -> String {
     ticker.trim().to_ascii_uppercase()
 }
 
-fn fetch_vx30_history() -> Result<Vec<CustomDataPoint>, String> {
+fn fetch_vx30_history(config: &CustomDataConfig) -> Result<Vec<CustomDataPoint>, String> {
     let html = fetch_text(CBOE_FUTURES_HISTORY_URL)
         .map_err(|error| format!("VX history page fetch failed: {error}"))?;
-    let urls = extract_vx_history_urls(&html);
+    let (start, end) = query_dates(config);
+    let urls = extract_vx_history_urls(&html)
+        .into_iter()
+        .filter(|(expiry, _)| expiry_in_query_window(*expiry, start, end))
+        .collect::<Vec<_>>();
     if urls.is_empty() {
         return Err("VX history page did not expose any VX contract CSV links".to_string());
     }
@@ -142,6 +147,9 @@ fn fetch_vx30_history() -> Result<Vec<CustomDataPoint>, String> {
     Ok(settlements
         .into_iter()
         .filter_map(|(date, mut curve)| {
+            if !date_in_query_window(date, start, end) {
+                return None;
+            }
             Decimal::from_str(&interpolate_vx30(&mut curve)?.to_string())
                 .ok()
                 .map(|value| custom_point(date, value))
@@ -149,14 +157,40 @@ fn fetch_vx30_history() -> Result<Vec<CustomDataPoint>, String> {
         .collect())
 }
 
+fn custom_point_in_query(point: &CustomDataPoint, config: &CustomDataConfig) -> bool {
+    let (start, end) = query_dates(config);
+    date_in_query_window(point.time, start, end)
+}
+
+fn query_dates(config: &CustomDataConfig) -> (Option<NaiveDate>, Option<NaiveDate>) {
+    let start = config
+        .query
+        .start_date
+        .or_else(|| config.query.start_time.map(|time| time.date_utc()));
+    let end = config
+        .query
+        .end_date
+        .or_else(|| config.query.end_time.map(|time| time.date_utc()));
+    (start, end)
+}
+
+fn date_in_query_window(date: NaiveDate, start: Option<NaiveDate>, end: Option<NaiveDate>) -> bool {
+    start.map_or(true, |start| date >= start) && end.map_or(true, |end| date <= end)
+}
+
+fn expiry_in_query_window(
+    expiry: NaiveDate,
+    start: Option<NaiveDate>,
+    end: Option<NaiveDate>,
+) -> bool {
+    let min_expiry = start.map(|date| date + chrono::Duration::days(1));
+    let max_expiry = end.map(|date| date + chrono::Duration::days(120));
+    date_in_query_window(expiry, min_expiry, max_expiry)
+}
+
 fn fetch_text(url: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(async {
-        let response = reqwest::get(url).await?.error_for_status()?;
-        Ok(response.text().await?)
-    })
+    let response = reqwest::blocking::get(url)?.error_for_status()?;
+    Ok(response.text()?)
 }
 
 #[derive(Debug, Clone, PartialEq)]

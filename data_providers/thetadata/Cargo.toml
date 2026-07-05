@@ -26,6 +26,7 @@ chrono-tz    = { workspace = true }
 tracing      = { workspace = true }
 async-trait  = { workspace = true }
 rust_decimal = { workspace = true }
+parquet      = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

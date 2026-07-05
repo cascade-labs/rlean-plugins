@@ -35,5 +35,5 @@ async-trait = "0.1"
 rust_decimal = { version = "1", features = ["serde-with-str"] }
 arrow-array  = "53"
 arrow-schema = "53"
-parquet      = { version = "53", features = ["async"] }
+parquet      = { version = "53", features = ["async", "snap"] }
 tempfile     = "3"

@@ -297,7 +297,7 @@ impl Brokerage for TradierBrokerage {
 
                 positions
                     .into_iter()
-                    .filter_map(|position| {
+                    .map(|position| {
                         let symbol = parse_osi_symbol(&position.symbol).unwrap_or_else(|| {
                             Symbol::create_equity(&position.symbol, &Market::usa())
                         });
@@ -310,12 +310,12 @@ impl Brokerage for TradierBrokerage {
                             .get(&position.symbol.to_ascii_uppercase())
                             .copied()
                             .unwrap_or(Decimal::ZERO);
-                        Some(BrokerageHolding {
+                        BrokerageHolding {
                             symbol,
                             quantity: position.quantity,
                             average_price,
                             market_price,
-                        })
+                        }
                     })
                     .collect()
             }
@@ -823,18 +823,11 @@ struct TradierOrderLeg {
 fn split_cross_zero_order(quantity: Decimal, current_position: Decimal) -> Vec<TradierOrderLeg> {
     let current = current_position;
     let projected = current + quantity;
-    if current > Decimal::ZERO && quantity < Decimal::ZERO && projected < Decimal::ZERO {
-        vec![
-            TradierOrderLeg {
-                quantity: -current,
-                current_position,
-            },
-            TradierOrderLeg {
-                quantity: projected,
-                current_position: Decimal::ZERO,
-            },
-        ]
-    } else if current < Decimal::ZERO && quantity > Decimal::ZERO && projected > Decimal::ZERO {
+    let crosses_zero =
+        (current > Decimal::ZERO && quantity < Decimal::ZERO && projected < Decimal::ZERO)
+            || (current < Decimal::ZERO && quantity > Decimal::ZERO && projected > Decimal::ZERO);
+
+    if crosses_zero {
         vec![
             TradierOrderLeg {
                 quantity: -current,

@@ -1991,4 +1991,5 @@ mod tests {
         assert_eq!(r.volume, 500.0);
         assert_eq!(r.date, "20210419");
     }
+
 }

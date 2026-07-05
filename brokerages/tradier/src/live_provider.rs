@@ -1206,7 +1206,7 @@ impl<'de> Deserialize<'de> for FlexibleI64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lean_core::{Market, OptionRight, OptionStyle};
+    use lean_core::{DataNormalizationMode, Market, OptionRight, OptionStyle};
     use rust_decimal_macros::dec;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -1262,7 +1262,11 @@ mod tests {
     #[test]
     fn parses_quote_event_to_quote_bar() {
         let symbol = Symbol::create_equity("SPY", &Market::usa());
-        let mut config = SubscriptionDataConfig::new_equity(symbol, Resolution::Minute);
+        let mut config = SubscriptionDataConfig::new_equity(
+            symbol,
+            Resolution::Minute,
+            DataNormalizationMode::Adjusted,
+        );
         config.tick_type = TickType::Quote;
         let event: TradierStreamEvent = serde_json::from_str(
             r#"{"type":"quote","symbol":"SPY","bid":281.84,"bidsz":60,"biddate":"1557757189000","ask":281.85,"asksz":6,"askdate":"1557757190000"}"#,
@@ -1282,7 +1286,11 @@ mod tests {
     #[test]
     fn parses_trade_event_to_trade_bar() {
         let symbol = Symbol::create_equity("SPY", &Market::usa());
-        let config = SubscriptionDataConfig::new_equity(symbol, Resolution::Minute);
+        let config = SubscriptionDataConfig::new_equity(
+            symbol,
+            Resolution::Minute,
+            DataNormalizationMode::Adjusted,
+        );
         let event: TradierStreamEvent = serde_json::from_str(
             r#"{"type":"trade","symbol":"SPY","exch":"J","price":"281.85","size":"100","date":"1557757190000","last":"281.85"}"#,
         )
@@ -1301,7 +1309,11 @@ mod tests {
     #[test]
     fn rest_quote_to_trade_bar_uses_last_price() {
         let symbol = Symbol::create_equity("SPY", &Market::usa());
-        let config = SubscriptionDataConfig::new_equity(symbol, Resolution::Minute);
+        let config = SubscriptionDataConfig::new_equity(
+            symbol,
+            Resolution::Minute,
+            DataNormalizationMode::Adjusted,
+        );
 
         let item = rest_quote_to_trade_item(&sample_rest_quote(), &config).unwrap();
 
@@ -1321,7 +1333,11 @@ mod tests {
     #[test]
     fn rest_quote_to_quote_bar_uses_bid_ask() {
         let symbol = Symbol::create_equity("SPY", &Market::usa());
-        let mut config = SubscriptionDataConfig::new_equity(symbol, Resolution::Minute);
+        let mut config = SubscriptionDataConfig::new_equity(
+            symbol,
+            Resolution::Minute,
+            DataNormalizationMode::Adjusted,
+        );
         config.tick_type = TickType::Quote;
 
         let item = rest_quote_to_quote_item(&sample_rest_quote(), &config).unwrap();
@@ -1347,7 +1363,11 @@ mod tests {
     #[test]
     fn rest_quote_to_trade_bar_rejects_zero_last_price() {
         let symbol = Symbol::create_equity("SPY", &Market::usa());
-        let config = SubscriptionDataConfig::new_equity(symbol, Resolution::Minute);
+        let config = SubscriptionDataConfig::new_equity(
+            symbol,
+            Resolution::Minute,
+            DataNormalizationMode::Adjusted,
+        );
         let quote = TradierQuote {
             last: 0.0,
             bid: 734.14,
@@ -1381,7 +1401,11 @@ mod tests {
     #[test]
     fn live_quote_event_does_not_publish_zero_prices() {
         let symbol = Symbol::create_equity("SPY", &Market::usa());
-        let mut config = SubscriptionDataConfig::new_equity(symbol, Resolution::Tick);
+        let mut config = SubscriptionDataConfig::new_equity(
+            symbol,
+            Resolution::Tick,
+            DataNormalizationMode::Adjusted,
+        );
         config.tick_type = TickType::Quote;
         let event: TradierStreamEvent = serde_json::from_str(
             r#"{"type":"quote","symbol":"SPY","bid":"0","bidsz":"60","biddate":"1557757189000","ask":"281.85","asksz":"6","askdate":"1557757190000"}"#,
@@ -1404,7 +1428,11 @@ mod tests {
     #[test]
     fn live_trade_event_does_not_publish_zero_prices() {
         let symbol = Symbol::create_equity("SPY", &Market::usa());
-        let config = SubscriptionDataConfig::new_equity(symbol, Resolution::Tick);
+        let config = SubscriptionDataConfig::new_equity(
+            symbol,
+            Resolution::Tick,
+            DataNormalizationMode::Adjusted,
+        );
         let event: TradierStreamEvent = serde_json::from_str(
             r#"{"type":"trade","symbol":"SPY","exch":"J","price":"0","size":"100","date":"1557757190000"}"#,
         )
@@ -1427,6 +1455,7 @@ mod tests {
         let mut config = SubscriptionDataConfig::new_equity(
             Symbol::create_equity("SPY", &Market::usa()),
             Resolution::Tick,
+            DataNormalizationMode::Adjusted,
         );
         config.tick_type = TickType::Quote;
 
@@ -1472,6 +1501,7 @@ mod tests {
         let mut config = SubscriptionDataConfig::new_equity(
             Symbol::create_equity("SPY", &Market::usa()),
             Resolution::Tick,
+            DataNormalizationMode::Adjusted,
         );
         config.tick_type = TickType::Quote;
 

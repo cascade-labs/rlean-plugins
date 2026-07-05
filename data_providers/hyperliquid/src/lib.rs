@@ -112,6 +112,11 @@ pub unsafe extern "C" fn rlean_create_history_provider(
 }
 
 #[no_mangle]
+/// # Safety
+///
+/// `config_json` must be null or point to a valid, NUL-terminated C string for
+/// the duration of the call. The returned pointer must be released with
+/// `rlean_destroy_live_data_provider`.
 pub unsafe extern "C" fn rlean_create_live_data_provider(
     config_json: *const std::os::raw::c_char,
 ) -> *mut () {
@@ -126,6 +131,10 @@ pub unsafe extern "C" fn rlean_create_live_data_provider(
 }
 
 #[no_mangle]
+/// # Safety
+///
+/// `ptr` must be null or a pointer previously returned by
+/// `rlean_create_live_data_provider` that has not already been destroyed.
 pub unsafe extern "C" fn rlean_destroy_live_data_provider(ptr: *mut ()) {
     if !ptr.is_null() {
         drop(unsafe { Box::from_raw(ptr as *mut Box<dyn DataQueueHandler>) });
@@ -133,6 +142,11 @@ pub unsafe extern "C" fn rlean_destroy_live_data_provider(ptr: *mut ()) {
 }
 
 #[no_mangle]
+/// # Safety
+///
+/// `config_json` must be null or point to a valid, NUL-terminated C string for
+/// the duration of the call. The returned pointer must be released with
+/// `rlean_destroy_brokerage`.
 pub unsafe extern "C" fn rlean_create_brokerage(
     config_json: *const std::os::raw::c_char,
 ) -> *mut () {
@@ -153,6 +167,10 @@ pub unsafe extern "C" fn rlean_create_brokerage(
 }
 
 #[no_mangle]
+/// # Safety
+///
+/// `ptr` must be null or a pointer previously returned by
+/// `rlean_create_brokerage` that has not already been destroyed.
 pub unsafe extern "C" fn rlean_destroy_brokerage(ptr: *mut ()) {
     if !ptr.is_null() {
         drop(unsafe { Box::from_raw(ptr as *mut Box<dyn Brokerage>) });

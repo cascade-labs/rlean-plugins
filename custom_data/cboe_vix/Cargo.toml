@@ -19,7 +19,6 @@ serde_json          = { workspace = true }
 anyhow              = { workspace = true }
 lean-storage        = { workspace = true }
 reqwest             = { workspace = true }
-tokio               = { workspace = true }
 arrow-array         = { workspace = true }
 arrow-schema        = { workspace = true }
 parquet             = { workspace = true }

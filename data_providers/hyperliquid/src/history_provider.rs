@@ -334,9 +334,7 @@ impl HyperliquidHistoryProvider {
             output
                 .margin_interest_rates
                 .extend(parsed.margin_interest_rates);
-            output
-                .open_interest_ticks
-                .extend(parsed.open_interest_ticks);
+            output.open_interest_ticks.extend(parsed.open_interest_ticks);
 
             if quote_resolution != Resolution::Minute {
                 let aggregated = aggregate_quote_bars(&parsed.quote_bars, quote_resolution)?;
@@ -401,12 +399,7 @@ impl HyperliquidHistoryProvider {
             };
 
             let trade_bars = self
-                .read_or_fetch_trade_bars_from_info(
-                    std::slice::from_ref(symbol),
-                    resolution,
-                    start,
-                    end,
-                )
+                .read_or_fetch_trade_bars_from_info(std::slice::from_ref(symbol), resolution, start, end)
                 .await?;
 
             quote_bars.extend(

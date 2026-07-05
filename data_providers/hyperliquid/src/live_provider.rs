@@ -11,9 +11,10 @@ use lean_core::{
     LeanError, Market, NanosecondTimestamp, Resolution, SecurityType, Symbol, TickType, TimeSpan,
 };
 use lean_data::{
-    live_data_channel, Bar, CustomDataPoint, DataQueueHandler, LiveDataItem, LiveDataSubscription,
-    LiveDataSubscriptionConfig, LiveNodePacket, LiveUniverseSubscriptionConfig, OrderBook,
-    OrderBookLevel, QuoteBar, SubscriptionDataConfig, SubscriptionDataKind, TradeBar, TradeBarData,
+    live_data_channel, Bar, CustomDataPoint, DataQueueHandler, LiveDataItem,
+    LiveDataSubscription, LiveDataSubscriptionConfig, LiveNodePacket, LiveUniverseSubscriptionConfig,
+    OrderBook, OrderBookLevel, QuoteBar, SubscriptionDataConfig, SubscriptionDataKind, TradeBar,
+    TradeBarData,
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -183,8 +184,7 @@ impl HyperliquidLiveDataProvider {
         std::thread::Builder::new()
             .name(format!("hyperliquid-custom-live-{thread_ticker}"))
             .spawn(move || {
-                if let Err(error) =
-                    poll_custom_subscription(subscription, live_config, sender, stop)
+                if let Err(error) = poll_custom_subscription(subscription, live_config, sender, stop)
                 {
                     let _ = error_sender.send(Err(LeanError::DataError(error.to_string())));
                     warn!("Hyperliquid custom live subscription stopped with error: {error:#}");
@@ -661,8 +661,7 @@ fn poll_custom_subscription(
     let info = HyperliquidInfoClient::new(config.info_url);
     let mut consecutive_errors = 0u32;
     while !stop.load(Ordering::Relaxed) {
-        let points = match load_live_custom_points(&info, &custom.ticker, &custom.config.properties)
-        {
+        let points = match load_live_custom_points(&info, &custom.ticker, &custom.config.properties) {
             Ok(points) => {
                 consecutive_errors = 0;
                 points
@@ -1172,7 +1171,8 @@ mod tests {
 
     #[test]
     fn live_custom_retry_classifier_keeps_parse_errors_fatal() {
-        let error = anyhow::anyhow!("Hyperliquid metaAndAssetCtxs response must be [meta, ctxs]");
+        let error =
+            anyhow::anyhow!("Hyperliquid metaAndAssetCtxs response must be [meta, ctxs]");
 
         assert!(!is_retriable_live_custom_error(&error));
     }

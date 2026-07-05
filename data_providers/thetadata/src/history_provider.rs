@@ -238,7 +238,10 @@ impl ThetaDataHistoryProvider {
             .fetch_trade_bars(symbol, resolution, start, end)
             .await?;
 
-        info!("ThetaData: fetched {} bars", bars.len(),);
+        info!(
+            "ThetaData: fetched {} bars",
+            bars.len(),
+        );
         Ok(bars)
     }
 
@@ -472,6 +475,7 @@ impl ThetaDataHistoryProvider {
         ticks.sort_by_key(|tick| (tick.time.0, tick.tick_type as u8));
         Ok(ticks)
     }
+
 }
 
 impl IHistoricalDataProvider for ThetaDataHistoryProvider {
@@ -584,6 +588,7 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
                     let rows = rows?;
                     batch.trade_bars.extend(rows);
                 }
+
             }
             DataType::QuoteBar => {
                 let results = stream::iter(request.symbols.iter().cloned())
@@ -604,6 +609,7 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
                     let rows = rows?;
                     batch.quote_bars.extend(rows);
                 }
+
             }
             DataType::Tick => {
                 let mut seen_symbols = HashSet::new();
@@ -645,6 +651,7 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
                     let rows = rows?;
                     batch.ticks.extend(rows);
                 }
+
             }
             DataType::OpenInterest
             | DataType::FactorFile

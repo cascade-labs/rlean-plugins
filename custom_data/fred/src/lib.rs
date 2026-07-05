@@ -81,6 +81,7 @@ impl ICustomDataSource for FredDataSource {
             uri,
             transport: CustomDataTransport::Http,
             format: CustomDataFormat::Csv,
+            headers: Default::default(),
         })
     }
 
