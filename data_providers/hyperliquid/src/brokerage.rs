@@ -308,12 +308,8 @@ mod tests {
         assert_eq!(cash, vec![("USDC".to_string(), dec!(1234.56))]);
         let holdings = parse_holdings(&state);
         assert_eq!(holdings.len(), 1);
-        assert!(
-            holdings
-                .keys()
-                .any(|symbol| symbol.value == "BTC"
-                    && symbol.market().as_str() == Market::HYPERLIQUID)
-        );
+        assert!(holdings.keys().any(|symbol| symbol.value.as_ref() == "BTC"
+            && symbol.market().as_str() == Market::HYPERLIQUID));
     }
 
     #[test]

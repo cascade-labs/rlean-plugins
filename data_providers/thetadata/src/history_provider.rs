@@ -1,25 +1,22 @@
-use std::collections::HashSet;
-/// ThetaData historical data provider — implements `IHistoricalDataProvider`.
+/// ThetaData historical data provider — implements `lean_data_providers::IHistoryProvider`.
 ///
 /// Fetches stock EOD bars from ThetaData, writes them to the local Parquet
 /// store, and returns the raw bars.  The runner applies factor-file adjustments
 /// afterwards (same as the Polygon provider).
-use std::future::Future;
-use std::pin::Pin;
-
 use async_trait::async_trait;
 use chrono::{NaiveDate, TimeZone, Utc};
 use chrono_tz::America::New_York;
 use futures::{stream, StreamExt};
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
+use std::collections::HashSet;
 use tracing::info;
 
 use lean_core::{
     DateTime, LeanError, Market, NanosecondTimestamp, OptionRight, OptionStyle, Resolution,
     Result as LeanResult, Symbol, SymbolOptionsExt, TimeSpan,
 };
-use lean_data::{Bar as LeanBar, IHistoricalDataProvider, QuoteBar, Tick, TradeBar, TradeBarData};
+use lean_data::{Bar as LeanBar, QuoteBar, Tick, TradeBar, TradeBarData};
 use lean_data_providers::TickStream;
 use lean_storage::OptionUniverseRow;
 
@@ -238,10 +235,7 @@ impl ThetaDataHistoryProvider {
             .fetch_trade_bars(symbol, resolution, start, end)
             .await?;
 
-        info!(
-            "ThetaData: fetched {} bars",
-            bars.len(),
-        );
+        info!("ThetaData: fetched {} bars", bars.len(),);
         Ok(bars)
     }
 
@@ -475,19 +469,6 @@ impl ThetaDataHistoryProvider {
         ticks.sort_by_key(|tick| (tick.time.0, tick.tick_type as u8));
         Ok(ticks)
     }
-
-}
-
-impl IHistoricalDataProvider for ThetaDataHistoryProvider {
-    fn get_trade_bars(
-        &self,
-        symbol: Symbol,
-        resolution: Resolution,
-        start: DateTime,
-        end: DateTime,
-    ) -> Pin<Box<dyn Future<Output = LeanResult<Vec<TradeBar>>> + Send + '_>> {
-        Box::pin(self.fetch_and_cache(symbol, resolution, start, end))
-    }
 }
 
 // ─── lean_data_providers::IHistoryProvider ────────────────────────────────────
@@ -588,7 +569,6 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
                     let rows = rows?;
                     batch.trade_bars.extend(rows);
                 }
-
             }
             DataType::QuoteBar => {
                 let results = stream::iter(request.symbols.iter().cloned())
@@ -609,7 +589,6 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
                     let rows = rows?;
                     batch.quote_bars.extend(rows);
                 }
-
             }
             DataType::Tick => {
                 let mut seen_symbols = HashSet::new();
@@ -651,7 +630,6 @@ impl lean_data_providers::IHistoryProvider for ThetaDataHistoryProvider {
                     let rows = rows?;
                     batch.ticks.extend(rows);
                 }
-
             }
             DataType::OpenInterest
             | DataType::FactorFile

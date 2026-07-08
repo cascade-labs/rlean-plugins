@@ -57,7 +57,10 @@ impl MassiveHistoryProvider {
     /// Compute factor rows for `symbol`, fetching daily reference prices from
     /// Massive so dividend price factors can be computed. Returns the rows for
     /// the framework to persist; performs no writes itself.
-    async fn compute_factor_rows_for(&self, symbol: &Symbol) -> anyhow::Result<Vec<FactorFileEntry>> {
+    async fn compute_factor_rows_for(
+        &self,
+        symbol: &Symbol,
+    ) -> anyhow::Result<Vec<FactorFileEntry>> {
         let ticker = symbol.permtick.to_uppercase();
         let action_start_day = lean_factor_file_start_date();
         let action_end_day = chrono::Utc::now().date_naive();
@@ -117,7 +120,6 @@ impl MassiveHistoryProvider {
         )
         .await
     }
-
 }
 
 fn date_to_datetime(date: NaiveDate, hour: u32, minute: u32, second: u32) -> DateTime {

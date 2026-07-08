@@ -82,6 +82,9 @@ impl ICustomDataSource for FredDataSource {
             transport: CustomDataTransport::Http,
             format: CustomDataFormat::Csv,
             headers: Default::default(),
+            // FRED series are single-series macro data (one series per source);
+            // there is no per-row underlying/ticker column.
+            symbol_column: None,
         })
     }
 
@@ -127,12 +130,7 @@ impl ICustomDataSource for FredDataSource {
             serde_json::Value::String(config.ticker.clone()),
         );
 
-        Some(CustomDataPoint {
-            time: parsed_date,
-            end_time: None,
-            value,
-            fields,
-        })
+        Some(CustomDataPoint::new(parsed_date, None, value, fields))
     }
 
     fn is_full_history_source(&self) -> bool {
@@ -166,12 +164,7 @@ impl ICustomDataSource for FredDataSource {
             serde_json::Value::String(config.ticker.clone()),
         );
 
-        Some(CustomDataPoint {
-            time: date,
-            end_time: None,
-            value,
-            fields,
-        })
+        Some(CustomDataPoint::new(date, None, value, fields))
     }
 }
 

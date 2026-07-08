@@ -582,7 +582,12 @@ mod tests {
             ticker: "KEY".to_string(),
             dividend_type: "CD".to_string(),
         };
-        let rows = compute_factor_rows(&[], &[dividend], &HashMap::new(), lean_factor_file_end_date());
+        let rows = compute_factor_rows(
+            &[],
+            &[dividend],
+            &HashMap::new(),
+            lean_factor_file_end_date(),
+        );
         assert!(
             rows.iter().all(|r| (r.price_factor - 1.0).abs() < 1e-9),
             "with no reference prices all price factors stay 1.0 (bug condition)"

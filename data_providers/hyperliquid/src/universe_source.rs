@@ -529,6 +529,10 @@ impl ICustomDataSource for HyperliquidUniverseDataSource {
                 transport: lean_data::custom::CustomDataTransport::LocalFile,
                 format: CustomDataFormat::Csv,
                 headers: std::collections::HashMap::new(),
+                // Universe rows carry a per-row underlying ticker in the "symbol"
+                // column. (Only consulted by the engine's Parquet decode path;
+                // this CSV source sets `CustomDataPoint::symbol` in `reader`.)
+                symbol_column: Some("symbol".to_string()),
             }),
             Ok(None) => None,
             Err(error) => {
@@ -574,12 +578,10 @@ impl ICustomDataSource for HyperliquidUniverseDataSource {
         fields.insert("base".to_string(), json!(row.base));
         fields.insert("quote".to_string(), json!(row.quote));
 
-        Some(CustomDataPoint {
-            time: date,
-            end_time: Some(time),
-            value: decimal_from_optional(&row.value),
-            fields,
-        })
+        Some(
+            CustomDataPoint::new(date, Some(time), decimal_from_optional(&row.value), fields)
+                .with_symbol(Some(row.symbol.clone())),
+        )
     }
 
     fn default_resolution(&self) -> Resolution {

@@ -334,7 +334,9 @@ impl HyperliquidHistoryProvider {
             output
                 .margin_interest_rates
                 .extend(parsed.margin_interest_rates);
-            output.open_interest_ticks.extend(parsed.open_interest_ticks);
+            output
+                .open_interest_ticks
+                .extend(parsed.open_interest_ticks);
 
             if quote_resolution != Resolution::Minute {
                 let aggregated = aggregate_quote_bars(&parsed.quote_bars, quote_resolution)?;
@@ -399,7 +401,12 @@ impl HyperliquidHistoryProvider {
             };
 
             let trade_bars = self
-                .read_or_fetch_trade_bars_from_info(std::slice::from_ref(symbol), resolution, start, end)
+                .read_or_fetch_trade_bars_from_info(
+                    std::slice::from_ref(symbol),
+                    resolution,
+                    start,
+                    end,
+                )
                 .await?;
 
             quote_bars.extend(
@@ -1628,7 +1635,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rates.len(), 1);
-        assert_eq!(rates[0].symbol.value, "APT");
+        assert_eq!(rates[0].symbol.value.as_ref(), "APT");
         assert_eq!(rates[0].time, DateTime::from_millis(1_761_336_000_000));
         assert_eq!(rates[0].interest_rate, Decimal::new(125, 7));
 
@@ -1780,7 +1787,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(rates.len(), 2);
-        assert_eq!(rates[0].symbol.value, "XYZ:TSLA");
+        assert_eq!(rates[0].symbol.value.as_ref(), "XYZ:TSLA");
         assert_eq!(rates[0].interest_rate, Decimal::new(-125, 7));
         assert_eq!(rates[1].interest_rate, Decimal::new(3, 6));
     }

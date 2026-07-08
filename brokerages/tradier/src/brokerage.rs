@@ -113,9 +113,15 @@ impl Brokerage for TradierBrokerage {
                         .collect(),
                 ))
             }
+            // Propagate the real rejection reason (local validation failure, API
+            // error body, insufficient position, etc.) through the `Err` path so
+            // the engine surfaces it in the Invalid OrderEvent message rather than
+            // the generic "Brokerage rejected order submission".
             Err(e) => {
                 error!("Tradier: place_order failed: {}", e);
-                Ok(None)
+                Err(lean_core::LeanError::BrokerageError(format!(
+                    "Tradier: place_order failed: {e}"
+                )))
             }
         }
     }
@@ -333,25 +339,38 @@ impl TradierBrokerage {
     /// Place a LEAN order via Tradier's REST API (async).
     pub async fn place_order_async(&self, order: &Order) -> Result<Vec<i64>> {
         let wire = tradier_order_symbols(&order.symbol)?;
-        let current_position = self
-            .current_position_quantity(&wire.order_symbol())
-            .await
-            .unwrap_or_else(|error| {
-                warn!(
-                    "Tradier: could not fetch current position for {}: {}",
-                    wire.order_symbol(),
-                    error
-                );
-                Decimal::ZERO
-            });
-        let legs = split_cross_zero_order(order.quantity, current_position);
+        // Tradier's positions endpoint lags several seconds behind just-executed
+        // fills, so a reducing order (a plain trim/close) can read as position 0
+        // and be misclassified as an illegal short/buy-to-cover. Resolve the
+        // position with a short retry loop; if it never becomes credible, fall
+        // back to a plain side and let Tradier adjudicate (the engine only sends
+        // reducing orders it believes are covered).
+        let position = self
+            .resolve_position_for_order(&wire.order_symbol(), order)
+            .await;
+
+        // Only split a cross-zero order when the fetched position is credible;
+        // an incredible (stale/zero) position must not drive close+open leg
+        // splitting, or a plain trim would be torn into a bogus short leg.
+        let legs = if position.credible {
+            split_cross_zero_order(order.quantity, position.quantity)
+        } else {
+            vec![TradierOrderLeg {
+                quantity: order.quantity,
+                current_position: position.quantity,
+            }]
+        };
         let mut tradier_ids = Vec::with_capacity(legs.len());
 
         for leg in legs {
             let mut leg_order = order.clone();
             leg_order.quantity = leg.quantity;
             let (direction, class, order_type_str, duration, price_str, stop_str) =
-                translate_order(&leg_order, leg.current_position)?;
+                translate_order_with_credibility(
+                    &leg_order,
+                    leg.current_position,
+                    position.credible,
+                )?;
 
             let qty = leg_order.quantity.abs().to_string();
             let mut params: Vec<(&str, String)> = vec![
@@ -377,7 +396,12 @@ impl TradierBrokerage {
                 Ok(resp) => resp,
                 Err(error) => {
                     if let Some(tradier_id) = self
-                        .recover_submitted_order_id(&leg_order, leg.current_position, submitted_at)
+                        .recover_submitted_order_id(
+                            &leg_order,
+                            leg.current_position,
+                            position.credible,
+                            submitted_at,
+                        )
                         .await?
                     {
                         warn!(
@@ -393,7 +417,12 @@ impl TradierBrokerage {
             if let Some(errors) = resp.errors {
                 if !errors.error.is_empty() {
                     if let Some(tradier_id) = self
-                        .recover_submitted_order_id(&leg_order, leg.current_position, submitted_at)
+                        .recover_submitted_order_id(
+                            &leg_order,
+                            leg.current_position,
+                            position.credible,
+                            submitted_at,
+                        )
                         .await?
                     {
                         warn!(
@@ -408,7 +437,12 @@ impl TradierBrokerage {
             }
             if resp.order.id <= 0 {
                 if let Some(tradier_id) = self
-                    .recover_submitted_order_id(&leg_order, leg.current_position, submitted_at)
+                    .recover_submitted_order_id(
+                        &leg_order,
+                        leg.current_position,
+                        position.credible,
+                        submitted_at,
+                    )
                     .await?
                 {
                     warn!(
@@ -483,15 +517,72 @@ impl TradierBrokerage {
             .unwrap_or(Decimal::ZERO))
     }
 
+    /// Resolve the current position for an order, retrying the positions fetch a
+    /// few times when a reducing order reads as insufficiently covered.
+    ///
+    /// Tradier's positions endpoint settles seconds after a fill; a trim issued
+    /// immediately after an entry can transiently see position 0 (or a value
+    /// smaller than the order it is reducing) and get classified as an illegal
+    /// short / buy-to-cover. We retry with short delays and, if the position is
+    /// still not credible, mark it incredible so the caller submits a plain side
+    /// (`sell` / `buy`) and lets Tradier adjudicate — the minimal equivalent of
+    /// C# LEAN's local position ledger.
+    async fn resolve_position_for_order(&self, symbol: &str, order: &Order) -> ResolvedPosition {
+        const MAX_ATTEMPTS: usize = 3;
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(600);
+
+        let mut last = Decimal::ZERO;
+        for attempt in 0..MAX_ATTEMPTS {
+            match self.current_position_quantity(symbol).await {
+                Ok(position) => {
+                    last = position;
+                    if position_is_credible_for_order(position, order.quantity) {
+                        return ResolvedPosition {
+                            quantity: position,
+                            credible: true,
+                        };
+                    }
+                    if attempt + 1 < MAX_ATTEMPTS {
+                        warn!(
+                            "Tradier: position for {symbol} not yet credible for order quantity {} (have {position}); retrying position fetch (attempt {}/{MAX_ATTEMPTS})",
+                            order.quantity,
+                            attempt + 1
+                        );
+                        tokio::time::sleep(RETRY_DELAY).await;
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        "Tradier: could not fetch current position for {symbol}: {error} (attempt {}/{MAX_ATTEMPTS})",
+                        attempt + 1
+                    );
+                    if attempt + 1 < MAX_ATTEMPTS {
+                        tokio::time::sleep(RETRY_DELAY).await;
+                    }
+                }
+            }
+        }
+
+        warn!(
+            "Tradier: position for {symbol} still not credible after {MAX_ATTEMPTS} attempts (have {last}, order quantity {}); submitting as a plain side and letting Tradier adjudicate",
+            order.quantity
+        );
+        ResolvedPosition {
+            quantity: last,
+            credible: false,
+        }
+    }
+
     async fn recover_submitted_order_id(
         &self,
         order: &Order,
         current_position: Decimal,
+        position_credible: bool,
         submitted_at: ChronoDateTime<Utc>,
     ) -> Result<Option<i64>> {
         let wire = tradier_order_symbols(&order.symbol)?;
         let (direction, _class, order_type, _duration, _price, _stop) =
-            translate_order(order, current_position)?;
+            translate_order_with_credibility(order, current_position, position_credible)?;
         let orders = self.client.get_orders(&self.account_id).await?;
         Ok(find_recent_matching_order_id(
             &orders,
@@ -710,40 +801,96 @@ fn tradier_order_symbols(symbol: &Symbol) -> Result<TradierOrderSymbols> {
     }
 }
 
-/// Translate a LEAN order into Tradier API parameters.
+/// The current position for an order, plus whether the fetched value is
+/// trustworthy enough to drive short/cover classification and cross-zero
+/// splitting. When `credible` is false the position endpoint likely lags a
+/// recent fill, so the caller submits a plain side and lets Tradier adjudicate.
+#[derive(Debug, Clone, Copy)]
+struct ResolvedPosition {
+    quantity: Decimal,
+    credible: bool,
+}
+
+/// A fetched position is credible for classifying `order_quantity` when it fully
+/// covers a reducing order.
+///
+/// The stale-read hazard is asymmetric. A sell whose long position reads as 0 (or
+/// smaller than the sell) is misclassified as an illegal `sell_short`, so a sell
+/// is only credible when a long position at least as large as the sell is
+/// present. A buy whose short position reads as 0 merely downgrades from
+/// `buy_to_cover` to a plain `buy`, which Tradier accepts, so a buy that reads a
+/// long or flat position is already credible; only a buy that reduces a short
+/// depends on a read large enough to cover that short (so the cross-zero split is
+/// preserved when the short is real).
+fn position_is_credible_for_order(position: Decimal, order_quantity: Decimal) -> bool {
+    if order_quantity < Decimal::ZERO {
+        // Sell/reduce a long: need a long position that covers the sell.
+        position > Decimal::ZERO && position >= order_quantity.abs()
+    } else if order_quantity > Decimal::ZERO {
+        // Buy: credible unless it reduces a short the read cannot cover.
+        position >= Decimal::ZERO || position.abs() >= order_quantity.abs()
+    } else {
+        true
+    }
+}
+
+/// Translate a LEAN order into Tradier API parameters, treating the position as
+/// credible. Test-only convenience wrapper over
+/// `translate_order_with_credibility`.
 ///
 /// Returns `(side, class, type, duration, price?, stop?)`.
+#[cfg(test)]
 fn translate_order(order: &Order, current_position: Decimal) -> Result<TradierOrderParams> {
-    validate_order_basics(order, current_position)?;
+    translate_order_with_credibility(order, current_position, true)
+}
+
+/// Translate a LEAN order, honoring whether the fetched `current_position` is
+/// credible. When it is not, a sell is forced to a plain `sell` (never
+/// `sell_short`) and a buy to a plain `buy` (never `buy_to_cover`), so a
+/// position endpoint lagging a recent fill cannot turn a covered trim into an
+/// illegal short. Cross-zero GTC validation is also skipped in that case, since
+/// the projected position derived from a stale read is meaningless.
+fn translate_order_with_credibility(
+    order: &Order,
+    current_position: Decimal,
+    position_credible: bool,
+) -> Result<TradierOrderParams> {
+    validate_order_basics(order, current_position, position_credible)?;
 
     let is_buy = order.quantity > Decimal::ZERO;
 
     let (class, side) = match order.symbol.security_type() {
         SecurityType::Equity => {
             let side = if is_buy {
-                if current_position < Decimal::ZERO {
+                if position_credible && current_position < Decimal::ZERO {
                     "buy_to_cover"
                 } else {
                     "buy"
                 }
-            } else if current_position <= Decimal::ZERO {
+            } else if position_credible && current_position > Decimal::ZERO {
+                "sell"
+            } else if position_credible {
                 "sell_short"
             } else {
+                // Position not credible: submit a plain sell and let Tradier
+                // adjudicate rather than risk an illegal short.
                 "sell"
             };
             ("equity", side)
         }
         SecurityType::Option | SecurityType::IndexOption => {
             let side = if is_buy {
-                if current_position < Decimal::ZERO {
+                if position_credible && current_position < Decimal::ZERO {
                     "buy_to_close"
                 } else {
                     "buy_to_open"
                 }
-            } else if current_position > Decimal::ZERO {
+            } else if position_credible && current_position > Decimal::ZERO {
                 "sell_to_close"
-            } else {
+            } else if position_credible {
                 "sell_to_open"
+            } else {
+                "sell_to_close"
             };
             ("option", side)
         }
@@ -846,7 +993,11 @@ fn split_cross_zero_order(quantity: Decimal, current_position: Decimal) -> Vec<T
     }
 }
 
-fn validate_order_basics(order: &Order, current_position: Decimal) -> Result<()> {
+fn validate_order_basics(
+    order: &Order,
+    current_position: Decimal,
+    position_credible: bool,
+) -> Result<()> {
     let abs_quantity = order.quantity.abs();
     if abs_quantity < Decimal::ONE || abs_quantity > Decimal::from(10_000_000u64) {
         anyhow::bail!(
@@ -855,8 +1006,14 @@ fn validate_order_basics(order: &Order, current_position: Decimal) -> Result<()>
         );
     }
 
+    // Only enforce the projected-short check when the fetched position is
+    // credible; a stale read (endpoint lagging a recent fill) would otherwise
+    // reject a covered trim as if it left a short.
     let projected_position = current_position + order.quantity;
-    if projected_position < Decimal::ZERO && order.time_in_force == TimeInForce::GoodTilCanceled {
+    if position_credible
+        && projected_position < Decimal::ZERO
+        && order.time_in_force == TimeInForce::GoodTilCanceled
+    {
         anyhow::bail!("Tradier: GTC orders cannot leave a short position");
     }
 
@@ -1105,6 +1262,73 @@ mod tests {
     }
 
     #[test]
+    fn position_credibility_protects_sells_but_not_plain_buys() {
+        // Sell fully covered by a long → credible.
+        assert!(position_is_credible_for_order(dec!(10), dec!(-5)));
+        // Sell against a flat/too-small long → not credible (stale-read hazard).
+        assert!(!position_is_credible_for_order(dec!(0), dec!(-5)));
+        assert!(!position_is_credible_for_order(dec!(3), dec!(-5)));
+        // Buy against flat/long → credible (worst case downgrades to plain buy).
+        assert!(position_is_credible_for_order(dec!(0), dec!(5)));
+        assert!(position_is_credible_for_order(dec!(10), dec!(5)));
+        // Buy covering a short fully → credible; buy larger than the short → not.
+        assert!(position_is_credible_for_order(dec!(-10), dec!(5)));
+        assert!(!position_is_credible_for_order(dec!(-3), dec!(5)));
+    }
+
+    #[test]
+    fn incredible_position_forces_plain_sell_not_short() {
+        // Stale read of 0 for a long trim: with credibility, this is a plain
+        // "sell", never "sell_short".
+        assert_eq!(
+            translate_order_with_credibility(&equity_order(dec!(-5)), dec!(0), false)
+                .unwrap()
+                .0,
+            "sell"
+        );
+        // Same order with a credible zero read would be a short.
+        assert_eq!(
+            translate_order_with_credibility(&equity_order(dec!(-5)), dec!(0), true)
+                .unwrap()
+                .0,
+            "sell_short"
+        );
+        // Options mirror: incredible sell falls back to sell_to_close.
+        assert_eq!(
+            translate_order_with_credibility(&option_order(dec!(-1)), dec!(0), false)
+                .unwrap()
+                .0,
+            "sell_to_close"
+        );
+    }
+
+    #[test]
+    fn credible_position_preserves_normal_sell_classification() {
+        // Adequate long position → normal "sell" (unchanged behavior).
+        assert_eq!(
+            translate_order_with_credibility(&equity_order(dec!(-5)), dec!(10), true)
+                .unwrap()
+                .0,
+            "sell"
+        );
+    }
+
+    #[test]
+    fn incredible_position_skips_gtc_short_rejection() {
+        let mut order = equity_order(dec!(-5));
+        order.time_in_force = TimeInForce::GoodTilCanceled;
+        // Credible zero read would reject (leaves short).
+        assert!(translate_order_with_credibility(&order, dec!(0), true).is_err());
+        // Incredible read submits a plain sell and lets Tradier adjudicate.
+        assert_eq!(
+            translate_order_with_credibility(&order, dec!(0), false)
+                .unwrap()
+                .0,
+            "sell"
+        );
+    }
+
+    #[test]
     fn cross_zero_orders_are_split_into_close_and_open_legs() {
         assert_eq!(
             split_cross_zero_order(dec!(-15), dec!(10)),
@@ -1269,7 +1493,7 @@ mod tests {
             symbol.underlying.as_ref().unwrap().security_type(),
             SecurityType::Equity
         );
-        assert_eq!(symbol.value, "SPY260116C00450000");
+        assert_eq!(symbol.value.as_ref(), "SPY260116C00450000");
     }
 
     #[test]
@@ -1285,7 +1509,7 @@ mod tests {
             symbol.option_symbol_id().unwrap().style,
             OptionStyle::European
         );
-        assert_eq!(symbol.value, "SPX260116P04500000");
+        assert_eq!(symbol.value.as_ref(), "SPX260116P04500000");
     }
 
     #[test]

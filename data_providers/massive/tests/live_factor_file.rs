@@ -26,7 +26,10 @@ fn key_factor_file_has_dividend_price_factors() {
         );
     }
 
-    let nonunit = rows.iter().filter(|r| (r.price_factor - 1.0).abs() > 1e-9).count();
+    let nonunit = rows
+        .iter()
+        .filter(|r| (r.price_factor - 1.0).abs() > 1e-9)
+        .count();
     assert!(
         nonunit > 0,
         "KEY pays quarterly dividends; expected at least one non-unit price_factor row, got {nonunit}"

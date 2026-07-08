@@ -35,7 +35,16 @@ impl TradierHistoryProvider {
         }
     }
 
-    fn get_quotes(&self, symbols: &[&str]) -> Result<Vec<TradierQuote>> {
+    /// Fetches quotes on a dedicated OS thread.
+    ///
+    /// This is loaded as a separate plugin `cdylib` with its own statically
+    /// linked `reqwest`/`tokio`, so touching this plugin's own async/timer
+    /// machinery from a task polled by the *host* runtime panics with "there
+    /// is no reactor running". `reqwest::blocking` + `std::thread` sidesteps
+    /// that: the worker thread never needs a reactor, and the
+    /// `futures::channel::oneshot` receiver only relies on `std::task::Waker`,
+    /// which is safe to poll from any executor.
+    async fn get_quotes(&self, symbols: &[&str]) -> Result<Vec<TradierQuote>> {
         if symbols.is_empty() {
             return Ok(Vec::new());
         }
@@ -45,15 +54,26 @@ impl TradierHistoryProvider {
             "{}/markets/quotes?symbols={csv}&greeks=false",
             self.base_url
         );
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&self.access_token)
-            .header("Accept", "application/json")
-            .send()?;
-        check_status(resp.status())?;
-        let container: TradierQuoteContainer = resp.json()?;
-        normalize_quote_list(container)
+        let http = self.http.clone();
+        let access_token = self.access_token.clone();
+        let (tx, rx) = futures_channel::oneshot::channel();
+        std::thread::Builder::new()
+            .name("tradier-get-quotes".to_string())
+            .spawn(move || {
+                let result = (|| -> Result<Vec<TradierQuote>> {
+                    let resp = http
+                        .get(&url)
+                        .bearer_auth(&access_token)
+                        .header("Accept", "application/json")
+                        .send()?;
+                    check_status(resp.status())?;
+                    let container: TradierQuoteContainer = resp.json()?;
+                    normalize_quote_list(container)
+                })();
+                let _ = tx.send(result);
+            })?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Tradier quotes worker dropped response"))?
     }
 }
 
@@ -67,8 +87,8 @@ impl IHistoryProvider for TradierHistoryProvider {
             return Ok(Vec::new());
         }
 
-        let ticker = request.symbol.value.as_str();
-        let quotes = self.get_quotes(&[ticker])?;
+        let ticker: &str = &request.symbol.value;
+        let quotes = self.get_quotes(&[ticker]).await?;
         let Some(quote) = quotes
             .into_iter()
             .find(|quote| quote.symbol.eq_ignore_ascii_case(ticker))

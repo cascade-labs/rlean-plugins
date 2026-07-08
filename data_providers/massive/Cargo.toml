@@ -28,8 +28,8 @@ rust_decimal = { workspace = true }
 arrow-array  = { workspace = true }
 arrow-schema = { workspace = true }
 parquet      = { workspace = true }
+futures      = "0.3"
 
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio    = { workspace = true }
-futures  = "0.3"

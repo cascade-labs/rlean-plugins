@@ -54,6 +54,10 @@ impl ICustomDataSource for CboeVixDataSource {
             uri: format!("{CBOE_INDEX_BASE_URL}/{ticker}_History.csv"),
             transport: CustomDataTransport::Http,
             format: lean_data::custom::CustomDataFormat::Csv,
+            headers: Default::default(),
+            // Single CBOE index series per source (parsed by our own reader);
+            // no per-row underlying column.
+            symbol_column: None,
         })
     }
 
@@ -175,7 +179,7 @@ fn query_dates(config: &CustomDataConfig) -> (Option<NaiveDate>, Option<NaiveDat
 }
 
 fn date_in_query_window(date: NaiveDate, start: Option<NaiveDate>, end: Option<NaiveDate>) -> bool {
-    start.map_or(true, |start| date >= start) && end.map_or(true, |end| date <= end)
+    start.is_none_or(|start| date >= start) && end.is_none_or(|end| date <= end)
 }
 
 fn expiry_in_query_window(
@@ -239,12 +243,7 @@ fn custom_point(date: NaiveDate, value: Decimal) -> CustomDataPoint {
             .expect("valid CBOE history timestamp")
             .and_utc(),
     );
-    CustomDataPoint {
-        time: date,
-        end_time: Some(time + TimeSpan::ZERO),
-        value,
-        fields: HashMap::new(),
-    }
+    CustomDataPoint::new(date, Some(time + TimeSpan::ZERO), value, HashMap::new())
 }
 
 #[derive(Debug, Clone, PartialEq)]

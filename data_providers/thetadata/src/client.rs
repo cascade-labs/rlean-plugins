@@ -966,78 +966,97 @@ impl ThetaDataClient {
         }
         debug!("ThetaData streaming GET {query}");
 
-        let mut rl_retries: u32 = 0;
-        let mut gen_retries: u32 = 0;
+        // The concurrency permit is a `tokio::sync::Semaphore`, which is
+        // reactor-independent (no timers, no `Handle::current()`) and safe to
+        // `.await` here regardless of which runtime is driving this task.
+        let permit = self
+            .concurrency
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("ThetaData concurrency semaphore closed");
 
-        loop {
-            self.limiter.wait();
-            let permit = self
-                .concurrency
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("ThetaData concurrency semaphore closed");
-            let mut req = self.http.get(&query);
-            if let Some(token) = &self.access_token {
-                req = req.bearer_auth(token);
-            }
-            let resp = match req.send() {
-                Ok(r) => {
-                    drop(permit);
-                    r
-                }
-                Err(e) if gen_retries < MAX_RETRIES => {
-                    drop(permit);
-                    gen_retries += 1;
-                    warn!("ThetaData: streaming request error (retry {gen_retries}): {e}");
-                    std::thread::sleep(Duration::from_secs(gen_retries as u64));
-                    continue;
-                }
-                Err(e) => {
-                    drop(permit);
-                    bail!("ThetaData: {e}");
-                }
-            };
+        // Everything below is blocking I/O (`reqwest::blocking` + retry
+        // sleeps), so it must run on a dedicated OS thread rather than
+        // directly on whatever task is polling this future — see `execute`'s
+        // doc comment for why touching this plugin's own async/timer
+        // machinery from here is unsafe.
+        let http = self.http.clone();
+        let access_token = self.access_token.clone();
+        let limiter = Arc::clone(&self.limiter);
+        let endpoint = endpoint.to_string();
+        let (tx, rx) = futures::channel::oneshot::channel();
+        std::thread::Builder::new()
+            .name("thetadata-stream-request".to_string())
+            .spawn(move || {
+                let _permit = permit;
+                let result = (|| -> Result<std::io::Lines<BufReader<reqwest::blocking::Response>>> {
+                    let mut rl_retries: u32 = 0;
+                    let mut gen_retries: u32 = 0;
+                    loop {
+                        limiter.wait();
+                        let mut req = http.get(&query);
+                        if let Some(token) = &access_token {
+                            req = req.bearer_auth(token);
+                        }
+                        let resp = match req.send() {
+                            Ok(r) => r,
+                            Err(e) if gen_retries < MAX_RETRIES => {
+                                gen_retries += 1;
+                                warn!("ThetaData: streaming request error (retry {gen_retries}): {e}");
+                                std::thread::sleep(Duration::from_secs(gen_retries as u64));
+                                continue;
+                            }
+                            Err(e) => bail!("ThetaData: {e}"),
+                        };
 
-            let status = resp.status().as_u16();
-            if matches!(status, 472 | 475 | 572) {
-                debug!("ThetaData: no streaming data ({status}) for {endpoint}");
-                return Ok(ThetaDataNdjsonStream {
-                    lines: BufReader::new(resp).lines(),
-                    _marker: std::marker::PhantomData,
-                });
-            }
-            if status == 429 {
-                if rl_retries >= MAX_RATE_LIMIT_RETRIES {
-                    bail!("ThetaData: rate limit exceeded after {MAX_RATE_LIMIT_RETRIES} retries");
-                }
-                rl_retries += 1;
-                let delay = retry_after_delay(&resp).unwrap_or_else(|| {
-                    Duration::from_millis((2u64.pow(rl_retries)) * 1000 + (rand_jitter() as u64))
-                });
-                self.limiter.cool_down(delay);
-                warn!(
-                    "ThetaData: rate limited (429), cooling down shared limiter for {:.1}s",
-                    delay.as_secs_f64()
-                );
-                std::thread::sleep(delay);
-                continue;
-            }
-            if !resp.status().is_success() {
-                let body = resp.text().unwrap_or_default();
-                if gen_retries < MAX_RETRIES {
-                    gen_retries += 1;
-                    warn!("ThetaData: HTTP {status} (stream retry {gen_retries}): {body}");
-                    std::thread::sleep(Duration::from_secs(gen_retries as u64));
-                    continue;
-                }
-                bail!("ThetaData: HTTP {status} for {endpoint}: {body}");
-            }
-            return Ok(ThetaDataNdjsonStream {
-                lines: BufReader::new(resp).lines(),
-                _marker: std::marker::PhantomData,
-            });
-        }
+                        let status = resp.status().as_u16();
+                        if matches!(status, 472 | 475 | 572) {
+                            debug!("ThetaData: no streaming data ({status}) for {endpoint}");
+                            return Ok(BufReader::new(resp).lines());
+                        }
+                        if status == 429 {
+                            if rl_retries >= MAX_RATE_LIMIT_RETRIES {
+                                bail!(
+                                    "ThetaData: rate limit exceeded after {MAX_RATE_LIMIT_RETRIES} retries"
+                                );
+                            }
+                            rl_retries += 1;
+                            let delay = retry_after_delay(&resp).unwrap_or_else(|| {
+                                Duration::from_millis(
+                                    (2u64.pow(rl_retries)) * 1000 + (rand_jitter() as u64),
+                                )
+                            });
+                            limiter.cool_down(delay);
+                            warn!(
+                                "ThetaData: rate limited (429), cooling down shared limiter for {:.1}s",
+                                delay.as_secs_f64()
+                            );
+                            std::thread::sleep(delay);
+                            continue;
+                        }
+                        if !resp.status().is_success() {
+                            let body = resp.text().unwrap_or_default();
+                            if gen_retries < MAX_RETRIES {
+                                gen_retries += 1;
+                                warn!("ThetaData: HTTP {status} (stream retry {gen_retries}): {body}");
+                                std::thread::sleep(Duration::from_secs(gen_retries as u64));
+                                continue;
+                            }
+                            bail!("ThetaData: HTTP {status} for {endpoint}: {body}");
+                        }
+                        return Ok(BufReader::new(resp).lines());
+                    }
+                })();
+                let _ = tx.send(result);
+            })?;
+        let lines = rx
+            .await
+            .map_err(|_| anyhow::anyhow!("ThetaData streaming worker dropped response"))??;
+        Ok(ThetaDataNdjsonStream {
+            lines,
+            _marker: std::marker::PhantomData,
+        })
     }
 }
 
@@ -1991,5 +2010,4 @@ mod tests {
         assert_eq!(r.volume, 500.0);
         assert_eq!(r.date, "20210419");
     }
-
 }

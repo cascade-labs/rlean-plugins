@@ -198,7 +198,7 @@ impl DataQueueHandler for TradierLiveDataProvider {
         self.ensure_worker();
 
         Ok(LiveDataSubscription::new(
-            LiveDataSubscriptionConfig::Market(config.clone()),
+            LiveDataSubscriptionConfig::Market(Box::new(config.clone())),
             receiver,
         ))
     }
@@ -1131,7 +1131,7 @@ fn tradier_wire_symbol(symbol: &Symbol) -> String {
                     id.right,
                 )
             })
-            .unwrap_or_else(|| symbol.permtick.clone())
+            .unwrap_or_else(|| symbol.permtick.to_string())
             .to_ascii_uppercase()
     } else {
         symbol.permtick.to_ascii_uppercase()
@@ -1275,7 +1275,7 @@ mod tests {
         let item = event_to_quote_item(&event, &config).unwrap();
         match item {
             LiveDataItem::QuoteBar(bar) => {
-                assert_eq!(bar.symbol.value, "SPY");
+                assert_eq!(bar.symbol.value.as_ref(), "SPY");
                 assert_eq!(bar.last_bid_size, Decimal::from_i32(60).unwrap());
                 assert_eq!(bar.last_ask_size, Decimal::from_i32(6).unwrap());
             }
@@ -1298,7 +1298,7 @@ mod tests {
         let item = event_to_trade_item(&event, &config).unwrap();
         match item {
             LiveDataItem::TradeBar(bar) => {
-                assert_eq!(bar.symbol.value, "SPY");
+                assert_eq!(bar.symbol.value.as_ref(), "SPY");
                 assert_eq!(bar.close, Decimal::from_f64(281.85).unwrap());
                 assert_eq!(bar.volume, Decimal::from_i32(100).unwrap());
             }
@@ -1319,7 +1319,7 @@ mod tests {
 
         match item {
             LiveDataItem::TradeBar(bar) => {
-                assert_eq!(bar.symbol.value, "SPY");
+                assert_eq!(bar.symbol.value.as_ref(), "SPY");
                 assert_eq!(bar.open, Decimal::from_f64(734.15).unwrap());
                 assert_eq!(bar.high, Decimal::from_f64(734.15).unwrap());
                 assert_eq!(bar.low, Decimal::from_f64(734.15).unwrap());
@@ -1344,7 +1344,7 @@ mod tests {
 
         match item {
             LiveDataItem::QuoteBar(bar) => {
-                assert_eq!(bar.symbol.value, "SPY");
+                assert_eq!(bar.symbol.value.as_ref(), "SPY");
                 assert_eq!(bar.last_bid_size, Decimal::from_i64(7).unwrap());
                 assert_eq!(bar.last_ask_size, Decimal::from_i64(8).unwrap());
                 assert_eq!(
@@ -1478,7 +1478,7 @@ mod tests {
         );
         match item {
             LiveDataItem::Tick(tick) => {
-                assert_eq!(tick.symbol.value, "SPY");
+                assert_eq!(tick.symbol.value.as_ref(), "SPY");
                 assert_eq!(tick.bid_price, dec!(450.10));
                 assert_eq!(tick.ask_price, dec!(450.12));
             }
@@ -1532,7 +1532,7 @@ mod tests {
         );
         match item {
             LiveDataItem::Tick(tick) => {
-                assert_eq!(tick.symbol.value, "SPY");
+                assert_eq!(tick.symbol.value.as_ref(), "SPY");
                 assert_eq!(tick.bid_price, dec!(450.10));
                 assert_eq!(tick.ask_price, dec!(450.12));
             }
