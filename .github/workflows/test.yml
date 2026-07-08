@@ -13,16 +13,30 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# The workspace patches rlean crate dependencies to the sibling path ../rlean
+# (see .cargo/config.toml), so the job checks out cascade-labs/rlean next to
+# this repository using the read-only RLEAN_DEPLOY_KEY deploy key.
 jobs:
   test:
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: rlean-plugins
+
+      - uses: actions/checkout@v4
+        with:
+          repository: cascade-labs/rlean
+          ssh-key: ${{ secrets.RLEAN_DEPLOY_KEY }}
+          path: rlean
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rlean-plugins
 
       - name: Run tests
         run: cargo test --workspace --all-targets
+        working-directory: rlean-plugins
