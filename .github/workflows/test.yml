@@ -32,11 +32,15 @@ jobs:
           path: rlean
 
       - name: Grant cargo SSH access to the rlean git dependency
+        env:
+          RLEAN_DEPLOY_KEY: ${{ secrets.RLEAN_DEPLOY_KEY }}
         run: |
           mkdir -p ~/.ssh
-          printf '%s\n' "${{ secrets.RLEAN_DEPLOY_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$RLEAN_DEPLOY_KEY" > ~/.ssh/rlean_deploy_key
+          chmod 600 ~/.ssh/rlean_deploy_key
           ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          echo "GIT_SSH_COMMAND=ssh -i $HOME/.ssh/rlean_deploy_key -o IdentitiesOnly=yes" >> "$GITHUB_ENV"
+          ssh -i ~/.ssh/rlean_deploy_key -o IdentitiesOnly=yes -T git@github.com 2>&1 | head -2 || true
 
       - uses: dtolnay/rust-toolchain@stable
 
