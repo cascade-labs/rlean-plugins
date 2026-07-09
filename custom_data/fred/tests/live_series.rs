@@ -7,6 +7,7 @@ use rlean_plugin_fred::FredDataSource;
 use std::collections::HashMap;
 
 #[test]
+#[ignore = "live network test; FRED blocks CI/datacenter IPs — run with -- --ignored"]
 fn live_fred_dfii10_downloads_and_parses() {
     let src = FredDataSource::new();
     let day = NaiveDate::from_ymd_opt(2019, 1, 2).unwrap();
