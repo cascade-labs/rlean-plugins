@@ -46,17 +46,11 @@ jobs:
           repository: cascade-labs/rlean
           ssh-key: ${{ secrets.RLEAN_DEPLOY_KEY }}
           path: rlean
+          fetch-depth: 0
 
-      - name: Grant cargo SSH access to the rlean git dependency
-        env:
-          RLEAN_DEPLOY_KEY: ${{ secrets.RLEAN_DEPLOY_KEY }}
+      - name: Point cargo's rlean git source at the sibling checkout
         run: |
-          mkdir -p ~/.ssh
-          printf '%s\n' "$RLEAN_DEPLOY_KEY" > ~/.ssh/rlean_deploy_key
-          chmod 600 ~/.ssh/rlean_deploy_key
-          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
-          echo "GIT_SSH_COMMAND=ssh -i $HOME/.ssh/rlean_deploy_key -o IdentitiesOnly=yes" >> "$GITHUB_ENV"
-          ssh -i ~/.ssh/rlean_deploy_key -o IdentitiesOnly=yes -T git@github.com 2>&1 | head -2 || true
+          git config --global url."file://${{ github.workspace }}/rlean".insteadOf "ssh://git@github.com/cascade-labs/rlean"
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -81,17 +75,11 @@ jobs:
           repository: cascade-labs/rlean
           ssh-key: ${{ secrets.RLEAN_DEPLOY_KEY }}
           path: rlean
+          fetch-depth: 0
 
-      - name: Grant cargo SSH access to the rlean git dependency
-        env:
-          RLEAN_DEPLOY_KEY: ${{ secrets.RLEAN_DEPLOY_KEY }}
+      - name: Point cargo's rlean git source at the sibling checkout
         run: |
-          mkdir -p ~/.ssh
-          printf '%s\n' "$RLEAN_DEPLOY_KEY" > ~/.ssh/rlean_deploy_key
-          chmod 600 ~/.ssh/rlean_deploy_key
-          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
-          echo "GIT_SSH_COMMAND=ssh -i $HOME/.ssh/rlean_deploy_key -o IdentitiesOnly=yes" >> "$GITHUB_ENV"
-          ssh -i ~/.ssh/rlean_deploy_key -o IdentitiesOnly=yes -T git@github.com 2>&1 | head -2 || true
+          git config --global url."file://${{ github.workspace }}/rlean".insteadOf "ssh://git@github.com/cascade-labs/rlean"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
