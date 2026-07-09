@@ -412,7 +412,18 @@ fn fetch_paged_with_retry<T: DeserializeOwned>(
                 continue;
             }
             Ok(r) if r.status().is_success() => {
-                return Ok(r.json::<PaginatedResponse<T>>()?);
+                let resp = r.json::<PaginatedResponse<T>>()?;
+                // Massive returns HTTP 200 with `status:"ERROR"` for rejected
+                // requests on the reference (splits/dividends) endpoints too.
+                // Deserializing yields `results: None`, which is
+                // indistinguishable from "no corporate actions" and would
+                // silently drop split/dividend factors (issue #27). Surface it
+                // as a hard error so the framework can retry rather than caching
+                // a bogus empty factor file.
+                if resp.status.eq_ignore_ascii_case("ERROR") {
+                    bail!("Massive reference error status for {}", url);
+                }
+                return Ok(resp);
             }
             Ok(r) => {
                 bail!("Massive API error: HTTP {}", r.status());
