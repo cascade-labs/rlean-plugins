@@ -378,27 +378,63 @@ pub async fn fetch_map_rows(
         (None, None)
     };
 
-    let mut ticker_changes = Vec::new();
-    match client.get_ticker_events(ticker).await {
-        Ok(mut events) => {
-            events.sort_by(|a, b| a.date.cmp(&b.date));
-            events.retain(|ev| ev.event_type == "ticker_change");
-            if let Some(first_event) = events.first() {
-                list_date = list_date.or_else(|| ticker_event_date(first_event));
-                let mut previous_ticker = first_event.ticker_change.ticker.to_uppercase();
-                for event in events.iter().skip(1) {
-                    if let Some(change) = parse_ticker_change_event(&previous_ticker, event) {
-                        previous_ticker = change.new_ticker.clone();
-                        ticker_changes.push(change);
-                    }
-                }
-            }
-        }
-        Err(e) => tracing::warn!("Massive: could not fetch ticker events for {ticker}: {e}"),
+    // Issue #29: a failed ticker-events fetch must NOT be swallowed and turned
+    // into a default map. The engine persists any non-empty success and never
+    // refetches, so a default map built after an error would permanently erase
+    // a ticker's rename history (e.g. FB -> META) from the cache. Return the
+    // error so the framework persists nothing and retries next run. We only
+    // build a default map when the events fetch genuinely succeeds and there
+    // are no rename events (the correct "no renames" case).
+    let events = client
+        .get_ticker_events(ticker)
+        .await
+        .map_err(|e| anyhow::anyhow!("Massive: could not fetch ticker events for {ticker}: {e}"))?;
+    let (events_list_date, ticker_changes) = assemble_ticker_changes(&events);
+    list_date = list_date.or(events_list_date);
+
+    // Surface an unknown listing date. If neither ticker details nor the events
+    // supplied a list date, `compute_map_file_rows` falls back to 1998-01-02,
+    // which is a guess — make that visible so a wrong inception date is not
+    // silent. Note: `get_ticker_details` returning None (a 404) is treated as a
+    // legitimate "no reference record" rather than an error, because Massive
+    // 404s for obscure/long-delisted tickers we still need to map; the events
+    // fetch above still runs and can supply both the list date and any renames.
+    if list_date.is_none() {
+        tracing::warn!(
+            "Massive: no listing date for {ticker}; using 1998-01-02 fallback \
+             (details missing and no ticker-change events)"
+        );
     }
 
     let rows = compute_map_file_rows(ticker, list_date, delisting_date, &ticker_changes, today);
     Ok(rows)
+}
+
+/// Turn raw ticker events into an ordered list of rename events, plus the
+/// listing date implied by the first event (if any).
+///
+/// Pure so the issue #29 behavior is directly testable: on a genuine "no rename
+/// events" input this yields `(None, [])`, and `fetch_map_rows` builds the
+/// correct default map only in that case. It is never reached when the events
+/// fetch errors, because `fetch_map_rows` returns that error first.
+fn assemble_ticker_changes(events: &[TickerEvent]) -> (Option<NaiveDate>, Vec<TickerChangeEvent>) {
+    let mut events: Vec<&TickerEvent> = events.iter().collect();
+    events.sort_by(|a, b| a.date.cmp(&b.date));
+    events.retain(|ev| ev.event_type == "ticker_change");
+
+    let mut list_date = None;
+    let mut ticker_changes = Vec::new();
+    if let Some(first_event) = events.first() {
+        list_date = ticker_event_date(first_event);
+        let mut previous_ticker = first_event.ticker_change.ticker.to_uppercase();
+        for event in events.iter().skip(1) {
+            if let Some(change) = parse_ticker_change_event(&previous_ticker, event) {
+                previous_ticker = change.new_ticker.clone();
+                ticker_changes.push(change);
+            }
+        }
+    }
+    (list_date, ticker_changes)
 }
 
 #[cfg(test)]
@@ -496,6 +532,86 @@ mod tests {
             date(2026, 4, 28),
         );
 
+        assert_eq!(
+            rows,
+            vec![
+                MapFileEntry {
+                    date: date(2012, 5, 18),
+                    ticker: "FB".to_string()
+                },
+                MapFileEntry {
+                    date: date(2022, 6, 8),
+                    ticker: "FB".to_string()
+                },
+                MapFileEntry {
+                    date: date(2050, 12, 31),
+                    ticker: "META".to_string()
+                }
+            ]
+        );
+    }
+
+    fn ticker_change_event(date: &str, new_ticker: &str) -> TickerEvent {
+        TickerEvent {
+            date: date.to_string(),
+            event_type: "ticker_change".to_string(),
+            ticker_change: crate::models::TickerChange {
+                ticker: new_ticker.to_string(),
+            },
+        }
+    }
+
+    /// Issue #29: with a genuine "no rename events" result (the events fetch
+    /// succeeded and returned nothing), `assemble_ticker_changes` yields no
+    /// changes and no list date, so `fetch_map_rows` correctly builds a default
+    /// identity map. This is the ONLY case where a default map is legitimate.
+    #[test]
+    fn no_events_yields_identity_map_with_no_renames() {
+        let (list_date, changes) = assemble_ticker_changes(&[]);
+        assert_eq!(list_date, None, "no events implies no listing date");
+        assert!(changes.is_empty(), "no events must produce no renames");
+
+        // The map built from that empty result is a clean identity map for the
+        // ticker (fallback list date, far-future sentinel) — no fake renames.
+        let rows = compute_map_file_rows("SPY", list_date, None, &changes, date(2026, 4, 28));
+        assert_eq!(
+            rows,
+            vec![
+                MapFileEntry {
+                    date: date(1998, 1, 2),
+                    ticker: "SPY".to_string()
+                },
+                MapFileEntry {
+                    date: date(2050, 12, 31),
+                    ticker: "SPY".to_string()
+                }
+            ]
+        );
+    }
+
+    /// A real rename sequence is turned into ordered `TickerChangeEvent`s, and
+    /// the first event supplies the listing date. Guards that the refactor into
+    /// `assemble_ticker_changes` preserves the FB -> META mapping behavior.
+    #[test]
+    fn events_are_assembled_into_ordered_renames() {
+        // First event is the listing under the original ticker; the second is
+        // the rename to the new ticker.
+        let events = vec![
+            ticker_change_event("2012-05-18", "FB"),
+            ticker_change_event("2022-06-09", "META"),
+        ];
+        let (list_date, changes) = assemble_ticker_changes(&events);
+        assert_eq!(list_date, Some(date(2012, 5, 18)));
+        assert_eq!(
+            changes,
+            vec![TickerChangeEvent {
+                effective_date: date(2022, 6, 9),
+                old_ticker: "FB".to_string(),
+                new_ticker: "META".to_string(),
+            }]
+        );
+
+        let rows = compute_map_file_rows("META", list_date, None, &changes, date(2026, 4, 28));
         assert_eq!(
             rows,
             vec![
