@@ -774,7 +774,9 @@ fn live_universe_poll_interval(configured: Duration, resolution: Resolution) -> 
 }
 
 fn is_retriable_live_custom_error(error: &anyhow::Error) -> bool {
-    let message = error.to_string().to_ascii_lowercase();
+    // Format the full context chain — the retriable signal (status code or
+    // API-call context) can sit at any level, not just the outermost message.
+    let message = format!("{error:#}").to_ascii_lowercase();
     message.contains("http 429")
         || message.contains("http 500")
         || message.contains("http 502")

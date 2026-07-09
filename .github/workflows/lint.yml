@@ -13,46 +13,82 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# The workspace patches rlean crate dependencies to the sibling path ../rlean
+# (see .cargo/config.toml), so cargo-running jobs check out cascade-labs/rlean
+# next to this repository using the read-only RLEAN_DEPLOY_KEY deploy key.
 jobs:
   format:
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: rlean-plugins
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
 
-      - uses: Swatinem/rust-cache@v2
-
       - name: Check formatting
         run: cargo fmt --all --check
+        working-directory: rlean-plugins
 
   check:
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: rlean-plugins
+
+      - uses: actions/checkout@v4
+        with:
+          repository: cascade-labs/rlean
+          ssh-key: ${{ secrets.RLEAN_DEPLOY_KEY }}
+          path: rlean
+          fetch-depth: 0
+
+      - name: Point cargo's rlean git source at the sibling checkout
+        run: |
+          git config --global url."file://${{ github.workspace }}/rlean".insteadOf "ssh://git@github.com/cascade-labs/rlean"
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rlean-plugins
 
       - name: Check workspace
         run: cargo check --workspace --all-targets --message-format short
+        working-directory: rlean-plugins
 
   clippy:
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: rlean-plugins
+
+      - uses: actions/checkout@v4
+        with:
+          repository: cascade-labs/rlean
+          ssh-key: ${{ secrets.RLEAN_DEPLOY_KEY }}
+          path: rlean
+          fetch-depth: 0
+
+      - name: Point cargo's rlean git source at the sibling checkout
+        run: |
+          git config --global url."file://${{ github.workspace }}/rlean".insteadOf "ssh://git@github.com/cascade-labs/rlean"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rlean-plugins
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+        working-directory: rlean-plugins
