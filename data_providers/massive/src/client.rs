@@ -60,13 +60,26 @@ impl RateLimiter {
     /// Blocks the *calling* thread (never `.await`ed) — always call this from
     /// a dedicated worker thread spawned via [`run_blocking`], never directly
     /// from an async fn body.
+    ///
+    /// Reserves the next request slot while holding the lock, then releases the
+    /// lock *before* sleeping so the mutex is never held across `thread::sleep`.
+    /// Concurrent callers each reserve a distinct slot, so requests are still
+    /// spaced at `requests_per_second`.
     fn wait(&self) {
-        let mut last = self.last.lock().expect("rate limiter mutex poisoned");
-        let elapsed = last.elapsed();
-        if elapsed < self.min_interval {
-            std::thread::sleep(self.min_interval - elapsed);
+        let target = {
+            let mut last = self.last.lock().expect("rate limiter mutex poisoned");
+            let now = Instant::now();
+            // Reserve the next slot: at least `min_interval` after the previous
+            // reservation, but never in the past.
+            let slot = (*last + self.min_interval).max(now);
+            *last = slot;
+            slot
+        };
+        // Lock released; now sleep until the reserved slot if it's in the future.
+        let now = Instant::now();
+        if target > now {
+            std::thread::sleep(target - now);
         }
-        *last = Instant::now();
     }
 }
 

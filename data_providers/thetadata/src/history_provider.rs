@@ -46,7 +46,6 @@ impl ThetaDataHistoryProvider {
         access_token: Option<String>,
         base_url: Option<String>,
         data_root: impl AsRef<std::path::Path>,
-        requests_per_second: f64,
         max_concurrent: usize,
         standard_start_date: Option<NaiveDate>,
     ) -> Self {
@@ -54,7 +53,6 @@ impl ThetaDataHistoryProvider {
             client: ThetaDataClient::new(
                 access_token,
                 base_url,
-                requests_per_second,
                 max_concurrent,
                 data_root.as_ref(),
             ),

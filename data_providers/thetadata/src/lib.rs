@@ -52,8 +52,9 @@ pub unsafe extern "C" fn rlean_create_history_provider(
         return std::ptr::null_mut();
     };
     let data_root = std::path::PathBuf::from(data_root);
-    let rps = numeric_f64(&config["requests_per_second"]).unwrap_or(4.0);
-    let max_concurrent = numeric_u64(&config["max_concurrent"]).unwrap_or(4) as usize;
+    // Concurrency is plugin-owned (default 16). The obsolete
+    // `requests_per_second` field from older framework configs is ignored.
+    let max_concurrent = numeric_u64(&config["max_concurrent"]).unwrap_or(16) as usize;
 
     // Parse optional override for the subscription's earliest date.
     // Default (None) → 2018-01-01 (ThetaData STANDARD lower bound).
@@ -65,18 +66,11 @@ pub unsafe extern "C" fn rlean_create_history_provider(
         api_key,
         base_url,
         &data_root,
-        rps,
         max_concurrent,
         standard_start_date,
     ));
     let boxed: Box<Arc<dyn IHistoryProvider>> = Box::new(provider);
     Box::into_raw(boxed) as *mut ()
-}
-
-fn numeric_f64(value: &serde_json::Value) -> Option<f64> {
-    value
-        .as_f64()
-        .or_else(|| value.as_str().and_then(|s| s.parse::<f64>().ok()))
 }
 
 fn numeric_u64(value: &serde_json::Value) -> Option<u64> {

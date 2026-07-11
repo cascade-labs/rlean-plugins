@@ -4,14 +4,13 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Mirrors the C# `ThetaDataRestClient`:
 ///   - Bearer token auth
 ///   - NDJSON response parsing (`?format=ndjson`)
-///   - Rate limiting (configurable req/s)
-///   - Concurrent request limiting (default 4 — STANDARD plan cap)
-///   - Retry on 429 with exponential back-off + jitter
+///   - Concurrent request limiting (plugin-owned, default 16)
+///   - Reactive per-request retry on 429 with exponential back-off + jitter
 ///   - Treat HTTP 472 / 475 / 572 as "no data" (empty result, not an error)
 use std::io::{BufRead, BufReader, Lines};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Result};
 use chrono::NaiveDate;
@@ -44,60 +43,10 @@ pub struct OptionQuoteRequest<'a> {
     pub interval: &'a str,
 }
 
-/// Minimal process-local request scheduler.
-///
-/// ThetaData's local sidecar can return 429s when a burst of concurrent
-/// requests arrives even if the average request rate is within the configured
-/// limit. Keep one shared "next allowed request" instant and push it forward on
-/// 429s so all in-flight prefetch tasks observe the same cooldown.
-struct RateLimiter {
-    min_interval: Duration,
-    next_allowed: Mutex<Instant>,
-}
-
-impl RateLimiter {
-    fn new(rps: f64) -> Self {
-        let rps = if rps.is_finite() && rps > 0.0 {
-            rps
-        } else {
-            1.0
-        };
-        RateLimiter {
-            min_interval: Duration::from_secs_f64(1.0 / rps),
-            next_allowed: Mutex::new(Instant::now()),
-        }
-    }
-
-    fn wait(&self) {
-        let mut next_allowed = self
-            .next_allowed
-            .lock()
-            .expect("rate limiter mutex poisoned");
-        let now = Instant::now();
-        if now < *next_allowed {
-            std::thread::sleep(*next_allowed - now);
-        }
-        let now = Instant::now();
-        *next_allowed = now + self.min_interval;
-    }
-
-    fn cool_down(&self, delay: Duration) {
-        let mut next_allowed = self
-            .next_allowed
-            .lock()
-            .expect("rate limiter mutex poisoned");
-        let cooldown_until = Instant::now() + delay;
-        if cooldown_until > *next_allowed {
-            *next_allowed = cooldown_until;
-        }
-    }
-}
-
 pub struct ThetaDataClient {
     http: Client,
     access_token: Option<String>,
     base_url: String,
-    limiter: Arc<RateLimiter>,
     concurrency: Arc<Semaphore>,
     max_concurrent: usize,
 }
@@ -139,7 +88,6 @@ impl ThetaDataClient {
     pub fn new(
         access_token: Option<String>,
         base_url: Option<String>,
-        requests_per_second: f64,
         max_concurrent: usize,
         _data_root: impl AsRef<Path>,
     ) -> Self {
@@ -156,7 +104,6 @@ impl ThetaDataClient {
             http,
             access_token,
             base_url,
-            limiter: Arc::new(RateLimiter::new(requests_per_second)),
             concurrency: Arc::new(Semaphore::new(max_concurrent.max(1))),
             max_concurrent: max_concurrent.max(1),
         }
@@ -805,7 +752,7 @@ impl ThetaDataClient {
 
     /// Execute a v3 NDJSON request, parse each line into `T`.
     ///
-    /// Implements rate limiting, concurrency limiting, and retry logic.
+    /// Implements concurrency limiting and per-request retry logic.
     async fn execute<T>(&self, endpoint: &str, params: &[(&str, String)]) -> Result<Vec<T>>
     where
         T: DeserializeOwned + Send + 'static,
@@ -843,7 +790,6 @@ impl ThetaDataClient {
                 .expect("ThetaData concurrency semaphore closed");
             let http = self.http.clone();
             let access_token = self.access_token.clone();
-            let limiter = Arc::clone(&self.limiter);
             let query_for_request = query.clone();
 
             let (tx, rx) = futures::channel::oneshot::channel();
@@ -852,7 +798,6 @@ impl ThetaDataClient {
                 .spawn(move || {
                     let result = (|| -> Result<ExecuteAttempt<T>> {
                         let _permit = permit;
-                        limiter.wait();
                         let mut req = http.get(&query_for_request);
                         if let Some(token) = &access_token {
                             req = req.bearer_auth(token);
@@ -918,9 +863,8 @@ impl ThetaDataClient {
                         );
                     }
                     rl_retries += 1;
-                    self.limiter.cool_down(delay);
                     warn!(
-                        "ThetaData: rate limited (429), cooling down shared limiter for {:.1}s",
+                        "ThetaData: rate limited (429), backing off this request for {:.1}s",
                         delay.as_secs_f64()
                     );
                     sleep_compat(delay).await?;
@@ -983,7 +927,6 @@ impl ThetaDataClient {
         // machinery from here is unsafe.
         let http = self.http.clone();
         let access_token = self.access_token.clone();
-        let limiter = Arc::clone(&self.limiter);
         let endpoint = endpoint.to_string();
         let (tx, rx) = futures::channel::oneshot::channel();
         std::thread::Builder::new()
@@ -994,7 +937,6 @@ impl ThetaDataClient {
                     let mut rl_retries: u32 = 0;
                     let mut gen_retries: u32 = 0;
                     loop {
-                        limiter.wait();
                         let mut req = http.get(&query);
                         if let Some(token) = &access_token {
                             req = req.bearer_auth(token);
@@ -1027,9 +969,8 @@ impl ThetaDataClient {
                                     (2u64.pow(rl_retries)) * 1000 + (rand_jitter() as u64),
                                 )
                             });
-                            limiter.cool_down(delay);
                             warn!(
-                                "ThetaData: rate limited (429), cooling down shared limiter for {:.1}s",
+                                "ThetaData: rate limited (429), backing off this request for {:.1}s",
                                 delay.as_secs_f64()
                             );
                             std::thread::sleep(delay);
