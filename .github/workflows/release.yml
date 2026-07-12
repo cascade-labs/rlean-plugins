@@ -1,18 +1,22 @@
 name: Release
 
-# Builds the rlean plugin dylibs for the fleet's Linux/arm64 nodes and publishes
-# them to a GitHub Release as per-plugin bundles that `rlean cloud install` (and
-# later `rlean cloud deploy`) ship to a node.
+# Universal multi-platform release of the rlean plugin dylibs.
+#
+# One normal semver tag (e.g. v0.1.1, or v0.1.1-rc1 for a prerelease) produces a
+# GitHub Release carrying a plugin-<name>-<version>-<triple>.tar.gz for every
+# plugin on every supported platform, plus a top-level manifest.json. Consumers
+# (e.g. `rlean cloud install`) pull the tarballs for their triple.
 #
 # The plugins depend on rlean crates via `ssh://git@github.com/cascade-labs/rlean`
-# git deps. Like the test/lint workflows, we check out cascade-labs/rlean next to
-# this repo with the read-only RLEAN_DEPLOY_KEY and rewrite that git URL to the
-# local checkout, so no path-patch .cargo/config is needed in CI.
+# git deps. CI checks out cascade-labs/rlean next to this repo with the read-only
+# RLEAN_DEPLOY_KEY and rewrites that git URL to the local checkout, so no path-patch
+# .cargo/config is needed in CI.
 #
-# We build inside an oraclelinux:9 container against python3.9 for the same ABI
-# reason as the rlean binary: some plugins pull in lean-storage/PyO3 transitively,
-# and the whole fleet must share one glibc/python baseline (Oracle Linux 9,
-# glibc 2.34, libpython3.9).
+# Per-target ABI discipline (some plugins pull in lean-storage/PyO3 transitively):
+#   * Linux (both arches): oraclelinux:9 + python3.9, verify glibc <= 2.34 (the
+#     Oracle Linux 9 fleet baseline) on every produced .so.
+#   * macOS (aarch64-apple-darwin): Homebrew python@3.14; verify no runner-local
+#     paths are baked into the .dylib. Plugin libs do not link python directly.
 
 on:
   push:
@@ -21,9 +25,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to (re)build, e.g. v0.1.0 or cloud-latest"
+        description: "Release tag to (re)build, e.g. v0.1.1 or v0.1.1-rc1"
         required: true
-        default: "cloud-latest"
+        default: "v0.1.1"
 
 permissions:
   contents: write
@@ -33,36 +37,56 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  linux-arm64:
-    name: plugins aarch64-unknown-linux-gnu
-    runs-on: ubuntu-24.04-arm
-    container:
-      image: oraclelinux:9
+  build:
+    name: build ${{ matrix.triple }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - triple: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            container: oraclelinux:9
+          - triple: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            container: oraclelinux:9
+          - triple: aarch64-apple-darwin
+            runner: macos-15
+            container: ""
+    runs-on: ${{ matrix.runner }}
+    # Empty string => no container (the macOS leg runs directly on the runner).
+    container: ${{ matrix.container }}
     env:
-      TRIPLE: aarch64-unknown-linux-gnu
-      PYO3_PYTHON: /usr/bin/python3.9
+      TRIPLE: ${{ matrix.triple }}
     steps:
-      - name: Install toolchain and Python 3.9 headers
+      - name: Install Linux toolchain and Python 3.9 headers
+        if: matrix.container != ''
         run: |
           dnf -y install gcc gcc-c++ make git tar gzip findutils binutils file \
             python3.9 python3.9-devel openssl-devel perl
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
             sh -s -- -y --default-toolchain stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          # gh is preinstalled on the runner but not inside this container;
-          # the publish step needs it.
-          dnf -y install 'dnf-command(config-manager)'
-          dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
-          dnf -y install gh
+          echo "PYO3_PYTHON=/usr/bin/python3.9" >> "$GITHUB_ENV"
+
+      - name: Install macOS Python 3.14 (Homebrew)
+        if: matrix.container == ''
+        run: |
+          brew install python@3.14
+          PYPREFIX="$(brew --prefix python@3.14)"
+          echo "PYO3_PYTHON=${PYPREFIX}/bin/python3.14" >> "$GITHUB_ENV"
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       - name: Resolve release tag
         id: tag
+        shell: bash
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+            TAG="${{ github.event.inputs.tag }}"
           else
-            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+            TAG="${GITHUB_REF#refs/tags/}"
           fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
         with:
@@ -77,20 +101,45 @@ jobs:
           fetch-depth: 0
 
       - name: Point cargo's rlean git source at the sibling checkout
+        shell: bash
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE/rlean"
           git config --global --add safe.directory "$GITHUB_WORKSPACE/rlean-plugins"
           git config --global url."file://$GITHUB_WORKSPACE/rlean".insteadOf \
             "ssh://git@github.com/cascade-labs/rlean"
 
-      - name: Build all plugin cdylibs (release)
+      # Assert tag base version (v stripped, -prerelease stripped) == workspace
+      # version. The full tag version (incl. prerelease) is used in filenames.
+      - name: Assert tag matches workspace version
+        id: ver
+        shell: bash
         working-directory: rlean-plugins
         run: |
-          python3.9 --version
-          # Building the workspace produces every librlean_plugin_*.so.
+          TAG="${{ steps.tag.outputs.tag }}"
+          FULL="${TAG#v}"
+          BASE="${FULL%%-*}"
+          CARGO_VER=$(awk '
+            /^\[workspace\.package\]/ {inpkg=1; next}
+            /^\[/ {inpkg=0}
+            inpkg && /^version[[:space:]]*=/ {
+              gsub(/[",]/, "", $0); print $NF; exit
+            }' Cargo.toml)
+          echo "tag=${TAG} full=${FULL} base=${BASE} cargo=${CARGO_VER}"
+          if [ "$BASE" != "$CARGO_VER" ]; then
+            echo "ERROR: tag base version '$BASE' != Cargo.toml workspace version '$CARGO_VER'" >&2
+            exit 1
+          fi
+          echo "version=${FULL}" >> "$GITHUB_OUTPUT"
+
+      - name: Build all plugin cdylibs (release)
+        working-directory: rlean-plugins
+        shell: bash
+        run: |
+          "$PYO3_PYTHON" --version
           cargo build --release --workspace
 
-      - name: Verify Linux .so and node glibc baseline
+      - name: Verify Linux .so glibc baseline
+        if: matrix.container != ''
         working-directory: rlean-plugins
         run: |
           set -e
@@ -108,55 +157,152 @@ jobs:
           done
           [ "$found" = 1 ] || { echo "ERROR: no plugin .so produced" >&2; exit 1; }
 
+      - name: Verify macOS .dylib has no runner-local paths
+        if: matrix.container == ''
+        working-directory: rlean-plugins
+        shell: bash
+        run: |
+          set -e
+          found=0
+          for dl in target/release/librlean_plugin_*.dylib; do
+            [ -e "$dl" ] || continue
+            found=1
+            otool -L "$dl" || true
+            # Plugin dylibs must not bake in the runner's workspace or home path.
+            if otool -L "$dl" | grep -qE "${GITHUB_WORKSPACE}|/Users/runner/"; then
+              echo "ERROR: $dl references a runner-local path." >&2
+              otool -L "$dl" | grep -E "${GITHUB_WORKSPACE}|/Users/runner/" || true
+              exit 1
+            fi
+          done
+          [ "$found" = 1 ] || { echo "ERROR: no plugin .dylib produced" >&2; exit 1; }
+
       - name: Package per-plugin bundles
         id: pkg
         working-directory: rlean-plugins
+        shell: bash
         run: |
           TAG="${{ steps.tag.outputs.tag }}"
-          VERSION="${TAG#v}"
+          VERSION="${{ steps.ver.outputs.version }}"
           mkdir -p ../dist
-          for so in target/release/librlean_plugin_*.so; do
-            base=$(basename "$so" .so)               # librlean_plugin_tradier
+          if command -v sha256sum >/dev/null 2>&1; then
+            SHACMD="sha256sum"; PYABI="3.9"
+          else
+            SHACMD="shasum -a 256"; PYABI="3.14"
+          fi
+          found=0
+          # Glob BOTH extensions so the same loop packages .so (linux) and .dylib (macOS).
+          for lib in target/release/librlean_plugin_*.so target/release/librlean_plugin_*.dylib; do
+            [ -e "$lib" ] || continue
+            found=1
+            fname=$(basename "$lib")                 # librlean_plugin_tradier.so
+            base=${fname%.*}                         # librlean_plugin_tradier
             name=${base#librlean_plugin_}            # tradier
             work=$(mktemp -d)
-            cp "$so" "$work/"
-            SHA=$(sha256sum "$so" | awk '{print $1}')
+            cp "$lib" "$work/"
+            SHA=$($SHACMD "$lib" | awk '{print $1}')
             cat > "$work/manifest.json" <<EOF
           {
             "component": "plugin",
             "plugin": "${name}",
-            "lib": "$(basename "$so")",
+            "lib": "${fname}",
             "version": "${VERSION}",
             "tag": "${TAG}",
             "triple": "${TRIPLE}",
-            "python_abi": "3.9",
+            "python_abi": "${PYABI}",
             "sha256": "${SHA}",
             "repo": "rlean-plugins"
           }
           EOF
-            TARBALL="../dist/plugin-${name}-${VERSION}-${TRIPLE}.tar.gz"
-            tar -C "$work" -czf "$TARBALL" "$(basename "$so")" manifest.json
-            sha256sum "$TARBALL" | awk '{print $1}' > "${TARBALL}.sha256"
+            TARBALL="plugin-${name}-${VERSION}-${TRIPLE}.tar.gz"
+            tar -C "$work" -czf "../dist/${TARBALL}" "${fname}" manifest.json
+            ( cd ../dist && $SHACMD "${TARBALL}" > "${TARBALL}.sha256" )
           done
+          [ "$found" = 1 ] || { echo "ERROR: no plugin libs to package" >&2; exit 1; }
           echo "== bundles =="; ls -la ../dist/
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: plugins-${{ env.TRIPLE }}
+          name: dist-${{ matrix.triple }}
           path: dist/*
 
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          FULL="${TAG#v}"
+          echo "version=${FULL}" >> "$GITHUB_OUTPUT"
+          case "$FULL" in
+            *-*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Download all dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Build top-level manifest.json
+        shell: bash
+        run: |
+          cd dist
+          echo "== collected artifacts =="; ls -la
+          python3 - "$GITHUB_SHA" "${{ steps.tag.outputs.tag }}" "${{ steps.tag.outputs.version }}" <<'PY'
+          import glob, hashlib, json, os, sys, tarfile
+          git_sha, tag, version = sys.argv[1], sys.argv[2], sys.argv[3]
+          artifacts = []
+          for tb in sorted(glob.glob("plugin-*.tar.gz")):
+              sha = hashlib.sha256(open(tb, "rb").read()).hexdigest()
+              triple = plugin = None
+              with tarfile.open(tb) as t:
+                  inner = json.load(t.extractfile("manifest.json"))
+                  triple = inner.get("triple")
+                  plugin = inner.get("plugin")
+              artifacts.append({"file": tb, "triple": triple, "plugin": plugin, "sha256": sha})
+          top = {
+              "name": "rlean-plugins",
+              "repo": os.environ.get("GITHUB_REPOSITORY", "cascade-labs/rlean-plugins"),
+              "version": version,
+              "tag": tag,
+              "git_sha": git_sha,
+              "artifacts": artifacts,
+          }
+          json.dump(top, open("manifest.json", "w"), indent=2)
+          print(json.dumps(top, indent=2))
+          PY
+
       - name: Publish to GitHub Release
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
           TAG="${{ steps.tag.outputs.tag }}"
+          cd dist
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             PRERELEASE=""
-            case "$TAG" in *latest*) PRERELEASE="--prerelease";; esac
+            if [ "${{ steps.tag.outputs.prerelease }}" = "true" ]; then
+              PRERELEASE="--prerelease"
+            fi
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" \
-              --notes "rlean plugin bundles for ${TRIPLE} (python 3.9 ABI)." \
-              $PRERELEASE || true
+              --notes "Universal rlean-plugins release ${TAG}. Artifacts: plugin-<name>-<version>-<triple>.tar.gz per platform + manifest.json." \
+              $PRERELEASE
           fi
-          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" dist/*.tar.gz dist/*.sha256 --clobber
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" \
+            *.tar.gz *.sha256 manifest.json --clobber
