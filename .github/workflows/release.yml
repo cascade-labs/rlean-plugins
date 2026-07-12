@@ -94,9 +94,10 @@ jobs:
             [ -e "$so" ] || continue
             found=1
             file "$so" || true
-            if objdump -T "$so" 2>/dev/null | grep -oE 'GLIBC_2\.[0-9]+' | \
-               sort -uV | awk -F. '$2+0 > 34 {found=1} END{exit found?1:0}'; then
-              echo "ERROR: $so references glibc newer than 2.34 (node baseline)." >&2
+            bad=$(objdump -T "$so" | grep -oE 'GLIBC_2\.[0-9]+' | sort -u | \
+              awk -F. '$2+0 > 34')
+            if [ -n "$bad" ]; then
+              echo "ERROR: $so references glibc newer than 2.34 (node baseline): $bad" >&2
               exit 1
             fi
           done
