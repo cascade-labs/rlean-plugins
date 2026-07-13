@@ -15,7 +15,7 @@ concurrency:
 
 # The workspace patches rlean crate dependencies to the sibling path ../rlean
 # (see .cargo/config.toml), so the job checks out cascade-labs/rlean next to
-# this repository using the read-only RLEAN_DEPLOY_KEY deploy key.
+# this repository anonymously (cascade-labs/rlean is public).
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -28,7 +28,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: cascade-labs/rlean
-          ssh-key: ${{ secrets.RLEAN_DEPLOY_KEY }}
           path: rlean
           fetch-depth: 0
 
