@@ -299,3 +299,20 @@ cargo build --release
 # Install manually (rlean plugin install does this automatically)
 cp target/release/librlean_plugin_myprovider.dylib ~/.rlean/plugins/
 ```
+
+---
+
+## Releases
+
+Cutting a release is script-driven:
+
+1. `./scripts/bump-version.sh [patch|minor|major]` (default `patch`) bumps the
+   workspace version and opens a `Release v<version>` PR against `main`.
+2. Merge the release PR.
+
+Merging auto-tags `v<version>` and fires the universal multi-platform release
+automatically. One semver tag produces a GitHub Release with a
+`plugin-<name>-<version>-<triple>.tar.gz` for every plugin on every supported
+platform (`aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`,
+`aarch64-apple-darwin`) plus a top-level `manifest.json`. Prerelease tags
+(`v<version>-rc1`, `-alpha`, `-beta`, …) publish as GitHub prereleases.

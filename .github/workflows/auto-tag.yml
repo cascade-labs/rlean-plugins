@@ -1,0 +1,84 @@
+name: Auto-tag
+
+# When a "Release v<X.Y.Z>" PR merges to main (produced by scripts/bump-version.sh),
+# this workflow tags the merge commit and kicks off the universal release build.
+#
+# It fires only when the workspace version in Cargo.toml actually changed between
+# HEAD^ and HEAD, and only if the v<version> tag does not already exist.
+#
+# GITHUB_TOKEN recursion guard: tags pushed with the default GITHUB_TOKEN do NOT
+# trigger downstream `on: push: tags` workflows (GitHub deliberately prevents a
+# workflow from triggering another workflow run). So after creating and pushing the
+# annotated tag, we invoke release.yml explicitly via `gh workflow run` using its
+# workflow_dispatch `tag` input. That dispatch path exists precisely for this reason.
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: auto-tag-main
+  cancel-in-progress: false
+
+jobs:
+  auto-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2   # need HEAD and HEAD^ to diff the version
+
+      - name: Read workspace version at HEAD and HEAD^
+        id: ver
+        shell: bash
+        run: |
+          read_version() {
+            git show "$1:Cargo.toml" 2>/dev/null | awk '
+              /^\[workspace\.package\]/ {inpkg=1; next}
+              /^\[/ {inpkg=0}
+              inpkg && /^version[[:space:]]*=/ {
+                gsub(/[",]/, "", $0); print $NF; exit
+              }'
+          }
+          NEW=$(read_version HEAD)
+          if [ -z "$NEW" ]; then
+            echo "ERROR: could not read workspace version at HEAD" >&2
+            exit 1
+          fi
+          # Guard the initial-commit case: HEAD^ may not exist.
+          if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            OLD=$(read_version HEAD^)
+          else
+            OLD=""
+          fi
+          echo "old=${OLD} new=${NEW}"
+          echo "new=${NEW}" >> "$GITHUB_OUTPUT"
+          if [ "$OLD" = "$NEW" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create and push tag, then dispatch release
+        if: steps.ver.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          VERSION="${{ steps.ver.outputs.new }}"
+          TAG="v${VERSION}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists on origin — nothing to do."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "Release ${TAG}"
+          git push origin "${TAG}"
+          # GITHUB_TOKEN tag pushes don't trigger on:push:tags; dispatch explicitly.
+          gh workflow run release.yml -f tag="${TAG}"
