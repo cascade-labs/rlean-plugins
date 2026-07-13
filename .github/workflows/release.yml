@@ -9,7 +9,7 @@ name: Release
 #
 # The plugins depend on rlean crates via `ssh://git@github.com/cascade-labs/rlean`
 # git deps. CI checks out cascade-labs/rlean next to this repo with the read-only
-# RLEAN_DEPLOY_KEY and rewrites that git URL to the local checkout, so no path-patch
+# anonymous checkout (rlean is public) and rewrites that git URL to the local checkout, so no path-patch
 # .cargo/config is needed in CI.
 #
 # Per-target ABI discipline (some plugins pull in lean-storage/PyO3 transitively):
@@ -18,10 +18,11 @@ name: Release
 #   * macOS (aarch64-apple-darwin): Homebrew python@3.14; verify no runner-local
 #     paths are baked into the .dylib. Plugin libs do not link python directly.
 
+# Releases start ONLY from the auto-tag workflow's explicit dispatch (which
+# fires solely when the workspace version changes on main) or a manual
+# workflow_dispatch re-run for an EXISTING tag. A hand-pushed tag does not
+# start a release.
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       tag:
@@ -33,7 +34,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag }}
   cancel-in-progress: false
 
 jobs:
@@ -81,22 +82,19 @@ jobs:
         id: tag
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ github.event.inputs.tag }}"
-          else
-            TAG="${GITHUB_REF#refs/tags/}"
-          fi
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
 
+      # Build the tagged commit — not the default branch — so a manual re-run
+      # months later still reproduces the release.
       - uses: actions/checkout@v4
         with:
+          ref: ${{ steps.tag.outputs.tag }}
           path: rlean-plugins
 
       - name: Check out cascade-labs/rlean (for the git crate deps)
         uses: actions/checkout@v4
         with:
           repository: cascade-labs/rlean
-          ssh-key: ${{ secrets.RLEAN_DEPLOY_KEY }}
           path: rlean
           fetch-depth: 0
 
@@ -251,18 +249,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    steps:
+        steps:
       - name: Resolve release tag
         id: tag
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ github.event.inputs.tag }}"
-          else
-            TAG="${GITHUB_REF#refs/tags/}"
-          fi
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
           FULL="${TAG#v}"
           echo "version=${FULL}" >> "$GITHUB_OUTPUT"
           case "$FULL" in
