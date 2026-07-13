@@ -17,6 +17,7 @@ use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::str::FromStr;
 
+use lean_core::DateTime;
 use lean_data::custom::{
     CustomDataConfig, CustomDataFormat, CustomDataPoint, CustomDataSource, CustomDataTransport,
 };
@@ -130,7 +131,10 @@ impl ICustomDataSource for FredDataSource {
             serde_json::Value::String(config.ticker.clone()),
         );
 
-        Some(CustomDataPoint::new(parsed_date, None, value, fields))
+        // FRED is a daily macro feed: stamp the point at midnight UTC of the
+        // observation date and use the LEAN daily-EOD idiom (end_time = time + 1 day).
+        let time = DateTime::from(parsed_date.and_hms_opt(0, 0, 0).unwrap().and_utc());
+        Some(CustomDataPoint::daily_eod(time, value, fields))
     }
 
     fn is_full_history_source(&self) -> bool {
@@ -164,7 +168,9 @@ impl ICustomDataSource for FredDataSource {
             serde_json::Value::String(config.ticker.clone()),
         );
 
-        Some(CustomDataPoint::new(date, None, value, fields))
+        // Daily macro feed: midnight-UTC start, LEAN daily-EOD end_time.
+        let time = DateTime::from(date.and_hms_opt(0, 0, 0).unwrap().and_utc());
+        Some(CustomDataPoint::daily_eod(time, value, fields))
     }
 }
 
@@ -273,7 +279,7 @@ mod tests {
         let point = src
             .reader("2024-01-01,3.7", target, &config)
             .expect("should parse");
-        assert_eq!(point.time, target);
+        assert_eq!(point.time.date_utc(), target);
         assert_eq!(point.value, Decimal::from_str("3.7").unwrap());
         assert_eq!(
             point.fields["series_id"],

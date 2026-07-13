@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 
 use chrono::{Datelike, NaiveDate};
-use lean_core::{DateTime, TimeSpan};
+use lean_core::DateTime;
 use lean_data::custom::{CustomDataConfig, CustomDataPoint, CustomDataSource, CustomDataTransport};
 use lean_data_providers::{CustomDataContext, ICustomDataSource};
 use lean_plugin::{rlean_plugin, PluginKind};
@@ -163,7 +163,7 @@ fn fetch_vx30_history(config: &CustomDataConfig) -> Result<Vec<CustomDataPoint>,
 
 fn custom_point_in_query(point: &CustomDataPoint, config: &CustomDataConfig) -> bool {
     let (start, end) = query_dates(config);
-    date_in_query_window(point.time, start, end)
+    date_in_query_window(point.time.date_utc(), start, end)
 }
 
 fn query_dates(config: &CustomDataConfig) -> (Option<NaiveDate>, Option<NaiveDate>) {
@@ -238,12 +238,14 @@ fn parse_index_history_row(line: &str) -> Option<IndexRow> {
 }
 
 fn custom_point(date: NaiveDate, value: Decimal) -> CustomDataPoint {
+    // CBOE VIX is a daily EOD feed: stamp at midnight UTC of the trade date and
+    // apply the LEAN daily-EOD idiom (end_time = time + 1 day).
     let time = DateTime::from(
-        date.and_hms_opt(16, 0, 0)
+        date.and_hms_opt(0, 0, 0)
             .expect("valid CBOE history timestamp")
             .and_utc(),
     );
-    CustomDataPoint::new(date, Some(time + TimeSpan::ZERO), value, HashMap::new())
+    CustomDataPoint::daily_eod(time, value, HashMap::new())
 }
 
 #[derive(Debug, Clone, PartialEq)]
