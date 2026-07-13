@@ -157,6 +157,24 @@ jobs:
           done
           [ "$found" = 1 ] || { echo "ERROR: no plugin .so produced" >&2; exit 1; }
 
+      # cargo sets each dylib's install name (LC_ID_DYLIB) to its absolute build
+      # path on the runner. Rewrite it to the bare filename so no runner-local
+      # path ships in the artifact (rlean loads plugins by explicit path, so the
+      # ID only needs to be stable, not absolute). install_name_tool invalidates
+      # the linker's ad-hoc code signature, and arm64 macOS refuses to load
+      # unsigned dylibs — re-sign ad hoc afterwards.
+      - name: Normalize macOS dylib install names
+        if: matrix.container == ''
+        working-directory: rlean-plugins
+        shell: bash
+        run: |
+          set -e
+          for dl in target/release/librlean_plugin_*.dylib; do
+            [ -e "$dl" ] || continue
+            install_name_tool -id "$(basename "$dl")" "$dl"
+            codesign --force --sign - "$dl"
+          done
+
       - name: Verify macOS .dylib has no runner-local paths
         if: matrix.container == ''
         working-directory: rlean-plugins
