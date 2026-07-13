@@ -545,7 +545,7 @@ impl ICustomDataSource for HyperliquidUniverseDataSource {
     fn reader(
         &self,
         line: &str,
-        date: NaiveDate,
+        _date: NaiveDate,
         _config: &CustomDataConfig,
     ) -> Option<CustomDataPoint> {
         if line.starts_with("time_ns,") {
@@ -578,8 +578,9 @@ impl ICustomDataSource for HyperliquidUniverseDataSource {
         fields.insert("base".to_string(), json!(row.base));
         fields.insert("quote".to_string(), json!(row.quote));
 
+        // Intraday snapshot: time == end_time == the row's own timestamp.
         Some(
-            CustomDataPoint::new(date, Some(time), decimal_from_optional(&row.value), fields)
+            CustomDataPoint::new(time, time, decimal_from_optional(&row.value), fields)
                 .with_symbol(Some(row.symbol.clone())),
         )
     }

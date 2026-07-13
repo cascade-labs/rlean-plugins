@@ -736,7 +736,7 @@ fn poll_universe_subscription(
         };
         let time = points
             .iter()
-            .filter_map(|point| point.end_time)
+            .map(|point| point.end_time)
             .max_by_key(|time| time.0)
             .unwrap_or_else(NanosecondTimestamp::now);
         tracing::info!(
@@ -846,7 +846,6 @@ fn load_live_points(
         .unwrap_or_default();
     let ctx_rows = array[1].as_array().cloned().unwrap_or_default();
     let now = NanosecondTimestamp::now();
-    let date = now.date_utc();
     let dex_value = dex.unwrap_or_default().to_ascii_uppercase();
 
     let mut points = Vec::new();
@@ -911,9 +910,9 @@ fn load_live_points(
         fields.insert("base".to_string(), Value::Null);
         fields.insert("quote".to_string(), json!("USDC"));
 
-        points.push(
-            CustomDataPoint::new(date, Some(now), value, fields).with_symbol(Some(symbol.clone())),
-        );
+        // Intraday snapshot: time == end_time == the poll's own timestamp.
+        points
+            .push(CustomDataPoint::new(now, now, value, fields).with_symbol(Some(symbol.clone())));
     }
     Ok(points)
 }
